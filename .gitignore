@@ -1,0 +1,41 @@
+.ai/
+bug-report/
+scripts/
+tests/
+.mcp.json
+.claude/
+my-materials/
+
+# docs: only the API spec JSONs are tracked; local notes/reports stay out
+docs/*
+!docs/cdesk-api-v3.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Test / lint cache
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+
+# Env
+.env
+.env.local
+.env.production
+# (.env.production.example is the committed template)
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Claude Code (local project guidance, not shipped)
+CLAUDE.md

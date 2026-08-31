@@ -1,0 +1,20 @@
+# cdesk-mcp remote (http/OAuth) server.
+#
+# Usage:
+#   1. cp .env.production.example .env.production   # then fill it in
+#   2. docker compose up --build
+#   3. Front 127.0.0.1:8000 with a TLS proxy / Cloudflare whose public URL
+#      matches CDESK_PUBLIC_URL, then add <public-url>/mcp as a Claude connector.
+#
+# No datastore: OAuth sessions are self-encoded into the tokens Claude holds, so
+# they survive a restart as long as CDESK_ENCRYPTION_KEY stays the same.
+
+services:
+  cdesk-mcp:
+    build: .
+    env_file: .env.production
+    # Bind to localhost only — terminate TLS with a reverse proxy / Cloudflare
+    # in front (do NOT expose 8000 publicly; it speaks plain HTTP).
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped

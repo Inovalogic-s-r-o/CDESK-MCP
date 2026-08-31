@@ -1,0 +1,75 @@
+[project]
+name = "cdesk-mcp"
+version = "0.1.0"
+description = "MCP server for CDESK helpdesk/CRM — exposes Tasks, Customers, and Users to MCP-compatible AI clients"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Miroslav", email = "miro@sealit.sk" }]
+keywords = ["mcp", "cdesk", "claude", "anthropic", "helpdesk", "crm", "llm", "tools"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Office/Business",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "mcp[cli]>=1.27",
+    "httpx>=0.28",
+    "python-dotenv>=1.0",
+    "cryptography>=42",
+    # IANA timezone database for zoneinfo on platforms without a system copy
+    # (Windows). Needed to interpret naive datetimes as tenant-local time.
+    "tzdata>=2024.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/Sebinko22/Cdesk-MCP"
+Repository = "https://github.com/Sebinko22/Cdesk-MCP"
+Issues = "https://github.com/Sebinko22/Cdesk-MCP/issues"
+Changelog = "https://github.com/Sebinko22/Cdesk-MCP/blob/main/CHANGELOG.md"
+
+[project.scripts]
+cdesk-mcp = "cdesk_mcp.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-recording>=0.13",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cdesk_mcp"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# T20 = flake8-print: ban print() in production code (stdout is reserved for MCP JSON-RPC).
+extend-select = ["T20"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Turn DeprecationWarnings into test failures so deprecated APIs surface as
+# CI red rather than silently rotting. Catches things like
+# asyncio.get_event_loop() (Python 3.12+ deprecation) early.
+filterwarnings = ["error::DeprecationWarning"]
