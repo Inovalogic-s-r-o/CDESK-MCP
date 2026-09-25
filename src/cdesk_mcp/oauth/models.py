@@ -25,10 +25,14 @@ class CdeskCredential(BaseModel):
     OAuth tokens: the login it maps to, the current apitoken, and the CDESK
     refresh token used to renew it.
 
-    ``cdesk_refresh_token`` is the long-lived user secret and the durable one —
-    CDESK does not rotate it on renew, so a token that embeds it can always
-    reconstruct a working client. The name is explicit so it is never confused
-    with the OAuth refresh token we issue to Claude.
+    ``cdesk_refresh_token`` is the credential the session lives on. Issued and
+    renewed with ``accessType: 3`` it lasts 30 days, and every renew extends it
+    another 30; CDESK does not rotate it, so a token that embeds it can always
+    reconstruct a working client. ``apitoken`` is only the latest short-lived
+    token derived from it — CDESK always gives an apitoken the user's
+    ``auto_logout`` idle timeout — and is replaced on every OAuth refresh grant.
+    The name is explicit so it is never confused with the OAuth refresh token we
+    issue to Claude.
 
     ``base_url`` is the CDESK server this session targets — chosen by the user on
     the login page (one of the hosted servers, or a custom URL). It rides in the

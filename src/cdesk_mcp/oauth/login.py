@@ -764,7 +764,10 @@ def register_login_route(
         if not refresh:
             # No refresh token means the session can't outlive the apitoken's
             # inactivity window; still usable, but flag it for ops.
-            log.warning("CDESK login for %r returned no refresh token", login_name)
+            log.warning(
+                "CDESK login for %r returned no refresh token; the session will end "
+                "after the user's CDESK auto_logout", login_name,
+            )
 
         # Mint the one-time code; the chosen server is embedded in the credential.
         try:

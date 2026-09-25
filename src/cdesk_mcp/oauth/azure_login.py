@@ -12,8 +12,10 @@ ANY CDESK server the user selects:
 
   GET /login/azure/callback   (CDESK redirects the browser back here)
     → on success CDESK appends ``?token=<APITOKEN>&refresh_token=<REFRESH>&state=``
-      (on failure ``?error=access_denied&state=``). We hand the tokens straight to
-      the provider's existing ``complete_login`` (identical to the password path)
+      (on failure ``?error=access_denied&state=``). We renew once with
+      ``accessType: 3`` (upgrading the refresh token to the 30-day MCP lifetime),
+      then hand the tokens to the provider's existing ``complete_login`` (as the
+      password path does)
       and 302 back to the OAuth client (Claude). No code-exchange step — CDESK
       delivers the apitoken directly.
 
@@ -173,7 +175,16 @@ def register_azure_login_routes(
             )
 
         # refresh_token may be absent if the CDESK server has no token-signing
-        # secret configured (manual: treat as optional).
+        # secret configured (manual: treat as optional). When present, renew once
+        # with accessType 3: CDESK minted it without the MCP flag, so as delivered
+        # it would last only the user's auto_logout instead of 30 days.
+        if refresh:
+            fresh = await provider.renew_session_tokens(
+                login="microsoft-sso", apitoken=apitoken, refresh_token=refresh,
+                base_url=base_url,
+            )
+            if fresh:
+                apitoken = fresh
         try:
             redirect_url = await provider.complete_login(
                 session,

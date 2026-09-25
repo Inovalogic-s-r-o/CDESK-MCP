@@ -29,8 +29,18 @@ process-local sets (see oauth/memsets.py), not a datastore:
   lifetime so it can't be replayed.
 * **revocation** — ``revoke_token`` records the grant id so the session stops
   working immediately on this process, and best-effort logs the apitoken out at
-  CDESK. (Both sets are lost on restart, which is safe: codes expire on their
-  own within minutes, and the CDESK logout is the durable kill.)
+  CDESK. (Both sets are lost on restart. Codes expire on their own within
+  minutes; the CDESK logout kills the apitoken but NOT the CDESK refresh token —
+  CDESK has no route that revokes one — so a revoked grant replayed on another
+  replica or after a restart could still renew until that token expires. See
+  docs/bugs/bugs.md.)
+
+**Session lifetime.** The CDESK refresh token is the credential a session lives
+on; the apitoken is only its short-lived derivative (CDESK always gives it the
+user's ``auto_logout`` idle timeout). Every refresh grant renews at CDESK with
+``accessType: 3``, which pushes the CDESK refresh token out 30 days, and returns
+a *rotated* OAuth refresh token with a fresh 30-day window — so both sides slide
+together and a session used at least once a month never expires.
 
 PKCE, redirect-uri match, and code expiry are enforced by the SDK's
 ``TokenHandler`` *before* ``exchange_authorization_code`` runs, so the decrypted
@@ -59,7 +69,7 @@ from cryptography.fernet import InvalidToken
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import ValidationError
 
-from cdesk_mcp.cdesk_client import CdeskClient
+from cdesk_mcp.cdesk_client import CdeskAuthError, CdeskClient
 from cdesk_mcp.oauth.crypto import TokenCipher
 from cdesk_mcp.oauth.memsets import ExpiringKeySet
 from cdesk_mcp.oauth.models import (
@@ -75,9 +85,10 @@ log = logging.getLogger(__name__)
 _AUTH_CODE_TTL_SECONDS = 300  # 5 min — generous for the redirect round-trip
 _ACCESS_TOKEN_TTL_SECONDS = 8 * 3600  # 8h working session; refreshed silently after
 _LOGIN_SESSION_TTL_SECONDS = 600  # abandon half-finished login flows after 10 min
-# The OAuth refresh token lives this long from issue. Self-encoded tokens are
-# immutable, so this is a fixed (not sliding) window; capped in practice by the
-# CDESK refresh token's own lifetime (renewal fails → user reconnects).
+# The OAuth refresh token lives this long from issue. Each refresh grant issues
+# a new one, so the window slides — matching CDESK's MCP refresh token, which
+# every renew with accessType 3 also pushes out 30 days. A session idle longer
+# than this (or whose CDESK refresh token was rejected) has to reconnect.
 _REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 3600  # 30 days
 
 # One DNS label: alphanumeric, inner hyphens allowed, no leading/trailing hyphen.
@@ -531,6 +542,33 @@ class CdeskOAuthProvider(
             raise TokenError(
                 "invalid_grant", "CDESK session has ended; please reconnect the connector."
             )
+        session_client = self._build_session_client(cred)
+        if cred.cdesk_refresh_token:
+            # Renew at CDESK on every grant: it extends the CDESK refresh token
+            # 30 days (accessType 3) and proves the session is still alive, so a
+            # dead one surfaces here as a reconnect prompt rather than as failing
+            # tool calls. Legacy credentials without a refresh token skip this and
+            # run on the embedded apitoken, as before.
+            try:
+                fresh = await session_client.renew()
+            except CdeskAuthError as e:
+                if e.status not in (401, 403):
+                    # CDESK unreachable / 5xx: not evidence the session ended.
+                    # Keep it alive on the embedded credential; the next grant
+                    # (or a 401 on a tool call) renews again.
+                    log.warning(
+                        "CDESK renew on refresh grant failed transiently for %r: %s",
+                        cred.login, e,
+                    )
+                else:
+                    await session_client.close()
+                    log.info("CDESK rejected the refresh token for %r", cred.login)
+                    raise TokenError(
+                        "invalid_grant",
+                        "CDESK session has ended; please reconnect the connector.",
+                    ) from e
+            else:
+                cred = cred.model_copy(update={"apitoken": fresh})
         access = self._issue_access_token(
             client_id=refresh_token.client_id,
             scopes=scopes,
@@ -538,22 +576,32 @@ class CdeskOAuthProvider(
             cred=cred,
             grant_id=refresh_token.grant_id,
         )
-        await self._pool.put(access, self._build_session_client(cred))
-        # Reuse the same (immutable) refresh-token string — no rotation, matching
-        # the prior behavior; the credential it carries is unchanged.
+        await self._pool.put(access, session_client)
+        # Rotate: a new refresh token (same grant id, so revocation still covers
+        # it) with a fresh 30-day window. The old string stays decryptable until
+        # its own TTL — stateless tokens can't be un-issued — so this buys a
+        # sliding session, not replay protection.
+        rotated = self._issue_refresh_token(
+            client_id=refresh_token.client_id,
+            scopes=scopes,
+            resource=refresh_token.resource,
+            cred=cred,
+            grant_id=refresh_token.grant_id,
+        )
         return OAuthToken(
             access_token=access,
             token_type="Bearer",
             expires_in=_ACCESS_TOKEN_TTL_SECONDS,
             scope=" ".join(scopes) or None,
-            refresh_token=refresh_token.token,
+            refresh_token=rotated,
         )
 
     async def revoke_token(self, token: CdeskAccessToken | CdeskRefreshToken) -> None:
         # Self-encoded tokens can't be un-issued, so neutralize the whole session
         # by remembering the grant id (rejected everywhere it's checked on this
-        # process) and best-effort logging the apitoken out at CDESK — the durable
-        # kill that holds across replicas / a restart.
+        # process) and best-effort logging the apitoken out at CDESK. That logout
+        # does not touch the CDESK refresh token (CDESK has no route to revoke
+        # one), so it is not a complete kill across replicas / a restart.
         grant_id = getattr(token, "grant_id", "")
         if grant_id:
             self._revoked_grants.add(grant_id, ttl_seconds=_REFRESH_TOKEN_TTL_SECONDS)
@@ -652,10 +700,13 @@ class CdeskOAuthProvider(
 
     def _build_session_client(self, cred: CdeskCredential) -> CdeskClient:
         """A pooled, password-free session client for the credential's chosen server.
-        The credential is frozen in the token, so there is no write-back: when CDESK
-        renews the apitoken the fresh one lives only in this in-process client for the
-        token's life; a later reconstruction starts again from the embedded apitoken
-        and renews via the embedded (non-rotating) CDESK refresh token as needed."""
+
+        The embedded CDESK refresh token is what the session lives on; the embedded
+        apitoken is just the latest one derived from it (refreshed on every OAuth
+        refresh grant). The credential is frozen in the token, so there is no
+        write-back: an apitoken renewed mid-session after a 401 lives only in this
+        in-process client, and a later reconstruction starts from the embedded one
+        and renews via the (non-rotating) CDESK refresh token as needed."""
         return CdeskClient.from_tokens(
             base_url=self._cred_base_url(cred),
             login=cred.login,
@@ -663,6 +714,25 @@ class CdeskOAuthProvider(
             refresh_token=cred.cdesk_refresh_token,
             timeout_seconds=self._timeout_seconds,
         )
+
+    async def renew_session_tokens(
+        self, *, login: str, apitoken: str, refresh_token: str, base_url: str
+    ) -> str | None:
+        """Renew a just-issued CDESK session once, with ``accessType: 3``, and
+        return the fresh apitoken — or None if the renew failed (logged).
+
+        For Microsoft SSO: CDESK mints that refresh token itself, without the MCP
+        access type, so it would only live the user's ``auto_logout``. One renew
+        with the flag upgrades it to the 30-day MCP lifetime. Best-effort: on
+        failure the caller keeps the original tokens (a short session, as before)."""
+        client = self.build_token_client(login, apitoken, refresh_token, base_url)
+        try:
+            return await client.renew()
+        except CdeskAuthError as e:
+            log.warning("CDESK renew after SSO login failed for %r: %s", login, e)
+            return None
+        finally:
+            await client.close()
 
     def build_cdesk_client(self, login: str, password: str, base_url: str) -> CdeskClient:
         """Construct a password-bearing CdeskClient against the chosen CDESK server.

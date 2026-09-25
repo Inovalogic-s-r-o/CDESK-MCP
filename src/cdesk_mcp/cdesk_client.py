@@ -7,10 +7,21 @@ On 401 mid-session, the cached token is dropped and a fresh auth is attempted on
 Two credential kinds (m2m preferred when both are configured):
   * m2m (CDESK_CLIENT_ID + CDESK_CLIENT_SECRET): POST /auth/jwttoken mints a
     short-lived (5-min) HS256 JWT, which is then sent as `Authorization:
-    Bearer <jwt>` to POST /auth/login with an empty body — same apitoken
+    Bearer <jwt>` to POST /auth/login with no credentials in the body — same apitoken
     response as a password login. The pair can re-mint at any time, so no
     refresh token is needed.
   * password (CDESK_LOGIN + CDESK_PASSWORD): classic POST /auth/login body.
+  * token-based (``from_tokens``, the http/OAuth sessions): an already-issued
+    apitoken + CDESK refresh token, no password. The **refresh token is the
+    durable credential** — the apitoken always carries the user's
+    ``auto_logout`` idle timeout (typically 2 h), even for an MCP login, so it is
+    only a cache that POST /auth/renewtokens re-derives.
+
+Every login and renew sends ``accessType: 3`` (MCP / AI connector). With it
+CDESK gives the refresh token a 30-day lifetime, independent of ``auto_logout``,
+and each renew pushes it out another 30 days (it is not rotated). The flag is not
+remembered server-side: a renew without it shrinks the token back to
+``auto_logout``. See docs/v3-zmeny-pre-mcp.md §1.
 
 The password lives only in this process's memory; it is never logged or written.
 Logs include the request method, path, status, and duration — never headers,
@@ -20,6 +31,7 @@ credentials, or response bodies.
 from __future__ import annotations
 
 import asyncio
+import http.cookiejar
 import logging
 import random
 import time
@@ -38,6 +50,10 @@ _JWTTOKEN_PATH = "auth/jwttoken"
 _RENEW_PATH = "auth/renewtokens"
 _LOGOUT_PATH = "logout"
 _HEALTH_PATH = "v3/task/enums"
+# CDESK's `accessType` for an MCP / AI connector (apiportal `Token::MCP_APP`).
+# Must be sent on EVERY login and renew: CDESK keeps it only for the one request,
+# so a renew without it cuts the refresh token back to the user's auto_logout.
+_MCP_ACCESS_TYPE = 3
 _MAX_ATTEMPTS = 3
 # Methods safe to replay on a 5xx / mid-flight network error: a retry of one
 # of these can't create a duplicate (GET/HEAD/OPTIONS have no effect; PUT and
@@ -154,15 +170,16 @@ class CdeskClient:
                 "CDESK_PASSWORD or CDESK_CLIENT_ID+CDESK_CLIENT_SECRET is required"
             )
 
-        self._http = httpx.AsyncClient(
-            base_url=self._normalize_base_url(base_url), timeout=timeout_seconds
-        )
+        self._http = self._build_http(self._normalize_base_url(base_url), timeout_seconds)
         self._login = login
         self._password = password
         # Seeded directly for token-based (no-password) construction; for a
         # password client it's populated lazily by the first login.
         self._token: str | None = apitoken
         self._refresh_token: str | None = refresh_token
+        # Epoch seconds the CDESK refresh token expires at, when the login told us
+        # (`refreshTokenExpiresAt`). Diagnostics only — CDESK is the authority.
+        self._refresh_expires_at: int | None = None
         self._client_id = client_id
         self._client_secret = client_secret
         # Optional async hook invoked with the fresh apitoken after a successful
@@ -189,6 +206,33 @@ class CdeskClient:
         (token-based construction). Used to renew apitokens and embedded in the
         issued OAuth token to carry the session."""
         return self._refresh_token
+
+    @property
+    def refresh_expires_at(self) -> int | None:
+        """Epoch seconds the CDESK refresh token expires at, as reported by the
+        last login (None if unknown). Renew does not report it."""
+        return self._refresh_expires_at
+
+    @staticmethod
+    def _build_http(
+        api_base: str,
+        timeout_seconds: float,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> httpx.AsyncClient:
+        """The underlying httpx client, with a cookie jar that accepts nothing.
+
+        CDESK auth travels entirely in the ``Authorization`` header. But
+        /auth/login also sets a ``refreshToken`` cookie, and apiportal's
+        ``User::byToken`` extends the refresh token to the user's *auto_logout*
+        on every request that carries that cookie — so a client that echoed it
+        back would quietly undo the 30-day MCP lifetime on ordinary traffic.
+        ``transport`` is a test seam."""
+        jar = http.cookiejar.CookieJar(
+            policy=http.cookiejar.DefaultCookiePolicy(allowed_domains=[])
+        )
+        return httpx.AsyncClient(
+            base_url=api_base, timeout=timeout_seconds, cookies=jar, transport=transport
+        )
 
     @classmethod
     def from_tokens(
@@ -309,6 +353,20 @@ class CdeskClient:
         CDESK refresh token → password), so it is valid for every client kind."""
         return await self._ensure_token()
 
+    async def renew(self) -> str:
+        """Force a refresh-token renewal now (POST /auth/renewtokens with
+        ``accessType: 3``) and return the fresh apitoken, which also becomes this
+        client's cached token.
+
+        The point is the side effect on CDESK: every renew pushes the refresh
+        token's expiry out another 30 days, and a 401 proves the session is over.
+        The OAuth provider calls this on each refresh grant so an active session
+        never runs out. Raises CdeskAuthError if there is no refresh token or
+        CDESK rejects it."""
+        async with self._token_lock:
+            self._token = await self._renew_now()
+            return self._token
+
     async def logout(self) -> None:
         """Best-effort: tell CDESK to invalidate the current apitoken
         (``POST /api/logout``). Bypasses ``_request`` so it does NOT renew on a
@@ -387,7 +445,11 @@ class CdeskClient:
             try:
                 response = await self._http.post(
                     _LOGIN_PATH,
-                    json={"login": self._login, "password": self._password},
+                    json={
+                        "login": self._login,
+                        "password": self._password,
+                        "accessType": _MCP_ACCESS_TYPE,
+                    },
                 )
             except httpx.RequestError as e:
                 duration_ms = (time.monotonic() - start) * 1000
@@ -465,12 +527,16 @@ class CdeskClient:
         refresh = data.get("refreshToken")
         if isinstance(refresh, str) and refresh:
             self._refresh_token = refresh
+            expires_at = data.get("refreshTokenExpiresAt")
+            if isinstance(expires_at, int) and not isinstance(expires_at, bool):
+                self._refresh_expires_at = expires_at
         return token
 
     async def _jwt_login_now(self) -> str:
         """Machine-to-machine login: POST /auth/jwttoken (client_id +
         client_secret → short-lived HS256 JWT) followed by POST /auth/login
-        with `Authorization: Bearer <jwt>` and an empty body — the same
+        with `Authorization: Bearer <jwt>` and a body carrying only
+        ``accessType`` — the same
         apitoken response as a password login.
 
         The JWT is valid for ~5 minutes, so a login-401 most likely means it
@@ -481,7 +547,7 @@ class CdeskClient:
             jwt = await self._mint_jwt()
             response = await self._auth_post_with_retries(
                 _LOGIN_PATH,
-                json={},
+                json={"accessType": _MCP_ACCESS_TYPE},
                 headers={"Authorization": f"Bearer {jwt}"},
                 label="m2m login",
             )
@@ -599,7 +665,8 @@ class CdeskClient:
 
         NOTE: unlike /auth/login (unwrapped), the renew response is *wrapped* in
         a ``data`` envelope: ``{"data": {"apitoken": "...", ...}}``. CDESK does
-        not rotate the refresh token, so ``self._refresh_token`` is left as-is."""
+        not rotate the refresh token, so ``self._refresh_token`` is left as-is —
+        with ``accessType: 3`` the renew instead extends its expiry 30 days."""
         if not self._refresh_token:
             raise CdeskAuthError("No CDESK refresh token available to renew.")
 
@@ -611,6 +678,9 @@ class CdeskClient:
                     _RENEW_PATH,
                     json={
                         "refreshToken": self._refresh_token,
+                        # Without it CDESK shortens the refresh token to the
+                        # user's auto_logout instead of extending it 30 days.
+                        "accessType": _MCP_ACCESS_TYPE,
                         "requestedObject": {"apitoken": ""},
                     },
                 )
@@ -647,7 +717,8 @@ class CdeskClient:
         if status in (401, 403):
             raise CdeskAuthError(
                 "CDESK rejected the refresh token (it may have expired). "
-                "Reconnect the CDESK connector to sign in again."
+                "Reconnect the CDESK connector to sign in again.",
+                status=status,
             )
         if not response.is_success:
             raise CdeskAuthError(
