@@ -18,7 +18,10 @@ numbers.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import json
+import re
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
@@ -924,14 +927,27 @@ def register_request_tools(
         change_status_to_waiting_for_customer: bool = False,
         work_order_id: int | None = None,
         customer_signature: int | None = None,
-        custom_notify: bool = False,
+        notify_user_ids: list[int] | None = None,
         discussion_receivers: list[str] | None = None,
-        customer_to: dict[str, Any] | None = None,
-        technote_to: dict[str, Any] | None = None,
+        custom_notify: bool = False,
         notify_block: int | None = None,
         notify_customer_block: int | None = None,
         notify_sms_block: int | None = None,
     ) -> dict[str, Any]:
+        try:
+            receivers = _validate_receiver_emails(discussion_receivers)
+            if custom_notify and not (receivers or notify_user_ids):
+                raise ValueError(
+                    "custom_notify=True replaces CDESK's default receivers, so it "
+                    "needs at least one entry in notify_user_ids or "
+                    "discussion_receivers; with none, nobody would be notified."
+                )
+        except ValueError as e:
+            raise RuntimeError(f"post_request_discussion input error: {e}") from e
+        # Resolved before the POST: a receiver that can't be resolved must fail
+        # the call, not produce a post that looks notified and wasn't.
+        users = await _resolve_notify_users(client, notify_user_ids or [])
+        manual = _merge_receivers(users, receivers)
         try:
             body = _build_discussion_body(
                 channel=channel,
@@ -943,9 +959,7 @@ def register_request_tools(
                 work_order_id=work_order_id,
                 customer_signature=customer_signature,
                 custom_notify=custom_notify,
-                discussion_receivers=discussion_receivers,
-                customer_to=customer_to,
-                technote_to=technote_to,
+                manual_receivers=manual,
                 notify_block=notify_block,
                 notify_customer_block=notify_customer_block,
                 notify_sms_block=notify_sms_block,
@@ -961,7 +975,10 @@ def register_request_tools(
             raise to_llm_error(
                 e, operation="post_request_discussion", record_id=request_id,
             ) from e
-        return response if isinstance(response, dict) else {"data": response}
+        result = response if isinstance(response, dict) else {"data": response}
+        if manual:
+            result["notification"] = _notification_report(result, manual)
+        return result
 
 
     # FastMCP builds each tool's argument model with pydantic's default
@@ -1064,9 +1081,7 @@ def _build_discussion_body(
     work_order_id: int | None,
     customer_signature: int | None,
     custom_notify: bool,
-    discussion_receivers: list[str] | None,
-    customer_to: dict[str, Any] | None,
-    technote_to: dict[str, Any] | None,
+    manual_receivers: list[dict[str, Any]],
     notify_block: int | None,
     notify_customer_block: int | None,
     notify_sms_block: int | None,
@@ -1075,9 +1090,17 @@ def _build_discussion_body(
 
     Channel routing:
       - channel="customer" → status=1, text lands in customer_text,
-        recipient in customer_to, customer-targeted attachments.
+        receivers in customer_to, customer-targeted attachments.
       - channel="internal" → status=2, text lands in technote_text,
-        recipient in technote_to, internal attachments.
+        receivers in technote_to, internal attachments.
+
+    Extra receivers go in `<channel>_to.manual` as `{notify, name, type: 0}`
+    entries — the shape the CDESK UI sends. The spec's top-level
+    `discussion_receivers` is accepted and ignored by the backend, and
+    `customNotify` with it switches the default receivers off, so such a post
+    notified nobody (JCD-34004, verified live on cmpp 2026-10-06). Without
+    `customNotify` the manual entries are added to the default receivers; with
+    it they replace them.
 
     Either text OR attachments must be present (CDESK rejects an empty
     message)."""
@@ -1099,8 +1122,6 @@ def _build_discussion_body(
             body["customer_text"] = text
         if attachments:
             body["attachment"] = attachments
-        if customer_to is not None:
-            body["customer_to"] = customer_to
         if customer_signature is not None:
             body["customer_signature"] = customer_signature
     else:
@@ -1108,17 +1129,17 @@ def _build_discussion_body(
             body["technote_text"] = text
         if attachments:
             body["attachment_internal"] = attachments
-        if technote_to is not None:
-            body["technote_to"] = technote_to
+
+    if manual_receivers:
+        to_key = "customer_to" if channel == "customer" else "technote_to"
+        body[to_key] = {"auto": [], "manual": manual_receivers}
+        if custom_notify:
+            body["customNotify"] = True
 
     if change_status_to_waiting_for_customer:
         body["changeStatusToWaitingForCustomer"] = True
     if work_order_id is not None:
         body["work_order_id"] = work_order_id
-    if custom_notify:
-        body["customNotify"] = True
-    if discussion_receivers is not None:
-        body["discussion_receivers"] = discussion_receivers
     if notify_block is not None:
         body["notifyBlock"] = notify_block
     if notify_customer_block is not None:
@@ -1127,6 +1148,137 @@ def _build_discussion_body(
         body["notifySmsBlock"] = notify_sms_block
 
     return body
+
+
+# Deliberately loose: CDESK stores any string as a receiver (`not-an-email`
+# was accepted and reported as notified, cmpp 2026-10-06), so this only has to
+# catch what is plainly not an address.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s.]+$")
+
+
+def _validate_receiver_emails(emails: list[str] | None) -> list[str]:
+    """Strip and format-check the raw receiver addresses; raise ValueError
+    naming every bad one."""
+    if not emails:
+        return []
+    cleaned = [e.strip() if isinstance(e, str) else e for e in emails]
+    bad = [e for e in cleaned if not isinstance(e, str) or not _EMAIL_RE.match(e)]
+    if bad:
+        raise ValueError(
+            f"discussion_receivers contains values that are not email "
+            f"addresses: {bad!r}"
+        )
+    return cleaned
+
+
+async def _resolve_notify_users(
+    client: CdeskClient, user_ids: list[int],
+) -> list[tuple[int, str, str]]:
+    """Look up each user's (id, email, name) via GET v3/user/{id}.
+
+    Raises RuntimeError naming the id when a user can't be read or has no
+    email, so the post is never sent without a receiver that was asked for."""
+    async def one(uid: int) -> tuple[int, str, str]:
+        try:
+            envelope = await client.get(
+                f"v3/user/{uid}", params={"returnFields[]": ["id", "email", "name"]},
+            )
+        except Exception as e:
+            raise to_llm_error(
+                e, operation="post_request_discussion (notify_user_ids lookup)",
+                record_id=uid,
+            ) from e
+        record = unwrap_record(envelope)
+        email = record.get("email") if isinstance(record, dict) else None
+        if not isinstance(email, str) or not email.strip():
+            raise RuntimeError(
+                f"post_request_discussion input error: user {uid} has no email "
+                f"address in CDESK, so it cannot be notified; nothing was posted."
+            )
+        name = record.get("name") if isinstance(record, dict) else None
+        return uid, email.strip(), name if isinstance(name, str) and name else email.strip()
+
+    return list(await asyncio.gather(*(one(uid) for uid in dict.fromkeys(user_ids))))
+
+
+def _merge_receivers(
+    users: list[tuple[int, str, str]], emails: list[str],
+) -> list[dict[str, Any]]:
+    """The `manual` entries, deduplicated case-insensitively by address. Each
+    carries `name` because an entry without one is stored but shows as an
+    empty receiver list in CDESK.
+
+    CDESK users also carry `id` + `user_src: "user"`, the shape the UI's
+    receiver picker sends: the backend then adds the in-app (bell) copy itself
+    (BaseModel::getNotifyReceivers) and routes the person as a user rather
+    than an outside address (NotifyRecipient::addDiscussionReceivers), so their
+    own notification settings apply. Plain addresses have no CDESK user and
+    stay email-only. Users go first, so an address given both ways keeps the
+    user entry."""
+    merged: dict[str, dict[str, Any]] = {}
+    for uid, email, name in users:
+        merged.setdefault(email.lower(), {
+            "notify": email, "name": name, "type": 0, "id": uid, "user_src": "user",
+        })
+    for email in emails:
+        merged.setdefault(email.lower(), {"notify": email, "name": email, "type": 0})
+    return list(merged.values())
+
+
+def _notification_report(
+    response: dict[str, Any], manual: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compare the receivers sent with the ones CDESK stored on the post.
+
+    `notify_email_to` comes back as a JSON-encoded string on the POST (a list
+    on the discussion GET); `msg.success` carries CDESK's "notification sent"
+    text, and is absent when nothing was sent. The list holds one entry per
+    channel, so only email entries (type 0) count as recorded receivers — a
+    user's in-app copy (type 4) can carry the same address."""
+    data = response.get("data")
+    raw = data.get("notify_email_to") if isinstance(data, dict) else None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw) if raw.strip() else []
+        except json.JSONDecodeError:
+            raw = []
+    entries = [r for r in (raw if isinstance(raw, list) else []) if isinstance(r, dict)]
+    recorded = list(dict.fromkeys(
+        str(r["notify"]) for r in entries
+        if str(r.get("type", 0)) == "0"
+        and isinstance(r.get("notify"), str) and "@" in r["notify"]
+    ))
+    in_app_ids = sorted({
+        int(r["id"]) for r in entries
+        if str(r.get("type")) == "4" and isinstance(r.get("id"), int)
+    })
+    recorded_lower = {r.lower() for r in recorded}
+    requested = [str(m["notify"]) for m in manual]
+    missing = [r for r in requested if r.lower() not in recorded_lower]
+
+    msg = response.get("msg")
+    success = msg.get("success") if isinstance(msg, dict) else None
+    confirmations = [
+        str(s.get("message") if isinstance(s, dict) else s)
+        for s in (success if isinstance(success, list) else [])
+    ]
+
+    report: dict[str, Any] = {
+        "requested": requested,
+        "recorded_receivers": recorded,
+        "in_app_recorded_for_user_ids": in_app_ids,
+        "cdesk_confirmation": confirmations,
+    }
+    if missing or not confirmations:
+        report["warning"] = (
+            "The post was saved, but CDESK did not confirm the notification as "
+            "requested: "
+            + (f"these receivers are not in the post's notified list: {missing}. "
+               if missing else "")
+            + ("CDESK returned no notification-sent message. " if not confirmations else "")
+            + "These receivers have not been shown to be notified."
+        )
+    return report
 
 
 # --- Tool descriptions --------------------------------------------------
@@ -1473,14 +1625,31 @@ _POST_REQUEST_DISCUSSION_DESC = inspect.cleandoc(
       - work_order_id — associate the message with a work order.
       - customer_signature — 1 = primary signature, 2 = secondary;
         only honored on channel="customer".
-      - custom_notify + discussion_receivers — override the auto-
-        resolved receiver set with explicit emails.
-      - customer_to / technote_to — opaque receiver descriptors. Pass
-        verbatim from CDESK UI if needed; this tool doesn't validate
-        their shape.
+      - notify_user_ids — CDESK user ids to email about this post. Each
+        user's address is read from their CDESK user record (the ids
+        find_user returns); an id that can't be read, or a user without
+        an email, fails the call before anything is posted. They are
+        added as CDESK users: they also get the in-app notification, and
+        their own notification settings apply.
+      - discussion_receivers — additional email addresses to notify,
+        e.g. people who are not CDESK users. These get the email only.
+        Values that are not email addresses fail the call before
+        anything is posted.
+      - custom_notify — what the receivers above do to CDESK's default
+        notifications. False (default): they are notified in addition
+        to the receivers CDESK picks by its own rules. True: only they
+        are notified, and CDESK's default receivers are not. Requires at
+        least one receiver.
       - notify_block / notify_customer_block / notify_sms_block — 0 or
         1 flags that suppress notifications.
 
-    Returns the created message record.
+    With no receivers given, CDESK notifies by its own rules.
+
+    Returns the created message record. When receivers were given, a
+    `notification` block lists the requested receivers, the email
+    receivers CDESK recorded on the post, the user ids it recorded an
+    in-app notification for, and CDESK's confirmation message; it
+    carries a `warning` when a requested receiver is not in the recorded
+    list or CDESK sent no confirmation.
     """
 )
