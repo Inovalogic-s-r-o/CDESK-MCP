@@ -62,11 +62,11 @@ def _error_page(
     well-known routes in server.py) a root-absolute link lands outside the app."""
     retry = (
         f'<p><a href="{html.escape(login_url, quote=True)}'
-        f'?session={html.escape(session, quote=True)}">Back to sign-in</a></p>'
+        f'?session={html.escape(session, quote=True)}">Back to login</a></p>'
         if session else ""
     )
     return _secure_html(
-        f"<h1>Microsoft sign-in</h1><p>{html.escape(message)}</p>{retry}",
+        f"<h1>Microsoft login</h1><p>{html.escape(message)}</p>{retry}",
         status_code=status_code,
     )
 
@@ -102,7 +102,7 @@ def register_azure_login_routes(
         session = request.query_params.get("session", "")
         if not session or not await provider.peek_session(session):
             return _err(
-                "", "Invalid or expired sign-in link. Please restart the connection.", 400
+                "", "Invalid or expired login link. Please restart the connection.", 400
             )
         # The user supplies their CDESK server URL (no silent default). This path
         # skips the browser's form validation entirely — the button navigates via
@@ -112,7 +112,7 @@ def register_azure_login_routes(
             problem = url_problem or "That CDESK server address cannot be used."
             return _err(
                 session,
-                f"{problem} Then click Sign in with Microsoft again.",
+                f"{problem} Then click Log in with Microsoft again.",
                 400,
             )
 
@@ -125,7 +125,7 @@ def register_azure_login_routes(
         if azure_id is None:
             return _err(
                 session,
-                "This CDESK server doesn't offer Microsoft sign-in. "
+                "This CDESK server doesn't offer Microsoft login. "
                 "Please use your CDESK login instead.",
                 400,
             )
@@ -162,14 +162,14 @@ def register_azure_login_routes(
         base_url = provider.valid_base_url(request.query_params.get("base_url", ""))
         if not session or not await provider.peek_session(session):
             return _err(
-                "", "Invalid or expired sign-in link. Please restart the connection.", 400
+                "", "Invalid or expired login link. Please restart the connection.", 400
             )
         if base_url is None:
             return _err(session, "That CDESK server isn't allowed.", 400)
         if error or not apitoken:
             return _err(
                 session,
-                "Microsoft sign-in was declined, or your Microsoft account isn't "
+                "Microsoft login was declined, or your Microsoft account isn't "
                 "linked to a CDESK user. Please try again or use your CDESK login.",
                 400,
             )
@@ -194,7 +194,7 @@ def register_azure_login_routes(
                 base_url=base_url,
             )
         except KeyError:
-            return _err(session, "Sign-in session expired. Please restart the connection.", 400)
+            return _err(session, "Login session expired. Please restart the connection.", 400)
         except ValueError:
             return _err(session, "That CDESK server isn't allowed.", 400)
         return RedirectResponse(redirect_url, status_code=302)

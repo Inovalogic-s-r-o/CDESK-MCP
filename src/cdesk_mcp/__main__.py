@@ -200,11 +200,12 @@ async def _startup_probe(
     str | None,
     dict[str, str],
 ]:
-    """Best-effort: build client and load the four enum caches (task,
+    """Best-effort: build client and read the four enums endpoints (task,
     request, request-catalog, deal) in parallel using
     ``return_exceptions=True`` so one broken endpoint doesn't take the whole
-    server down. The first GET against each endpoint also doubles as an
-    auth / connectivity check via the lazy login.
+    server down. This is an auth / connectivity check via the lazy login —
+    nothing it reads is kept, because enums are fetched afresh on every tool
+    call (see enums.py).
 
     Returns a 7-tuple:
       (client, task_cache, request_cache, catalog_cache, deal_cache,
@@ -218,9 +219,8 @@ async def _startup_probe(
       exception in the error message. (The tenant might also be down
       entirely; either way every tool would fail.)
     * **Partial failure** — at least one cache loaded successfully, so
-      the client is known to work. The broken cache(s) stay alive but
-      unloaded; they'll retry on demand (cache.resolve auto-loads on
-      first use). cache_warnings carries the per-module error strings
+      the client is known to work. Every cache fetches on demand in each
+      tool call anyway, so a broken endpoint is simply retried then. cache_warnings carries the per-module error strings
       so server_info can show the user *which* module is degraded,
       while task / customer / user tools that don't depend on the
       broken endpoint keep working normally. (A tenant with the

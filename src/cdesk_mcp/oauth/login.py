@@ -11,8 +11,10 @@ server-side and a fronting WAF should rate-limit too).
 
 from __future__ import annotations
 
+import base64
 import html
 import logging
+from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
@@ -43,63 +45,80 @@ _PROBE_TIMEOUT_SECONDS = 5.0
 
 # CDESK-branded consent page. The CSS lives in a plain (non-f) string so its
 # literal `{ }` don't collide with the f-string interpolation in the page
-# builder; the logo is an inline SVG approximation of the CDESK orange badge.
-_CDESK_LOGO_SVG = (
-    '<svg class="brand-logo" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg" '
-    'role="img" aria-label="CDESK logo">'
-    '<circle cx="20" cy="20" r="19" fill="#F47920"/>'
-    '<path d="M11.5 21 l5.2 5.2 L28.5 13" stroke="#fff" stroke-width="3.6" '
-    'stroke-linecap="round" stroke-linejoin="round" fill="none"/>'
-    "</svg>"
+# builder. The logo is CDESK's official one (assets/): dark lettering for the
+# light theme (cdesk.sk/wp-content/uploads/2023/01/CDESK_logo_en.png) and the
+# white-lettering variant CDESK's own dark login screen uses. Both are inlined as
+# data: URIs, so the page stays one self-contained response.
+def _png_data_uri(name: str) -> str:
+    raw = (Path(__file__).parent / "assets" / name).read_bytes()
+    return "data:image/png;base64," + base64.b64encode(raw).decode("ascii")
+
+
+_CDESK_LOGO_HTML = (
+    '<picture class="brand-logo">'
+    '<source media="(prefers-color-scheme: dark)" '
+    f'srcset="{_png_data_uri("cdesk-logo-dark.png")}">'
+    f'<img src="{_png_data_uri("cdesk-logo.png")}" alt="CDESK — Powerful Service Desk">'
+    "</picture>"
 )
 
 _LOGIN_STYLE = """<style>
-  :root{--orange:#F47920;--orange-dark:#d8660f;--ink:#2f3640;--muted:#6b7280;--line:#dfe3e8;--bg:#f4f6f8;
-        --ms-blue:#2b7cd3;--ms-blue-dark:#2367b3;}
+  /* Colours follow CDESK's own login screen. The page follows the visitor's
+     browser/OS theme (prefers-color-scheme); the dark palette is CDESK's. */
+  :root{color-scheme:light dark;
+        --orange:#F47920;--orange-dark:#d8660f;--ink:#2f3640;--muted:#6b7280;--line:#dfe3e8;--bg:#f4f6f8;
+        --card:#fff;--card-line:#dfe3e8;--field:#fff;--field-line:#d3d8de;--err:#c0392b;
+        --warn-bg:#fff6ef;--warn-line:#f3c79a;--warn-ink:#8a4b16;--hover:#f3f4f6;}
+  @media (prefers-color-scheme: dark){
+    :root{--orange:#FF8126;--orange-dark:#f06f12;--ink:#f2f2f2;--muted:#a19f9b;--line:#33322f;--bg:#2a2927;
+          --card:#1b1a19;--card-line:#2f2e2c;--field:#2b2a29;--field-line:#403f3c;--err:#ff7b6b;
+          --warn-bg:#2b2116;--warn-line:#6b4a24;--warn-ink:#f3c79a;--hover:#353432;}
+  }
   *{box-sizing:border-box;}
   body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);
        color:var(--ink);margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1rem;}
-  .card{background:#fff;width:100%;max-width:25rem;border:1px solid var(--line);border-radius:10px;
-        box-shadow:0 6px 24px rgba(0,0,0,.08);overflow:hidden;}
-  .brand{display:flex;align-items:center;gap:.65rem;padding:1.1rem 1.5rem;border-bottom:1px solid var(--line);}
-  .brand-logo{width:38px;height:38px;flex:0 0 auto;}
-  .brand-name{font-weight:800;font-size:1.3rem;letter-spacing:.5px;line-height:1;}
-  .brand-name sup{color:var(--orange);font-size:.55em;}
-  .brand-sub{font-size:.6rem;letter-spacing:.2em;text-transform:uppercase;color:var(--muted);margin-top:3px;}
-  .body{padding:1.5rem;}
-  h1{font-size:1.05rem;margin:0 0 .3rem;}
+  .card{background:var(--card);width:100%;max-width:27rem;border:1px solid var(--card-line);border-radius:14px;
+        box-shadow:0 6px 24px rgba(0,0,0,.12);overflow:hidden;}
+  .brand{display:flex;justify-content:center;padding:2rem 1.5rem .8rem;}
+  .brand-logo img{display:block;height:60px;width:auto;}
+  .body{padding:1rem 2rem 1.6rem;}
+  h1{font-size:1.05rem;margin:0 0 .3rem;text-align:center;}
+  .body > p{text-align:center;}
   p{color:var(--muted);font-size:.9rem;margin:.3rem 0;}
-  .client{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:.6rem .8rem;
+  .client{background:var(--field);border:1px solid var(--field-line);border-radius:8px;padding:.6rem .8rem;
           margin:.6rem 0 1rem;color:var(--ink);font-size:.85rem;}
-  .err{color:#c0392b;font-size:.85rem;margin:.5rem 0;}
+  .err{color:var(--err);font-size:.85rem;margin:.5rem 0;}
   label{display:block;margin:.85rem 0 .3rem;font-size:.78rem;font-weight:600;color:var(--ink);}
-  input:not([type=hidden]),select{width:100%;padding:.6rem .7rem;border:1px solid var(--line);border-radius:7px;
-                           font-size:.95rem;color:var(--ink);background:#fff;}
-  input:not([type=hidden]):focus,select:focus{outline:none;border-color:var(--orange);box-shadow:0 0 0 3px rgba(244,121,32,.18);}
-  .warn{background:#fff6ef;border:1px solid #f3c79a;border-radius:8px;padding:.6rem .8rem;margin:.5rem 0 0;
-        font-size:.78rem;color:#8a4b16;line-height:1.4;}
-  .hint{font-size:.75rem;color:var(--muted);margin:.35rem 0 0;line-height:1.4;}
-  .hint code{background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:0 .2rem;
-             font-size:.95em;}
-  button{width:100%;margin-top:1.3rem;padding:.7rem 1rem;background:var(--orange);color:#fff;font-weight:700;
-         font-size:.95rem;border:none;border-radius:7px;cursor:pointer;}
+  input:not([type=hidden]),select{width:100%;height:46px;padding:0 .9rem;border:1px solid var(--field-line);
+                           border-radius:6px;font-size:1rem;color:var(--ink);background:var(--field);}
+  input::placeholder{color:var(--muted);}
+  input:not([type=hidden]):focus,select:focus{outline:none;border-color:var(--orange);box-shadow:0 0 0 3px rgba(244,121,32,.2);}
+  .warn{background:var(--warn-bg);border:1px solid var(--warn-line);border-radius:8px;padding:.6rem .8rem;margin:.5rem 0 0;
+        font-size:.78rem;color:var(--warn-ink);line-height:1.4;}
+  button{width:100%;height:48px;margin-top:1.1rem;padding:0 1rem;background:var(--orange);color:#fff;font-weight:700;
+         font-size:1rem;border:none;border-radius:6px;cursor:pointer;}
   button:hover{background:var(--orange-dark);}
-  .ms-btn{display:flex;align-items:center;justify-content:center;gap:.55rem;margin-top:0;
-          background:var(--ms-blue);color:#fff;font-weight:600;}
-  .ms-btn:hover{background:var(--ms-blue-dark);}
-  .ms-btn svg{width:17px;height:17px;flex:0 0 auto;}
-  .alt-sep{margin:1.3rem 0 .6rem;text-align:center;font-size:.68rem;font-weight:700;
-           letter-spacing:.09em;text-transform:uppercase;color:var(--muted);}
-  .footer{padding:.8rem 1.5rem;border-top:1px solid var(--line);font-size:.72rem;color:var(--muted);text-align:center;}
+  /* Styled like the SSO button on CDESK's own login screen: it sits on the
+     field colour, with Microsoft's unaltered four-colour logo. */
+  .ms-btn{display:flex;align-items:center;justify-content:center;gap:12px;margin-top:0;
+          background:var(--field);color:var(--ink);border:1px solid var(--field-line);font-weight:700;}
+  .ms-btn:hover{background:var(--hover);}
+  /* the Microsoft glyph has a 1px margin inside its viewBox: 20px shows as ~18px */
+  .ms-btn svg{width:20px;height:20px;flex:0 0 auto;}
+  /* "—— OR ——" between the password login and the other services. */
+  .alt-sep{display:flex;align-items:center;gap:.9rem;margin:1.1rem 0;font-size:.85rem;
+           text-transform:uppercase;letter-spacing:.04em;color:var(--muted);}
+  .alt-sep::before,.alt-sep::after{content:"";flex:1;border-top:1px solid var(--line);}
+  .footer{padding:.9rem 1.5rem;border-top:1px solid var(--line);font-size:.72rem;color:var(--muted);text-align:center;}
   [hidden]{display:none !important;}
   .server-head{display:flex;align-items:baseline;justify-content:space-between;gap:.5rem;}
   .server-head label{margin-bottom:.3rem;}
-  .change{font-size:.75rem;font-weight:600;color:var(--orange-dark);background:none;border:none;
+  .change{font-size:.75rem;font-weight:600;color:var(--orange);background:none;border:none;height:auto;
           padding:0;margin:0;width:auto;cursor:pointer;text-decoration:underline;}
-  .change:hover{background:none;color:var(--orange);}
+  .change:hover{background:none;color:var(--orange-dark);}
   input[readonly]{background:var(--bg);color:var(--muted);}
-  .note{background:#fff6ef;border:1px solid #f3c79a;border-radius:8px;padding:.6rem .8rem;
-        margin:.7rem 0 0;font-size:.78rem;color:#8a4b16;line-height:1.4;}
+  .note{background:var(--warn-bg);border:1px solid var(--warn-line);border-radius:8px;padding:.6rem .8rem;
+        margin:.7rem 0 0;font-size:.78rem;color:var(--warn-ink);line-height:1.4;}
   button[disabled]{opacity:.65;cursor:progress;}
 </style>"""
 
@@ -115,15 +134,14 @@ _CUSTOM_WARNING = (
 )
 
 
-# The Microsoft 4-square glyph in white — the form CDESK's own login page uses on
-# its blue Microsoft button (the 4-colour logo needs a light background, and this
-# button is blue).
+# The Microsoft logo as Microsoft ships it: four 9x9 squares in the official
+# colours, as on CDESK's own "Log in with Microsoft" button. Never altered.
 _MS_LOGO_SVG = (
     '<svg viewBox="0 0 21 21" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">'
-    '<rect x="1" y="1" width="9" height="9" fill="#fff"/>'
-    '<rect x="11" y="1" width="9" height="9" fill="#fff"/>'
-    '<rect x="1" y="11" width="9" height="9" fill="#fff"/>'
-    '<rect x="11" y="11" width="9" height="9" fill="#fff"/></svg>'
+    '<rect x="1" y="1" width="9" height="9" fill="#f25022"/>'
+    '<rect x="11" y="1" width="9" height="9" fill="#7fba00"/>'
+    '<rect x="1" y="11" width="9" height="9" fill="#00a4ef"/>'
+    '<rect x="11" y="11" width="9" height="9" fill="#ffb900"/></svg>'
 )
 
 # Turns the one-page form into the two-step flow, and drives the Microsoft button.
@@ -237,7 +255,7 @@ _TWO_STEP_JS = """<script>
         // Reaching OUR server failed (offline, tunnel dropped, aborted). Never let
         // that block sign-in — see the "don't add a pre-flight probe back" comment
         // on the authenticate() call below. Proceed without the Microsoft button.
-        reveal(value,'We could not check that server just now. You can still sign in.',false,true);
+        reveal(value,'We could not check that server just now. You can still log in.',false,true);
       }).then(function(){
         clearTimeout(timer);
         if(inFlight===ctrl){inFlight=null;}
@@ -309,13 +327,13 @@ def _signin_error_text(e: CdeskAuthError) -> str:
     credentials into this page — so the two classified cases get their own
     wording and only unclassified failures fall back to the raw text."""
     if e.status == 401:
-        return "CDESK sign-in failed. The CDESK login or password was wrong."
+        return "CDESK login failed. The CDESK login or password was wrong."
     if e.status == 302:
         return (
-            "CDESK sign-in failed. This account requires two-factor "
+            "CDESK login failed. This account requires two-factor "
             "authentication, which the connector cannot complete."
         )
-    return f"CDESK sign-in failed: {e}"
+    return f"CDESK login failed: {e}"
 
 
 # What a probe outcome means to the person typing the address, and — the load-
@@ -348,10 +366,10 @@ _PROBE_BLOCKING: dict[str, str] = {
 _PROBE_ADVISORY: dict[str, str] = {
     "timeout": (
         "That address didn't respond in time. It may be behind a firewall, or the "
-        "port may be wrong. You can still sign in below."
+        "port may be wrong. You can still log in below."
     ),
     "http_error": (
-        "That address answered, but not like a CDESK server. You can still sign in "
+        "That address answered, but not like a CDESK server. You can still log in "
         "below, or go back and check the address."
     ),
 }
@@ -360,12 +378,12 @@ _PROBE_ADVISORY: dict[str, str] = {
 # range on a deployment that accepts arbitrary servers — otherwise the differences
 # between "refused", "timed out" and "404" make this an unauthenticated port
 # scanner for the network our server sits in.
-_PROBE_VAGUE = "We couldn't confirm that server. You can still sign in below."
+_PROBE_VAGUE = "We couldn't confirm that server. You can still log in below."
 
 
 _PROBE_PROTECTED = (
     "That address is protected and wouldn't tell us about itself. You can still "
-    "sign in below."
+    "log in below."
 )
 
 
@@ -413,10 +431,10 @@ _REQUIRED_FIELD_JS = """<script>
 def _azure_button_html(start_url: str) -> str:
     """The Microsoft (Entra) sign-in block that sits *below* the submit button.
 
-    Deliberately mirrors CDESK's own login screen: a small uppercase caption
-    ("use another service to sign in") followed by the blue Microsoft button, so
-    someone who knows the CDESK login page finds the same control in the same
-    place. The label matches CDESK's wording verbatim, English on every locale.
+    Deliberately mirrors CDESK's own login screen: an "OR" divider followed by
+    the Microsoft button, so someone who knows the CDESK login page finds the
+    same control in the same place. The label matches CDESK's wording verbatim,
+    English on every locale.
 
     Ships ``hidden``: it is revealed only once the probe has confirmed the chosen
     server actually has an azure connector, so we never offer Microsoft sign-in on
@@ -424,10 +442,10 @@ def _azure_button_html(start_url: str) -> str:
     from CDESK_PUBLIC_URL) — the old root-absolute ``/login/azure/start`` broke
     under path-prefix hosting."""
     return (
-        '<div class="alt-sep" id="altSep" hidden>Use another service to sign in</div>'
+        '<div class="alt-sep" id="altSep" hidden>or</div>'
         f'<button type="button" id="msLoginBtn" class="ms-btn" hidden '
         f'data-start-url="{html.escape(start_url, quote=True)}">'
-        f"{_MS_LOGO_SVG}<span>Sign in with Microsoft</span></button>"
+        f"{_MS_LOGO_SVG}<span>Log in with Microsoft</span></button>"
     )
 
 
@@ -453,8 +471,6 @@ def _server_url_field_html(value: str) -> str:
         '<div class="err" id="probeErr" hidden></div>'
         '<div class="note" id="probeNote" hidden></div>'
         '<div id="step1extra">'
-        '<div class="hint">Just the address you use in your browser — '
-        '<code>https://</code> is added if you leave it out.</div>'
         f'<div class="warn">{html.escape(_CUSTOM_WARNING)}</div>'
         "</div>"
     )
@@ -475,8 +491,8 @@ def _login_page_html(
     """CDESK-branded login/consent form (no template engine). Posts back to
     /login with the opaque OAuth session id carried in a hidden field. When
     known, identifies the requesting client + redirect target so the user can
-    see who they're authorizing (anti-phishing). When ``azure_enabled`` a blue
-    "Sign in with Microsoft" button below the submit — same wording and
+    see who they're authorizing (anti-phishing). When ``azure_enabled`` a
+    "Log in with Microsoft" button below the submit — same wording and
     placement as CDESK's own login screen — starts the Office365 SSO for the
     selected CDESK server (connector id discovered at /login/azure/start)."""
     safe_session = html.escape(session, quote=True)
@@ -505,22 +521,16 @@ def _login_page_html(
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sign in to CDESK</title>
+<title>Log in to CDESK</title>
 {_LOGIN_STYLE}
 </head>
 <body>
 <div class="card">
-  <div class="brand">
-    {_CDESK_LOGO_SVG}
-    <div>
-      <div class="brand-name">CDESK<sup>&reg;</sup></div>
-      <div class="brand-sub">Powerful Service Desk</div>
-    </div>
-  </div>
+  <div class="brand">{_CDESK_LOGO_HTML}</div>
   <div class="body">
     {client_block}
-    <h1>Sign in to CDESK</h1>
-    <p>Sign in with your CDESK account to authorize this connector.</p>
+    <h1>Log in to CDESK</h1>
+    <p>Log in with your CDESK account to authorize this connector.</p>
     {error_block}
     <form method="post" action="" id="loginForm" data-verified-for="{verified_for}">
       <input type="hidden" name="session" value="{safe_session}">
@@ -533,7 +543,7 @@ def _login_page_html(
         <input id="login" name="login" autocomplete="username" required>
         <label for="password">Password</label>
         <input id="password" name="password" type="password" autocomplete="current-password" required>
-        <button type="submit">Sign in</button>
+        <button type="submit">Log in</button>
         {azure_block}
       </div>
     </form>
@@ -560,7 +570,7 @@ def register_login_route(
     The page is two-step: the user enters only their CDESK server address and
     presses "Verify server", which asks /login/probe what that server is and what
     it offers; the credential fields are revealed in place. When ``azure_enabled``
-    a "Sign in with Microsoft" button (see oauth/azure_login.py) is
+    a "Log in with Microsoft" button (see oauth/azure_login.py) is
     revealed too, but only for a server whose connector list actually contains an
     azure entry.
 
@@ -630,7 +640,7 @@ def register_login_route(
         if not session or not await provider.peek_session(session):
             return _secure_json(
                 {"server": typed, "blocked": True,
-                 "message": "This sign-in link has expired. Please restart the "
+                 "message": "This login link has expired. Please restart the "
                             "connection from your client."},
                 status_code=400,
             )

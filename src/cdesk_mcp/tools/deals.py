@@ -496,16 +496,15 @@ async def _require_module_enabled(cache: EnumCache, operation: str) -> None:
     the backend should gate its own writes, since any other API client bypasses
     us. See docs/bugs.md.
     """
+    # The enums are fetched per tool call, and the guard runs before anything
+    # else in the call has read them — so load them here, or `settings` is
+    # empty and the guard silently waves every write through. Unreadable
+    # settings mean "unknown": never block on a guess.
+    try:
+        await cache.load()
+    except Exception:  # noqa: BLE001
+        return
     if _module_disabled(cache):
-        # The cached settings may predate an admin re-enabling the module, and
-        # a false refusal is worse than a missed warning — re-read once before
-        # refusing.
-        try:
-            await cache.refresh()
-        except Exception:  # noqa: BLE001 - keep the original verdict on failure
-            pass
-        if not _module_disabled(cache):
-            return
         raise RuntimeError(
             f"{operation} refused: the CDESK Zákazky (deal) module is DISABLED "
             f"for this tenant (`contract.enabled` is off, reported as "

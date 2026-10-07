@@ -158,6 +158,9 @@ class RequestScopedEnumCache:
     def snapshot(self) -> dict[str, list[dict[str, Any]]]:
         return self._current().snapshot()
 
+    def bucket_is_absent(self, bucket: str) -> bool:
+        return self._current().bucket_is_absent(bucket)
+
     def id_name_map(self, bucket: str) -> dict[Any, str]:
         return self._current().id_name_map(bucket)
 

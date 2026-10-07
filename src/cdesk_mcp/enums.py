@@ -7,20 +7,24 @@ Matching is diacritic-insensitive (NFD-decompose + drop combining marks) and
 case-insensitive (casefold). Both display name and every `lang_<locale>`
 variant participate, so the same status is reachable across languages.
 
-Cache lifetime:
-- Loaded on first access (`load()`); idempotent under concurrent callers.
-- Manual `refresh()` to force a reload.
-- TTL: cache older than 1 hour gets refreshed on next access.
-- Miss-triggered refresh: a resolve that doesn't find the name attempts one
-  refresh, rate-limited to once per minute, so garbage input can't thrash.
+Lifetime — nothing is cached across tool calls. Enums change on the tenant at
+any time (a status renamed, a category added, a module switched on), so every
+tool call reads them from the API afresh:
+- The first lookup in a call fetches the endpoint; later lookups in the SAME
+  call reuse that response (a create resolving status, priority and type makes
+  one request, not three).
+- The parsed response lives in a ContextVar scope. The MCP server handles each
+  request in its own asyncio task, which starts from a copy of the context
+  without that scope, so the next call fetches again.
+- `refresh()` re-fetches within the current call.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import re
-import time
 import unicodedata
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -29,8 +33,6 @@ from typing import Any, Protocol
 log = logging.getLogger(__name__)
 
 _DEFAULT_ENUMS_PATH = "v3/task/enums"
-_MIN_MISS_REFRESH_INTERVAL_SECONDS = 60.0
-_MAX_CACHE_AGE_SECONDS = 3600.0  # 1 hour, per architecture.md
 _FUZZY_MIN_RATIO = 0.3
 # lang_<2-3 letter locale code> — accepts lang_en, lang_sk, lang_cs etc.
 # Rejects lang_id, lang_iso_code, lang_name, lang_updated_at, lang_description.
@@ -81,7 +83,43 @@ class AmbiguousEnumNameError(ValueError):
         )
 
 
+@dataclass
+class _Loaded:
+    """One parsed enums response."""
+
+    buckets: dict[str, list[EnumEntry]]
+    # Key/value-shaped buckets (e.g. the request `type` "druh": {key,value})
+    # that don't fit the int-id EnumEntry model but are still needed — e.g.
+    # the type code for create_request. Surfaced via snapshot().
+    raw_buckets: dict[str, list[dict[str, Any]]]
+    # The endpoint's `settings` object, when it sends one. Carries the tenant
+    # gates a module needs before a write — notably `enabled`, which is how a
+    # switched-off module is detectable on the endpoints CDESK does NOT gate
+    # (deal create/delete return 200 with the module off).
+    settings: dict[str, Any]
+
+
+_EMPTY = _Loaded(buckets={}, raw_buckets={}, settings={})
+
+# The enums fetched during the current tool call, keyed by EnumCache instance.
+# Unset (None) until the first lookup of a call; see the module docstring.
+_CALL_SCOPE: contextvars.ContextVar[dict[int, _Loaded] | None] = contextvars.ContextVar(
+    "cdesk_enum_call_scope", default=None,
+)
+
+
+def _call_scope() -> dict[int, _Loaded]:
+    scope = _CALL_SCOPE.get()
+    if scope is None:
+        scope = {}
+        _CALL_SCOPE.set(scope)
+    return scope
+
+
 class EnumCache:
+    """Name ↔ id lookups over one enums endpoint, read fresh on every tool call
+    (the name is historical — nothing is kept between calls)."""
+
     def __init__(
         self,
         client: _ClientProto,
@@ -89,21 +127,20 @@ class EnumCache:
     ) -> None:
         self._client = client
         self._endpoint = endpoint
-        self._buckets: dict[str, list[EnumEntry]] = {}
-        # Key/value-shaped buckets (e.g. the request `type` "druh": {key,value})
-        # that don't fit the int-id EnumEntry model but are still needed — e.g.
-        # the type code for create_request. Surfaced via snapshot() so the LLM
-        # can discover them. name->code resolution uses _resolve_keyvalue.
-        self._raw_buckets: dict[str, list[dict[str, Any]]] = {}
-        # The endpoint's `settings` object, when it sends one. Carries the
-        # tenant gates a module needs before a write — notably `enabled`, which
-        # is how a switched-off module is detectable on the endpoints CDESK
-        # does NOT gate (deal create/delete return 200 with the module off).
-        self._settings: dict[str, Any] = {}
-        self._loaded = False
         self._lock = asyncio.Lock()
-        self._last_load: float = 0.0
-        self._last_miss_refresh: float = 0.0
+
+    def _state(self) -> _Loaded:
+        """This call's parsed response, or an empty one before load()."""
+        scope = _CALL_SCOPE.get()
+        return (scope or {}).get(id(self), _EMPTY)
+
+    @property
+    def _buckets(self) -> dict[str, list[EnumEntry]]:
+        return self._state().buckets
+
+    @property
+    def _raw_buckets(self) -> dict[str, list[dict[str, Any]]]:
+        return self._state().raw_buckets
 
     @property
     def endpoint(self) -> str:
@@ -116,42 +153,47 @@ class EnumCache:
     @property
     def settings(self) -> dict[str, Any]:
         """The endpoint's `settings` object ({} when it sends none)."""
-        return self._settings
+        return self._state().settings
 
     @property
     def loaded(self) -> bool:
-        return self._loaded
+        """Whether the enums were already fetched in the current tool call."""
+        return id(self) in (_CALL_SCOPE.get() or {})
 
     @property
     def is_stale(self) -> bool:
-        if not self._loaded:
-            return True
-        return time.monotonic() - self._last_load > _MAX_CACHE_AGE_SECONDS
+        """Kept for callers of the old TTL cache: true until this call fetched."""
+        return not self.loaded
 
     async def load(self) -> None:
-        """Idempotent — first call fetches; concurrent callers collapse to one."""
+        """Fetch the enums unless the current tool call already did."""
+        scope = _call_scope()
         async with self._lock:
-            if self._loaded:
+            if id(self) in scope:
                 return
-            await self._fetch_locked()
+            scope[id(self)] = await self._fetch()
 
     async def refresh(self) -> None:
+        """Fetch the enums again, within the current tool call."""
+        scope = _call_scope()
         async with self._lock:
-            await self._fetch_locked()
+            scope[id(self)] = await self._fetch()
 
-    async def _fetch_locked(self) -> None:
+    async def _fetch(self) -> _Loaded:
         response = await self._client.get(self._endpoint)
-        self._buckets = _parse_response(response, self._endpoint)
-        self._raw_buckets = _extract_keyvalue_buckets(response)
+        buckets = _parse_response(response, self._endpoint)
         settings = response.get("settings") if isinstance(response, dict) else None
-        self._settings = settings if isinstance(settings, dict) else {}
-        self._loaded = True
-        self._last_load = time.monotonic()
-        log.info(
-            "EnumCache[%s] loaded: %s",
-            self._endpoint,
-            {b: len(e) for b, e in self._buckets.items()},
+        loaded = _Loaded(
+            buckets=buckets,
+            raw_buckets=_extract_keyvalue_buckets(response),
+            settings=settings if isinstance(settings, dict) else {},
         )
+        log.info(
+            "EnumCache[%s] fetched: %s",
+            self._endpoint,
+            {b: len(e) for b, e in buckets.items()},
+        )
+        return loaded
 
     async def resolve(
         self,
@@ -162,7 +204,7 @@ class EnumCache:
         allow_refresh: bool = True,
     ) -> int | None:
         """Resolve an enum name → its enum `id`. See `resolve_entry` for the
-        matching + refresh semantics; this just returns the matched entry's id."""
+        matching semantics; this just returns the matched entry's id."""
         entry = await self.resolve_entry(
             bucket, name, parent_id=parent_id, allow_refresh=allow_refresh
         )
@@ -191,53 +233,20 @@ class EnumCache:
         entries under multiple parents, raises AmbiguousEnumNameError rather
         than silently picking the first.
 
-        Refresh behavior (when allow_refresh=True):
-        - First call ever lazy-loads.
-        - Cache older than TTL triggers a proactive refresh.
-        - Miss triggers a refresh (rate-limited to once per minute).
-        - Refresh failures don't propagate — they degrade to a None result.
+        The enums are fetched on the first lookup of the tool call (unless
+        `allow_refresh` is False, which then answers None); a fetch failure
+        degrades to a None result. A miss is final — the data is this call's.
         """
-        if not self._loaded:
+        if not self.loaded:
             if not allow_refresh:
                 return None
             try:
                 await self.load()
             except Exception as e:
                 log.warning(
-                    "Initial enum load failed: %s: %s", type(e).__name__, e,
+                    "Enum load failed: %s: %s", type(e).__name__, e,
                 )
                 return None
-
-        # Proactive TTL refresh.
-        if allow_refresh and self.is_stale:
-            try:
-                await self.refresh()
-            except Exception as e:
-                log.warning(
-                    "TTL refresh failed (using stale cache): %s: %s",
-                    type(e).__name__, e,
-                )
-
-        cached = self._match_cached(bucket, name, parent_id)
-        if cached is not None or not allow_refresh:
-            return cached
-
-        # Miss-triggered refresh. Use a separate timer from _last_load so the
-        # *first* miss after startup actually fires (M5.3) — but garbage input
-        # can't thrash because we rate-limit miss-refreshes specifically.
-        now = time.monotonic()
-        if now - self._last_miss_refresh < _MIN_MISS_REFRESH_INTERVAL_SECONDS:
-            return None
-        self._last_miss_refresh = now  # set before refresh to suppress racers
-
-        try:
-            await self.refresh()
-        except Exception as e:
-            log.warning(
-                "Miss-refresh failed: %s: %s", type(e).__name__, e,
-            )
-            return None
-
         return self._match_cached(bucket, name, parent_id)
 
     def _match_cached(
@@ -348,7 +357,8 @@ class EnumCache:
         return not any(entry.name for entry in entries)
 
     def snapshot(self) -> dict[str, list[dict[str, Any]]]:
-        """JSON-serializable view of the cache. Used by the get_task_enums tool."""
+        """JSON-serializable view of this call's enums. Used by the get_*_enums
+        tools (load() first)."""
         out: dict[str, list[dict[str, Any]]] = {}
         for bucket, entries in self._buckets.items():
             out[bucket] = []
