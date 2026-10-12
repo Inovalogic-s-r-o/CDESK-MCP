@@ -19,9 +19,22 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from cdesk_mcp import base_config
 from cdesk_mcp.cdesk_client import CdeskClient
+from cdesk_mcp.field_policy import (
+    CUSTOMER_FIELDS,
+    CUSTOMER_UPDATE_FIELDS,
+    customer_settings,
+    customer_type_tags,
+    refuse_if_violated,
+    violations,
+)
 from cdesk_mcp.filters import build_customer_filter, encode_sb
+from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
+    drop_empty_fields,
+    list_meta,
+    TEXT_MATCH_NOTE,
     annotate_write_warnings,
     apply_field_scope,
     redact_secrets,
@@ -47,6 +60,28 @@ _CUSTOMER_CREATE_FIELDS = {
 _MAX_PER_PAGE = 100
 
 
+# What a customer write answers with (UAT low-priority L1): an older backend
+# sends the whole customer model back — ~25 kB on UAT, with a serialized PHP
+# settings blob and the mail-server configuration — and even the current one
+# carries empty fields. None of it tells the model anything about the write
+# (passwords were already masked by redact_secrets). get_customer still returns
+# a full record when asked.
+_CUSTOMER_INTERNAL_PREFIXES = ("pop3_", "smtp_", "imap_", "broad_read_", "error_evaluation_")
+_CUSTOMER_INTERNAL_KEYS = frozenset({"auto_mail_server", "settings", "easyclickSettings"})
+
+
+def _compact_customer_write(result: dict[str, Any]) -> dict[str, Any]:
+    for key in ("savedData", "data"):
+        record = result.get(key)
+        if isinstance(record, dict):
+            result[key] = {
+                k: v for k, v in drop_empty_fields(record).items()
+                if k not in _CUSTOMER_INTERNAL_KEYS
+                and not k.startswith(_CUSTOMER_INTERNAL_PREFIXES)
+            }
+    return result
+
+
 def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
     """Register all Customer-module tools on the given FastMCP instance.
     Called by build_server when client is available.
@@ -59,7 +94,7 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
     register_task_tools."""
 
     @mcp.tool(
-        description=_LIST_CUSTOMERS_DESC,
+        description=_LIST_CUSTOMERS_DESC + "\n\n" + sort_note("customers") + "\n\n" + TEXT_MATCH_NOTE,
         annotations=ToolAnnotations(title="List customers", readOnlyHint=True),
     )
     async def list_customers(
@@ -91,17 +126,17 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
             params: dict[str, Any] = {"pg": page, "pp": per_page}
             apply_field_scope(params, fieldset, fields)
             if sort:
-                params["sort"] = sort
+                params["sort"] = resolve_sort("customers", sort)
             if sb is not None:
                 params["sb"] = encode_sb(sb)
-            response = await client.get("v3/company", params=params)
+            response, paging = await client.get_page("v3/company", params=params)
         except ValueError as e:
             raise RuntimeError(f"list_customers input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="list_customers") from e
 
         records, meta = unwrap_list(response)
-        result = {"items": records, "meta": meta, "page": page, "per_page": per_page}
+        result = {"items": records, "meta": list_meta(meta, paging, dropped=dropped_clauses), "page": page, "per_page": per_page}
         if dropped_clauses:
             result["unsupported_filters"] = unsupported_filter_directive(dropped_clauses)
         return result
@@ -219,6 +254,18 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
         custom_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
+            # The tenant's customer FORM rules, read live from core/base-config
+            # (no v3 source; v1 customer/settings is admin-only): each field the
+            # form requires must be given, and with customer_type at 2 the tags
+            # must include a customer-type tag (CDESK checks that on create only).
+            customer_cfg = customer_settings(await base_config.load(client))
+            refuse_if_violated(violations(CUSTOMER_FIELDS, customer_cfg, {
+                "tag_ids": customer_type_tags(tag_ids, customer_cfg),
+                "email_general": email_general, "phone_general": phone_general,
+                    "mobile_general": mobile_general, "web_page": web_page,
+                    "street": street, "city": city, "postal_code": postal_code,
+                    "country": country, "ico": ico, "dic": dic, "icdph": icdph,
+            }))
             validate_custom_fields(custom_fields)
             # Validates ISO shape; a naive datetime gets the tenant offset
             # (CDESK reads naive as UTC); bare dates pass through unchanged.
@@ -258,10 +305,10 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
             raise RuntimeError(f"create_customer input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="create_customer") from e
-        return redact_secrets(annotate_write_warnings(
+        return _compact_customer_write(redact_secrets(annotate_write_warnings(
             response if isinstance(response, dict) else {"data": response},
             sent_body=body,
-        ))
+        )))
 
     @mcp.tool(
         description=_UPDATE_CUSTOMER_DESC,
@@ -295,6 +342,18 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
         custom_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
+            # The tenant's customer FORM rules, read live from core/base-config
+            # (no v3 source; v1 customer/settings is admin-only): a required
+            # field cannot be cleared (left out = unchanged).
+            refuse_if_violated(violations(
+                CUSTOMER_UPDATE_FIELDS, customer_settings(await base_config.load(client)), {
+                    "email_general": email_general, "phone_general": phone_general,
+                    "mobile_general": mobile_general, "web_page": web_page,
+                    "street": street, "city": city, "postal_code": postal_code,
+                    "country": country, "ico": ico, "dic": dic, "icdph": icdph,
+                },
+                update=True,
+            ))
             if name is not None and not name.strip():
                 raise ValueError("name must be a non-empty string")
             validate_custom_fields(custom_fields)
@@ -339,10 +398,10 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
             raise RuntimeError(f"update_customer input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="update_customer", record_id=id) from e
-        return redact_secrets(annotate_write_warnings(
+        return _compact_customer_write(redact_secrets(annotate_write_warnings(
             response if isinstance(response, dict) else {"data": response},
             sent_body=body,
-        ))
+        )))
 
     @mcp.tool(
         description=_DELETE_CUSTOMER_DESC,
@@ -424,16 +483,7 @@ _LIST_CUSTOMERS_DESC = inspect.cleandoc(
 
     Pagination: page (1-based), per_page (default 20, max 100).
 
-    Ordering (re-verified live 2026-07-31 — the backend behaviour CHANGED):
-    omitting `sort` gives id ascending (oldest first). A BARE COLUMN NAME now
-    genuinely sorts ASCENDING by that column ("name" confirmed against a
-    record deliberately given the highest id and an alphabetically-first
-    name). A direction modifier is NOT honored — "-name" fell back to id
-    ascending, i.e. the default order. So: for ascending order by one column
-    pass the bare name; DESCENDING is not available server-side — page the
-    set and sort client-side, and never assume a "-" prefix was applied.
-    `meta` is usually empty (no total count) — detect the last page by a
-    short/empty page.
+    `meta.total` is the number of records matching the filter across all pages (CDESK's own count) and `meta.last_page` tells whether this is the last page.
 
     Response shaping (same semantics as get_customer): fieldset selects the
     field group per record ("base"/"extended"/"all"/"custom"); fields is an
@@ -528,7 +578,17 @@ _CREATE_CUSTOMER_DESC = inspect.cleandoc(
     require at least one customer-type classification tag at create time;
     the server will surface that as a clear validation error if so. We
     don't cache tag ids — discover them via the CDESK UI or sb_raw
-    queries.
+    queries. When the tenant requires a customer type, tag_ids must
+    include a customer-type tag (CDESK's customer/supplier tags) — read
+    live with the rest of the tenant's customer form: e-mail, phones, web,
+    address, IČO, DIČ and IČ DPH are each refused when missing if the form
+    requires them (and cannot be cleared by update_customer).
+    The customer-type tag also decides whether the company can
+    receive requests: when the tenant flags a tag as "requests may be
+    added" (CDESK's default customer-type tag does), a company created
+    without such a tag is refused by create_request with "Zadajte
+    aktívneho zákazníka". Some tenants also require price-list templates
+    on a new company, which this tool cannot send.
 
     cdesk_allowed: pass True to enable CDESK-portal access for this
     customer (sends 'Y'). Omit to leave it at the tenant default.
@@ -544,6 +604,11 @@ _CREATE_CUSTOMER_DESC = inspect.cleandoc(
     Returns: {data: <new id>, savedData: {...full record...}}; check the
     optional `warnings` list for silently-dropped/ignored fields
     (e.g. `code` without the company code-field write right).
+
+    Side effects (by CDESK): on a tenant with CDESK's mail-server integration
+    (the customer's auto_mail_server on the default POP3 server), creating a
+    customer also creates a POP3 mailbox for it on that mail server — it stays
+    when the customer is deleted.
     """
 )
 
@@ -564,6 +629,10 @@ _UPDATE_CUSTOMER_DESC = inspect.cleandoc(
 
     Returns: {data: <id>, savedData: {...full record...}}; check the
     optional `warnings` list for silently-dropped/ignored fields.
+
+    Side effects (by CDESK): an update can re-run the customer's mailbox setup and
+    answer "Mailbox creating error 2 (user already exists!)" — the mailbox exists
+    already; the update itself is stored.
     """
 )
 

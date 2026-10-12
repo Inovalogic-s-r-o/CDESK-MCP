@@ -43,6 +43,13 @@ class RequestScopedClient:
         client = await self._resolve()
         return await client.get(path, params=params)
 
+    async def get_page(
+        self, path: str, *, params: dict[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        client = await self._resolve()
+        result: tuple[Any, dict[str, Any]] = await client.get_page(path, params=params)
+        return result
+
     async def post(self, path: str, *, json: dict[str, Any] | None = None) -> Any:
         client = await self._resolve()
         return await client.post(path, json=json)
@@ -158,6 +165,9 @@ class RequestScopedEnumCache:
     def snapshot(self) -> dict[str, list[dict[str, Any]]]:
         return self._current().snapshot()
 
+    def extra(self, key: str) -> Any:
+        return self._current().extra(key)
+
     def bucket_is_absent(self, bucket: str) -> bool:
         return self._current().bucket_is_absent(bucket)
 
@@ -166,6 +176,9 @@ class RequestScopedEnumCache:
 
     def action_code_name_map(self, bucket: str) -> dict[Any, str]:
         return self._current().action_code_name_map(bucket)
+
+    def key_name_map(self, bucket: str) -> dict[Any, str]:
+        return self._current().key_name_map(bucket)
 
     # --- properties ---
     @property

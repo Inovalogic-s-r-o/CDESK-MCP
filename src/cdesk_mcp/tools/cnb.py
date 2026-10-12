@@ -28,6 +28,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from cdesk_mcp import base_config
 from cdesk_mcp.cdesk_client import CdeskApiError, CdeskClient
 from cdesk_mcp.tools._export_cache import ExportSnapshotStore
 from cdesk_mcp.tools._helpers import to_llm_error, validate_fields
@@ -112,6 +113,13 @@ def register_cnb_tools(
         annotations=ToolAnnotations(title="Export CMDB CI", readOnlyHint=True),
     )
     async def export_cmdb_ci() -> dict[str, Any]:
+        data = await base_config.load(client)
+        if isinstance(data, dict) and data.get("cnb_server") is False:
+            raise RuntimeError(
+                "export_cmdb_ci works only on the CNB tenant (it exports CNB's own "
+                "CI fields); this CDESK server is not one. list_configuration_items "
+                "pages through CIs on any tenant."
+            )
         try:
             response = await client.get(_EXPORT_PATH)
         except httpx.HTTPStatusError as e:

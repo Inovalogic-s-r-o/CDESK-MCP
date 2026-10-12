@@ -18,6 +18,7 @@ from mcp.server.auth.settings import (
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import AnyHttpUrl
 
+from cdesk_mcp import base_config
 from cdesk_mcp.cdesk_client import CdeskClient
 from cdesk_mcp.config import Config
 from cdesk_mcp.enums import EnumCache
@@ -172,6 +173,18 @@ async def _run_stdio(config: Config) -> None:
             probe_error, cache_warnings,
         ) = await _startup_probe(config)
 
+    cnb_tools = True
+    if client is not None and probe_error is None:
+        # One tenant in stdio: leave the CNB-only export tools out unless this
+        # is a CNB tenant (base-config `cnb_server`). Unreadable → keep them.
+        # In its own task: base_config caches per call in a ContextVar, and a
+        # cache set in this (main) context would be inherited by every later
+        # tool call — a stale base-config forever.
+        data = await asyncio.create_task(base_config.load(client))
+        if isinstance(data, dict) and data.get("cnb_server") is False:
+            cnb_tools = False
+            log.info("not a CNB tenant: export_cmdb_ci / get_cmdb_export_page not offered")
+
     try:
         server = build_server(
             client=client,
@@ -182,6 +195,7 @@ async def _run_stdio(config: Config) -> None:
             probe_error=probe_error,
             cache_warnings=cache_warnings,
             evidence_threshold=config.evidence_threshold,
+            cnb_tools=cnb_tools,
         )
         await server.run_stdio_async()
     finally:

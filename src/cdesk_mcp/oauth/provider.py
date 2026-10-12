@@ -33,7 +33,7 @@ process-local sets (see oauth/memsets.py), not a datastore:
   minutes; the CDESK logout kills the apitoken but NOT the CDESK refresh token —
   CDESK has no route that revokes one — so a revoked grant replayed on another
   replica or after a restart could still renew until that token expires. See
-  docs/bugs/bugs.md.)
+  docs/bugs/auth.md.)
 
 **Session lifetime.** The CDESK refresh token is the credential a session lives
 on; the apitoken is only its short-lived derivative (CDESK always gives it the

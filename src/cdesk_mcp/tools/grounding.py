@@ -26,7 +26,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -115,6 +115,14 @@ class GroundingDomain:
     # display uses action_code_name_map instead of id_name_map. Tasks (which
     # carry the enum id) leave this False.
     status_by_action_code: bool = False
+    # Who/what a record is about, as (key, record field) pairs. scope_fields are
+    # the id keys a claim's `scope` may pin (named like this domain's filter
+    # keys); context_fields are echoed with each verified quote so a mismatch
+    # between the claim's subject and the record is visible. company_field
+    # names the customer id whose name is looked up for that context.
+    scope_fields: tuple[tuple[str, str], ...] = ()
+    context_fields: tuple[tuple[str, str], ...] = ()
+    company_field: str | None = None
 
 
 # --- per-domain filter resolvers ----------------------------------------
@@ -148,6 +156,7 @@ async def _resolve_request_filter(
     return build_request_filter(
         text_search=f.get("text_search"),
         status_id=status_id,
+        status_group=f.get("status_group"),
         priority_id=priority_id,
         cat_type_id=cat_type_id,
         base_type=f.get("base_type"),
@@ -185,6 +194,7 @@ async def _resolve_task_filter(
     return build_task_filter(
         text_search=f.get("text_search"),
         status_id=status_id,
+        status_group=f.get("status_group"),
         type_id=type_id,
         solver_id=f.get("solver_id"),
         customer_id=f.get("customer_id"),
@@ -271,7 +281,7 @@ async def _resolve_fill_filter(
 # _validate_filters before any enum/HTTP work, which is what cleanly stops a
 # status_name/type_name slipping into a customer/user search.
 _REQUEST_FILTER_KEYS = frozenset({
-    "text_search", "status_name", "priority_name", "place_name",
+    "text_search", "status_name", "status_group", "priority_name", "place_name",
     "cat_type_name", "base_type",
     # `company` matches the list_requests param; `customer_id` kept as a
     # transitional alias (see _resolve_request_filter).
@@ -281,7 +291,7 @@ _REQUEST_FILTER_KEYS = frozenset({
     "created_after", "created_before", "sb_raw",
 })
 _TASK_FILTER_KEYS = frozenset({
-    "text_search", "status_name", "type_name", "solver_id", "customer_id",
+    "text_search", "status_name", "status_group", "type_name", "solver_id", "customer_id",
     "valid_from_after", "valid_from_before",
     "deadline_after", "deadline_before",
     "created_after", "created_before", "sb_raw",
@@ -297,7 +307,9 @@ _FILL_FILTER_KEYS = frozenset({
 })
 
 _REQUEST_FILTER_HELP = (
-    "requests: text_search, status_name, priority_name, place_name, "
+    "requests: text_search, status_name, status_group (open / completed / "
+    "closed / closed_and_completed / waiting_for_response — CDESK's own "
+    "groups, see list_requests), priority_name, place_name, "
     "cat_type_name (category type, resolved to cat_type_id), base_type "
     "(base-type letter e.g. 'H'), company, solver_id, solver_group_id, "
     "catalog_id, deal_id, project_contract_id, branch_id, "
@@ -305,9 +317,9 @@ _REQUEST_FILTER_HELP = (
     "(sla/due-date/deleted filters are not honored by the v3 request list)"
 )
 _TASK_FILTER_HELP = (
-    "tasks: text_search, status_name, type_name, solver_id, customer_id, "
-    "valid_from_after/before, deadline_after/before, created_after/before, "
-    "sb_raw (open/late filters are not honored by the v3 task list)"
+    "tasks: text_search, status_name, status_group (open / closed), type_name, "
+    "solver_id, customer_id, valid_from_after/before, deadline_after/before, "
+    "created_after/before, sb_raw (a late filter is not honored by the v3 task list)"
 )
 _CUSTOMER_FILTER_HELP = "customers: text_search, status, sb_raw"
 _USER_FILTER_HELP = "users: text_search, company_id, user_type, status, sb_raw"
@@ -361,6 +373,19 @@ def build_domains(
             allowed_filter_keys=_REQUEST_FILTER_KEYS,
             filter_help=_REQUEST_FILTER_HELP,
             status_by_action_code=True,
+            # Live v3 request detail: id_company / id_solver / solver_group_id
+            # (verified 2026-10-09).
+            scope_fields=(
+                ("company", "id_company"),
+                ("solver_id", "id_solver"),
+                ("solver_group_id", "solver_group_id"),
+            ),
+            context_fields=(
+                ("company_id", "id_company"),
+                ("solver_id", "id_solver"),
+                ("solver_group_id", "solver_group_id"),
+            ),
+            company_field="id_company",
         ),
         "tasks": GroundingDomain(
             name="tasks",
@@ -378,6 +403,9 @@ def build_domains(
             resolve_filter=_resolve_task_filter,
             allowed_filter_keys=_TASK_FILTER_KEYS,
             filter_help=_TASK_FILTER_HELP,
+            scope_fields=(("customer_id", "company_id"), ("solver_id", "solver_id")),
+            context_fields=(("company_id", "company_id"), ("solver_id", "solver_id")),
+            company_field="company_id",
         ),
         "customers": GroundingDomain(
             name="customers",
@@ -444,6 +472,17 @@ def build_domains(
             resolve_filter=_resolve_fill_filter,
             allowed_filter_keys=_FILL_FILTER_KEYS,
             filter_help=_FILL_FILTER_HELP,
+            scope_fields=(
+                ("company_id", "company_id"),
+                ("solver_id", "solver_id"),
+                ("request_id", "request_id"),
+            ),
+            context_fields=(
+                ("company_id", "company_id"),
+                ("solver_id", "solver_id"),
+                ("request_id", "request_id"),
+            ),
+            company_field="company_id",
         ),
     }
 
@@ -575,20 +614,7 @@ def register_grounding_tools(
             sb = await dom.resolve_filter(dom.cache, filters)
             sb_encoded = encode_sb(sb) if sb is not None else None
 
-            # Resolve status ids → names for readable evidence. Best-effort: if
-            # the enum cache can't load, the map is empty and _collect_entry
-            # falls back to the raw id. Skipped for domains with no enum cache.
-            status_names: dict[Any, str] = {}
-            if dom.cache is not None and dom.status_bucket is not None:
-                try:
-                    await dom.cache.load()
-                except Exception:
-                    pass
-                status_names = (
-                    dom.cache.action_code_name_map(dom.status_bucket)
-                    if dom.status_by_action_code
-                    else dom.cache.id_name_map(dom.status_bucket)
-                )
+            status_names = await _load_status_names(dom)
 
             items: list[dict[str, Any]] = []
             total_reported: int | None = None
@@ -601,10 +627,14 @@ def register_grounding_tools(
                 params: dict[str, Any] = {"pg": page, "pp": _MAX_PER_PAGE}
                 if sb_encoded is not None:
                     params["sb"] = sb_encoded
-                response = await client.get(dom.list_endpoint, params=params)
+                response, paging = await client.get_page(dom.list_endpoint, params=params)
                 records, meta = unwrap_list(response)
                 if total_reported is None:
-                    total_reported = _meta_total(meta)
+                    # v3 sends the filtered count as X-TotalRecords; the body
+                    # carries one only on some endpoints (tasks: totalItems).
+                    total_reported = paging.get("total")
+                    if total_reported is None:
+                        total_reported = _meta_total(meta)
                 for rec in records:
                     if len(items) >= max_records:
                         truncated = True
@@ -661,6 +691,11 @@ def register_grounding_tools(
         coverage: dict[str, Any] = {
             "scanned": len(items),
             "total_reported": total_reported,
+            # True only when CDESK's own count of matching records equals what
+            # was scanned; None when CDESK reported no count.
+            "complete": None if total_reported is None else (
+                not truncated and len(items) == total_reported
+            ),
             "truncated": truncated,
             "cap": max_records,
             "text_truncated_count": text_truncated_count,
@@ -695,14 +730,13 @@ def register_grounding_tools(
             # hold in-flight Tasks so this holds even though claims run
             # concurrently. A semaphore bounds load on CDESK; gather preserves
             # claim order.
-            record_cache: dict[int, "asyncio.Task[dict[str, Any] | None]"] = {}
-            disc_cache: dict[int, "asyncio.Task[str]"] = {}
+            caches = _VerifyCaches(status_names=await _load_status_names(dom))
             sem = asyncio.Semaphore(_VERIFY_CONCURRENCY)
 
             async def _run(index: int, claim: Any) -> dict[str, Any]:
                 async with sem:
                     return await _verify_one_claim(
-                        dom, client, claim, index, threshold, record_cache, disc_cache
+                        dom, client, claim, index, threshold, caches
                     )
 
             # return_exceptions=True so a RuntimeError from one claim (e.g.
@@ -753,6 +787,47 @@ def register_grounding_tools(
 
 
 # --- engine internals ---------------------------------------------------
+
+@dataclass
+class _VerifyCaches:
+    """Per-verify_claims-call memo. The fetch caches hold in-flight Tasks so
+    concurrently-verified claims citing the same record (or the same customer)
+    share one fetch (round-2 BUG 8)."""
+
+    status_names: dict[Any, str]
+    records: dict[int, "asyncio.Task[dict[str, Any] | None]"] = field(default_factory=dict)
+    discussions: dict[int, "asyncio.Task[str]"] = field(default_factory=dict)
+    company_names: dict[int, "asyncio.Task[str | None]"] = field(default_factory=dict)
+
+
+async def _load_status_names(dom: GroundingDomain) -> dict[Any, str]:
+    """Status enum value → name, for readable evidence. Best-effort: if the enum
+    cache can't load, the map is empty and the raw value is shown instead.
+    Empty for domains with no status enum."""
+    if dom.cache is None or dom.status_bucket is None:
+        return {}
+    try:
+        await dom.cache.load()
+    except Exception:
+        pass
+    return (
+        dom.cache.action_code_name_map(dom.status_bucket)
+        if dom.status_by_action_code
+        else dom.cache.id_name_map(dom.status_bucket)
+    )
+
+
+def _status_display(
+    domain: GroundingDomain, rec: dict[str, Any], status_names: dict[Any, str]
+) -> Any:
+    raw_status = _first_field(rec, domain.status_fields)
+    coerced_status = _coerce_int(raw_status)
+    # Only an int/str id can be a key in status_names; if a tenant returns
+    # status as a nested object/list (unhashable), show it raw rather than
+    # crashing on dict.get(unhashable).
+    if isinstance(coerced_status, (int, str)):
+        return status_names.get(coerced_status, raw_status)
+    return raw_status
 
 def _first_field(rec: dict[str, Any], fields: tuple[str, ...]) -> Any:
     """First present key's value among `fields` (presence-based, so an explicit
@@ -827,16 +902,7 @@ def _collect_entry(
     if len(text) > text_chars_per_record:
         text = text[:text_chars_per_record]
         truncated = True
-    raw_status = _first_field(rec, domain.status_fields)
-    coerced_status = _coerce_int(raw_status)
-    # Only an int/str id can be a key in status_names; if a tenant returns
-    # status as a nested object/list (unhashable), show it raw rather than
-    # crashing the whole collect on dict.get(unhashable).
-    status = (
-        status_names.get(coerced_status, raw_status)
-        if isinstance(coerced_status, (int, str))
-        else raw_status
-    )
+    status = _status_display(domain, rec, status_names)
     entry = {
         "id": _coerce_int(_first_field(rec, domain.id_fields)),
         "num": _first_field(rec, domain.num_fields),
@@ -949,12 +1015,12 @@ async def _verify_one_claim(
     claim: Any,
     index: int,
     threshold: int,
-    record_cache: dict[int, "asyncio.Task[dict[str, Any] | None]"],
-    disc_cache: dict[int, "asyncio.Task[str]"],
+    caches: _VerifyCaches,
 ) -> dict[str, Any]:
-    """Test a single claim. specific/pattern → check each cited record exists
-    and literally contains its quote, recount distinct ids, apply threshold for
-    pattern. absence → re-run the search and confirm zero matches."""
+    """Test a single claim. specific/pattern → check each cited record exists,
+    falls inside the claim's optional `scope`, and literally contains its quote;
+    recount distinct ids, apply threshold for pattern. absence → re-run the
+    search and confirm zero matches."""
     if not isinstance(claim, dict):
         return {
             "claim_id": index,
@@ -974,10 +1040,32 @@ async def _verify_one_claim(
             "reason": f"kind must be one of {_VALID_CLAIM_KINDS}",
         }
 
+    scope = claim.get("scope")
     if kind == "absence":
+        if scope is not None:
+            return {
+                "claim_id": claim_id,
+                "statement": statement,
+                "kind": kind,
+                "verdict": "error",
+                "reason": (
+                    "scope does not apply to an absence claim; put the subject "
+                    "filters (e.g. company, solver_id) in absence_query instead"
+                ),
+            }
         return await _verify_absence(domain, client, claim, claim_id, statement)
 
     # specific / pattern
+    try:
+        expected = await _resolve_scope(domain, scope)
+    except (ValueError, RuntimeError) as e:
+        return {
+            "claim_id": claim_id,
+            "statement": statement,
+            "kind": kind,
+            "verdict": "error",
+            "reason": f"invalid scope: {e}",
+        }
     evidence = claim.get("evidence")
     if not isinstance(evidence, list):
         evidence = []
@@ -1007,9 +1095,23 @@ async def _verify_one_claim(
         if len(qn) < MIN_QUOTE_CHARS:
             invalid.append({"record_id": rid, "quote": quote, "reason": f"quote normalizes to fewer than {MIN_QUOTE_CHARS} chars"})
             continue
-        record = await _fetch_record(client, domain, rid, record_cache)
+        record = await _fetch_record(client, domain, rid, caches.records)
         if record is None:
             invalid.append({"record_id": rid, "quote": quote, "reason": "record not found or inaccessible"})
+            continue
+        context = await _record_context(client, domain, record, caches)
+        # Subject check before the quote check: a quote that really is in the
+        # record still proves nothing about a customer/solver the record does
+        # not belong to (UAT 2026-10-09: a request of customer 65 "confirmed" a
+        # claim about customer 74).
+        mismatch = _scope_mismatch(domain, record, expected)
+        if mismatch is not None:
+            invalid.append({
+                "record_id": rid,
+                "quote": quote,
+                "reason": f"out_of_scope: {mismatch}",
+                **({"record": context} if context else {}),
+            })
             continue
         # Match against the SAME units collect_records displays — title as one
         # unit, the joined body as one unit — so a quote copied verbatim from what
@@ -1020,17 +1122,20 @@ async def _verify_one_claim(
         if units is None:
             units = _record_match_units(domain, record)
             units_cache[rid] = units
+        verified = {"record_id": rid, "quote": quote, **({"record": context} if context else {})}
         if any(qn in unit for unit in units):
-            valid.append({"record_id": rid, "quote": quote})
+            valid.append(verified)
             seen.add(rid)
             continue
         # Not in the record's own fields — for domains with a discussion thread
         # (requests) it may have been quoted from the thread that
         # collect_records(include_discussion=True) surfaced (round-1 BUG 1).
         if domain.discussion is not None:
-            disc = await _discussion_match_text(client, domain.discussion, rid, disc_cache)
+            disc = await _discussion_match_text(
+                client, domain.discussion, rid, caches.discussions
+            )
             if disc and qn in disc:
-                valid.append({"record_id": rid, "quote": quote})
+                valid.append(verified)
                 seen.add(rid)
                 continue
         invalid.append({"record_id": rid, "quote": quote, "reason": no_match_reason})
@@ -1045,7 +1150,7 @@ async def _verify_one_claim(
             verdict = "below_threshold"
         else:
             verdict = "rejected"
-    return {
+    result: dict[str, Any] = {
         "claim_id": claim_id,
         "statement": statement,
         "kind": kind,
@@ -1055,6 +1160,144 @@ async def _verify_one_claim(
         "invalid_evidence": invalid,
         "verdict": verdict,
     }
+    if scope is not None:
+        result["scope"] = scope
+    return result
+
+
+def _scope_keys(domain: GroundingDomain) -> list[str]:
+    keys = [k for k, _ in domain.scope_fields]
+    if domain.cache is not None and domain.status_bucket is not None:
+        keys.append("status_name")
+    return keys
+
+
+def _as_id_set(key: str, value: Any) -> frozenset[int]:
+    """A scope id value: one int, or a non-empty list of ints (any-of)."""
+    items = value if isinstance(value, list) else [value]
+    if not items or not all(isinstance(v, int) and not isinstance(v, bool) for v in items):
+        raise ValueError(f"scope.{key} must be an integer id or a non-empty list of integer ids")
+    return frozenset(items)
+
+
+async def _resolve_scope(
+    domain: GroundingDomain, scope: Any
+) -> dict[str, tuple[str, frozenset[Any]]]:
+    """Validate a claim's `scope` and resolve it to {record field: (scope key,
+    allowed values)}. status_name resolves through the domain's enum like the
+    collect_records filter does (action_code for requests, id for tasks)."""
+    if scope is None:
+        return {}
+    allowed = _scope_keys(domain)
+    if not isinstance(scope, dict) or not scope:
+        raise ValueError(
+            f"scope must be a non-empty object; keys for domain "
+            f"{domain.name!r}: {allowed or 'none (this domain takes no scope)'}"
+        )
+    unknown = sorted(set(scope) - set(allowed))
+    if unknown:
+        raise ValueError(
+            f"unknown scope keys for domain {domain.name!r}: {unknown}. "
+            f"Valid keys: {allowed or 'none (this domain takes no scope)'}"
+        )
+    fields = dict(domain.scope_fields)
+    expected: dict[str, tuple[str, frozenset[Any]]] = {}
+    for key, value in scope.items():
+        if key != "status_name":
+            expected[fields[key]] = (key, _as_id_set(key, value))
+            continue
+        if domain.cache is None or domain.status_bucket is None:
+            # Unreachable: _scope_keys only offers status_name when both are
+            # set. Raised (not asserted) so it survives `python -O`.
+            raise RuntimeError(f"{domain.name} domain has no status enum")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("scope.status_name must be a non-empty status name")
+        status = (
+            await resolve_enum_field_or_raise(
+                domain.cache, domain.status_bucket, value,
+                kind="status", field="action_code",
+            )
+            if domain.status_by_action_code
+            else await resolve_enum_or_raise(
+                domain.cache, domain.status_bucket, value, kind="status"
+            )
+        )
+        status_field = domain.status_fields[0]
+        expected[status_field] = (key, frozenset({status}))
+    return expected
+
+
+def _scope_mismatch(
+    domain: GroundingDomain,
+    record: dict[str, Any],
+    expected: dict[str, tuple[str, frozenset[Any]]],
+) -> str | None:
+    """Why the record falls outside the claim's scope, or None if it is inside.
+    A record that doesn't carry the scoped field at all is OUT of scope: the
+    subject can't be proven, and an unproven subject must not verify."""
+    for record_field, (key, allowed) in expected.items():
+        if key == "status_name":
+            actual = _coerce_int(_first_field(record, domain.status_fields))
+        else:
+            actual = _coerce_int(record.get(record_field))
+        if actual is None or actual == "":
+            return f"the record has no {key} value, so it cannot be shown to match {key}={_fmt(allowed)}"
+        if actual not in allowed:
+            return f"the record's {key} is {actual}, not {_fmt(allowed)}"
+    return None
+
+
+def _fmt(values: frozenset[Any]) -> str:
+    ordered = sorted(values, key=str)
+    return str(ordered[0]) if len(ordered) == 1 else f"one of {ordered}"
+
+
+async def _record_context(
+    client: CdeskClient,
+    domain: GroundingDomain,
+    record: dict[str, Any],
+    caches: _VerifyCaches,
+) -> dict[str, Any]:
+    """Who/what the record is about — customer (id + name), solver, status —
+    echoed with each verified quote. A quote check alone proves the words are
+    in the record, not that the record is about the claim's subject; this is
+    what lets that mismatch be seen when no `scope` was given. Empty for
+    domains whose record IS the subject (customers) or that carry no such
+    links (users)."""
+    ctx: dict[str, Any] = {}
+    for key, record_field in domain.context_fields:
+        ctx[key] = _coerce_int(record.get(record_field))
+    if domain.company_field is not None:
+        company_id = _coerce_int(record.get(domain.company_field))
+        if isinstance(company_id, int) and not isinstance(company_id, bool) and company_id > 0:
+            ctx["company_name"] = await _company_name(client, company_id, caches.company_names)
+    if domain.status_fields and domain.status_bucket is not None:
+        ctx["status"] = _status_display(domain, record, caches.status_names)
+    return ctx
+
+
+async def _company_name(
+    client: CdeskClient,
+    company_id: int,
+    cache: dict[int, "asyncio.Task[str | None]"],
+) -> str | None:
+    """The customer's name for the evidence context, memoized per verify call.
+    Display-only and best-effort: no verdict depends on it, so any failure
+    (deleted customer, no access, unconfigured client) yields None."""
+    task = cache.get(company_id)
+    if task is None:
+        task = asyncio.ensure_future(_load_company_name(client, company_id))
+        cache[company_id] = task
+    return await task
+
+
+async def _load_company_name(client: CdeskClient, company_id: int) -> str | None:
+    try:
+        record = unwrap_record(await client.get(f"v3/company/{company_id}"))
+    except Exception:  # noqa: BLE001
+        return None
+    name = record.get("name") if isinstance(record, dict) else None
+    return name if isinstance(name, str) and name.strip() else None
 
 
 async def _verify_absence(
@@ -1267,10 +1510,11 @@ _COLLECT_RECORDS_DESC = inspect.cleandoc(
       - items: [{id, num, title, text, status, created}] (text = cleaned
         title+body, capped at text_chars_per_record; pass 0 for a cheap
         ids/titles-only sweep with no body text).
-      - coverage: {scanned, total_reported, truncated, cap,
-        text_truncated_count, include_discussion[, discussion_unsupported]}. If
-        truncated=True or your filter was broad, say so — your counts are then a
-        LOWER BOUND.
+      - coverage: {scanned, total_reported, complete, truncated, cap,
+        text_truncated_count, include_discussion[, discussion_unsupported]}.
+        total_reported is CDESK's own count of the records matching the filter;
+        complete=True means every one of them was scanned. If truncated=True or
+        complete is not True, your counts are a LOWER BOUND — say so.
 
     Next step: form claims (each with record_id + a verbatim quote copied
     exactly from a record's text) and pass them to verify_claims with the SAME
@@ -1295,8 +1539,21 @@ _VERIFY_CLAIMS_DESC = inspect.cleandoc(
         "statement": "what you want to assert",
         "kind": "specific" | "pattern" | "absence",
         "evidence": [{"record_id": 123, "quote": "exact text from #123"}],
+        "scope": {"company": 74},
         "absence_query": { ...collect_records-style filter for this domain... }
       }
+
+    scope (optional, specific/pattern): the subject the claim is about, checked
+    against each cited record. A quote found in a record outside the scope does
+    not count — it lands in invalid_evidence with reason "out_of_scope: ...".
+    Ids take one int or a list of ints (any-of). Keys per domain:
+      - requests → company, solver_id, solver_group_id, status_name
+      - tasks → customer_id, solver_id, status_name
+      - fills → company_id, solver_id, request_id
+      - customers, users → none (a customer record is its own subject; the user
+        record carries no usable company link).
+    Without a scope only the quote is checked, so a quote from another
+    customer's record still verifies.
 
     kinds:
       - "specific" — a fact from one (or few) records. Confirmed if >=1 cited
@@ -1311,7 +1568,11 @@ _VERIFY_CLAIMS_DESC = inspect.cleandoc(
     pattern_threshold: optional override of the configured default.
 
     Per-claim verdict includes valid_evidence, invalid_evidence (with reasons:
-    bad id, quote-too-short, quote-not-found), supported_count and verdict.
+    bad id, quote-too-short, out_of_scope, quote-not-found), supported_count and
+    verdict. For requests, tasks and fills each evidence entry also carries
+    `record`: who the cited record is about (company_id + company_name,
+    solver_id, solver_group_id/request_id, status), so a record belonging to a
+    different subject than the claim is visible even without a scope.
     Relay only confirmed claims (cite the ids); report below_threshold as
     isolated mentions with counts; DROP rejected claims; for refuted absence,
     correct yourself. If nothing is confirmed, the truthful answer is the
@@ -1340,13 +1601,18 @@ _VERIFY_CLAIMS_DESC = inspect.cleandoc(
 _VERDICT_MEANINGS = inspect.cleandoc(
     """
     What each verdict says about the evidence:
-      - confirmed — a cited record really contains the quote; the claim is
-        supported, and the supporting record ids are in valid_evidence.
+      - confirmed — a cited record really contains the quote (and, when the
+        claim gave a scope, belongs to that subject); the supporting record ids
+        are in valid_evidence. Without a scope, a confirmed quote says nothing
+        about which customer/solver the record belongs to — each entry's
+        `record` block shows that.
       - below_threshold — fewer than `threshold_used` distinct records support
         it. It is an isolated mention of that size, not an established pattern;
         supported_count carries the exact number.
-      - rejected — no cited record contained the quote, so the claim has no
-        evidence behind it. invalid_evidence gives the per-quote reason.
+      - rejected — no cited record both contained the quote and fell inside
+        the claim's scope, so the claim has no evidence behind it.
+        invalid_evidence gives the per-quote reason; "out_of_scope" means the
+        words are in the record but the record is about a different subject.
       - confirmed_absence — the absence search ran and matched zero records:
         there is no record showing the thing.
       - refuted — the absence search DID match records, listed in matched_ids,
@@ -1387,10 +1653,15 @@ _TRUTHFUL_PROMPT = inspect.cleandoc(
          - "pattern"   — a population-level statement (needs the threshold).
          - "absence"   — "there is no record about X" (give an absence_query).
        For specific/pattern, attach each supporting record_id with a VERBATIM
-       quote copied exactly from that record's text.
+       quote copied exactly from that record's text. When the claim is about a
+       particular customer, solver or status, add it as `scope` (e.g.
+       {{"company": 74}}) so the server also checks each cited record belongs
+       to that subject — a quote alone only proves the words are in the record.
     3. Call verify_claims with the SAME domain and all your claims.
     4. Write the answer using ONLY the returned verdicts:
-         - confirmed → state it, cite the record ids.
+         - confirmed → state it, cite the record ids. Check each evidence
+           entry's `record` block (customer, solver, status) matches what the
+           claim says about it.
          - pattern below_threshold → report as an isolated mention with its
            exact count; do NOT present it as a need or trend.
          - rejected → drop it; do not state it.

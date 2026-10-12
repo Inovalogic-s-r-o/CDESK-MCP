@@ -65,6 +65,11 @@ from cdesk_mcp.oauth import (
     register_login_route,
     register_subpath_well_known_routes,
 )
+from cdesk_mcp.tools._helpers import (
+    annotate_unreturned_fields,
+    compact_llm_payloads,
+    mark_write_tools,
+)
 from cdesk_mcp.tools._export_cache import ExportSnapshotStore
 from cdesk_mcp.tools._helpers import forbid_unknown_arguments
 from cdesk_mcp.tools.cmdb import register_cmdb_tools
@@ -127,7 +132,9 @@ _SERVER_INSTRUCTIONS = inspect.cleandoc(
          collect_records once per module.
       2. Call collect_records(domain, ...) to gather the evidence.
       3. Form claims, each with a record_id + a VERBATIM quote, and call
-         verify_claims(domain, ...).
+         verify_claims(domain, ...). A claim about a particular customer,
+         solver or status carries it as `scope`; verify_claims rejects a quote
+         whose record falls outside that scope.
       4. State only what came back confirmed, citing the record id. Never assert
          a fact you did not verify, and never bend a quote's meaning.
 
@@ -153,6 +160,25 @@ _SERVER_INSTRUCTIONS = inspect.cleandoc(
     Call only once you hold an explicit value or an explicit skip for every
     parameter.
 
+    TENANT FORM RULES. Requests, deals, tasks, fills, customers and request
+    catalogs follow the tenant's CDESK form, read live: a field the tenant has
+    switched off is refused when given, a required one is refused when missing
+    (or, on update, when cleared). The `fields` block of get_request_enums /
+    get_deal_enums / get_task_enums / get_fill_enums / get_request_catalog_enums
+    lists each configurable field's state — off, optional or required — for this
+    tenant. Enum values the tenant switched off (`in_use: false`) are refused by
+    the write tools and still accepted as list filters.
+
+    SIDE EFFECTS. Some writes make CDESK change other data too — a fill moves its
+    request to "v riešení", closing a request sets its close and invoice dates,
+    a new customer gets a mail box, a new request can be linked to a deal. The
+    write tools' descriptions list them under "Side effects"; the user hears
+    about such a change together with the write itself.
+
+    THE CALLER. whoami returns the CDESK user this connector acts as; its `id`
+    is the user / solver id that questions about "my tasks", "my requests" or
+    "what I logged" refer to.
+
     FIELD-SCOPE PROTOCOL — applies to every single-record get_* tool that takes
     `fieldset` / `fields`. Before such a detail-GET, ask the user how much of the
     record they want, then map their answer on:
@@ -165,7 +191,11 @@ _SERVER_INSTRUCTIONS = inspect.cleandoc(
         fieldset="custom" is a different thing: it returns the record's
         custom-field (cfield_*) values, not a user-picked selection.
     If the user doesn't care, or it's an internal lookup, omit both parameters
-    (the extended default applies).
+    (the extended default applies). CDESK drops a field name it does not know
+    without a word; a result then carries `fields_not_returned` naming the
+    requested fields that came back on no record. Items of the list_* tools
+    leave out empty fields (null, "", [], {}): a field missing from an item is
+    empty there.
 
     STRIPPED sb_raw CLAUSES. Each list tool naming its LIVE-VERIFIED working
     columns means this section. CDESK silently ignores unknown filter columns and
@@ -227,6 +257,9 @@ class _UnconfiguredCdeskClient:
     async def get(self, *_args: Any, **_kwargs: Any) -> Any:
         raise RuntimeError(self._message)
 
+    async def get_page(self, *_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError(self._message)
+
     async def post(self, *_args: Any, **_kwargs: Any) -> Any:
         raise RuntimeError(self._message)
 
@@ -246,6 +279,7 @@ class _UnconfiguredEnumCache:
     rendering); async lookups raise the same instructional error."""
 
     bucket_names: list[str] = []
+    endpoint: str = ""
     loaded: bool = False
     is_stale: bool = False
     # Empty, never {"enabled": False} — an unconfigured server must not be
@@ -312,6 +346,15 @@ class _UnconfiguredEnumCache:
         # Same as id_name_map, for the requests domain (status_by_action_code).
         return {}
 
+    def key_name_map(self, _bucket: str) -> dict[Any, str]:
+        return {}
+
+    def bucket_is_absent(self, _bucket: str) -> bool:
+        return False
+
+    def extra(self, _key: str) -> Any:
+        return None
+
 
 def build_server(
     client: CdeskClient | None = None,
@@ -330,6 +373,7 @@ def build_server(
     streamable_http_path: str | None = None,
     trust_forwarded: bool = False,
     evidence_threshold: int = DEFAULT_EVIDENCE_THRESHOLD,
+    cnb_tools: bool = True,
     # Mirrors Config.azure_login_enabled, which is on unless an operator switched
     # it off. __main__ always passes the configured value; this default only
     # matters to other callers, and it must not disagree with the config.
@@ -533,8 +577,11 @@ def build_server(
     register_fill_tools(mcp, effective_client)
     # Deal statuses/phases/types ARE tenant enum data — 4th cached module.
     register_deal_tools(mcp, effective_client, effective_deal_cache)
-    # CNB-only bulk CI export (fails with a clear message on non-CNB servers).
-    register_cnb_tools(mcp, effective_client, export_store)
+    # CNB-only bulk CI export. stdio knows its one tenant at startup and leaves
+    # the tools out on a non-CNB tenant; http serves many tenants, so the tools
+    # stay and refuse a non-CNB caller themselves (UAT low-priority L5).
+    if cnb_tools:
+        register_cnb_tools(mcp, effective_client, export_store)
 
     # Domain-agnostic grounded-answer tools (collect_records / verify_claims /
     # the truthful_answer prompt) span requests, tasks, customers, users. The
@@ -549,4 +596,11 @@ def build_server(
 
     forbid_unknown_arguments(mcp, _FILTERABLE_LIST_TOOLS)
 
+    # Every tool with a `fields` whitelist names the requested fields CDESK
+    # silently dropped (UAT B10) — applied after all modules registered.
+    annotate_unreturned_fields(mcp)
+    # Trim what the LLM receives: enum-row noise, empty list fields.
+    compact_llm_payloads(mcp)
+    # Writes refuse enum values the tenant switched off (UAT B13).
+    mark_write_tools(mcp)
     return mcp

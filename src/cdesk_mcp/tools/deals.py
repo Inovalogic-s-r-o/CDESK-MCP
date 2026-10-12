@@ -47,8 +47,19 @@ from mcp.types import ToolAnnotations
 
 from cdesk_mcp.cdesk_client import CdeskClient
 from cdesk_mcp.enums import EnumCache
+from cdesk_mcp.field_policy import (
+    DEAL_FIELDS,
+    describe,
+    refuse_if_violated,
+    violations,
+)
 from cdesk_mcp.filters import build_deal_filter, encode_sb
+from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
+    list_meta,
+    TEXT_MATCH_NOTE,
+    EnumLabel,
+    add_enum_names,
     annotate_write_warnings,
     apply_field_scope,
     resolve_enum_or_raise,
@@ -61,6 +72,17 @@ from cdesk_mcp.tools._helpers import (
     write_values_match,
 )
 from cdesk_mcp.tz import localize_naive_datetime, tenant_timezone
+
+# Enum labels written next to the raw values (see the module docstring's status
+# model): rc_status holds the status ACTION CODE, rc_status_id / rc_phase_id /
+# cat_type_id hold enum ids. Names come from the live v3/contract/enums buckets.
+# Writes return the id only, so only list/get records are labelled.
+_DEAL_ENUM_LABELS = (
+    EnumLabel("rc_status", "status", "status_name", by="action_code"),
+    EnumLabel("rc_status_id", "status", "status_name"),
+    EnumLabel("rc_phase_id", "phase", "phase_name"),
+    EnumLabel("cat_type_id", "catType", "cat_type_name"),
+)
 
 # Pagination upper bound — mirrors the other modules' 100 cap.
 _MAX_PER_PAGE = 100
@@ -75,6 +97,12 @@ _STATUS_KEYWORDS = ("open", "closed")
 _ENUM_ENTRY_KEYS = ("id", "name", "action_code", "parent_id", "lang_en", "lang_sk")
 
 
+# This release's deal tools take no orderer, so its form rule is left out —
+# otherwise a tenant requiring an orderer would refuse every create with no
+# parameter to satisfy it.
+_DEAL_FIELDS = tuple(rule for rule in DEAL_FIELDS if "orderer_contact_id" not in rule.params)
+
+
 def register_deal_tools(
     mcp: FastMCP,
     client: CdeskClient,
@@ -84,7 +112,7 @@ def register_deal_tools(
     `cache` targets v3/contract/enums (buckets: status / phase / catType)."""
 
     @mcp.tool(
-        description=_LIST_DEALS_DESC,
+        description=_LIST_DEALS_DESC + "\n\n" + sort_note("deals") + "\n\n" + TEXT_MATCH_NOTE,
         annotations=ToolAnnotations(title="List deals", readOnlyHint=True),
     )
     async def list_deals(
@@ -149,10 +177,10 @@ def register_deal_tools(
             params: dict[str, Any] = {"pg": page, "pp": per_page}
             apply_field_scope(params, fieldset, fields)
             if sort:
-                params["sort"] = sort
+                params["sort"] = resolve_sort("deals", sort)
             if sb is not None:
                 params["sb"] = encode_sb(sb)
-            response = await client.get("v3/contract", params=params)
+            response, paging = await client.get_page("v3/contract", params=params)
         except RuntimeError:
             raise
         except ValueError as e:
@@ -162,7 +190,8 @@ def register_deal_tools(
 
         records, meta = unwrap_list(response)
         meta.pop("enums", None)
-        result = {"items": records, "meta": meta, "page": page, "per_page": per_page}
+        await add_enum_names(cache, records, _DEAL_ENUM_LABELS)
+        result = {"items": records, "meta": list_meta(meta, paging, dropped=dropped_clauses), "page": page, "per_page": per_page}
         if dropped_clauses:
             result["unsupported_filters"] = unsupported_filter_directive(dropped_clauses)
         return result
@@ -189,7 +218,9 @@ def register_deal_tools(
             raise RuntimeError(f"get_deal input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="get_deal", record_id=id) from e
-        return unwrap_record(response)
+        record = unwrap_record(response)
+        await add_enum_names(cache, [record], _DEAL_ENUM_LABELS)
+        return record
 
     @mcp.tool(
         description=_GET_DEAL_ENUMS_DESC,
@@ -220,6 +251,16 @@ def register_deal_tools(
                 result["settings"] = response["settings"]
             if "tags" in response:
                 result["tags"] = response["tags"]
+        result["fields"] = {
+            "always_required": ["title", "customer_id", "status_name or status_id"],
+            "by_tenant_setting": describe(_DEAL_FIELDS, result.get("settings")),
+            "note": (
+                "State of each configurable create_deal/update_deal parameter on "
+                "this tenant, from its live deal settings: off (refused when "
+                "given), optional, or required (must be given on create, cannot "
+                "be cleared on update)."
+            ),
+        }
         # This endpoint is NOT gated by `contract.enabled`, so it answers 200
         # with the full enum lists even when the module is off — the only
         # signal is settings.enabled, which is easy to miss among ~17 keys.
@@ -264,6 +305,18 @@ def register_deal_tools(
     ) -> dict[str, Any]:
         try:
             await _require_module_enabled(cache, "create_deal")
+            # Beyond title/customer/status, every configurable field follows the
+            # TENANT's deal form, read live (the guard above loaded the settings):
+            # an off field is refused, a required one must be given
+            # (field_policy.py) — CDESK's own errors name neither the parameter
+            # nor the setting.
+            refuse_if_violated(violations(_DEAL_FIELDS, getattr(cache, "settings", None), {
+                "code": code, "cat_type_name": cat_type_name, "phase_name": phase_name,
+                "responsible_person_ids": responsible_person_ids,
+                "coordinator_contact_ids": coordinator_contact_ids,
+                "est_opening_date": est_opening_date, "opening_date": opening_date,
+                "est_due_date": est_due_date, "due_date": due_date,
+            }))
             resolved_status_id = await _require_status(cache, status_name, status_id)
             body = await _build_deal_body(
                 cache,
@@ -332,6 +385,15 @@ def register_deal_tools(
     ) -> dict[str, Any]:
         try:
             await _require_module_enabled(cache, "update_deal")
+            # Same form rules as create: an off field may not be set, a required
+            # one not cleared (left out = unchanged).
+            refuse_if_violated(violations(_DEAL_FIELDS, getattr(cache, "settings", None), {
+                "code": code, "cat_type_name": cat_type_name, "phase_name": phase_name,
+                "responsible_person_ids": responsible_person_ids,
+                "coordinator_contact_ids": coordinator_contact_ids,
+                "est_opening_date": est_opening_date, "opening_date": opening_date,
+                "est_due_date": est_due_date, "due_date": due_date,
+            }, update=True))
             if status_name is not None and status_id is not None:
                 raise ValueError("pass either status_name or status_id, not both")
             resolved_status_id = status_id
@@ -494,7 +556,7 @@ async def _require_module_enabled(cache: EnumCache, operation: str) -> None:
     The state is knowable client-side: `v3/contract/enums` is itself ungated
     and reports `settings.enabled`. This guard is a MITIGATION, not the fix —
     the backend should gate its own writes, since any other API client bypasses
-    us. See docs/bugs.md.
+    us. See docs/bugs/deals.md.
     """
     # The enums are fetched per tool call, and the guard runs before anything
     # else in the call has read them — so load them here, or `settings` is
@@ -749,25 +811,29 @@ _GET_DEAL_ENUMS_DESC = inspect.cleandoc(
     Return the Deal module enums and tenant settings: `enums.status`
     (tenant statuses with action_code — 10 received, 20 in progress,
     25 delivered, 30 refused, 80 completed; 'open' = action_code < 30),
-    `enums.phase`, `enums.catType` (category types), plus `settings` (which
-    fields this tenant REQUIRES: types.status == 2 → category type required,
-    phases.enabled → phase required) and `tags`. Use these for
-    create/update/list name resolution.
+    `enums.phase`, `enums.catType` (category types), plus the raw tenant
+    `settings`, `tags`, and `fields`: the state of each configurable
+    create_deal / update_deal parameter on this tenant — off, optional or
+    required — derived from those settings, each with the setting behind
+    it. Use these for create/update/list name resolution.
     """
 )
 
 _CREATE_DEAL_DESC = inspect.cleandoc(
     """
-    Create a deal. Required: title, customer_id, and a status (status_name
-    resolved against the tenant enums, or status_id). Depending on tenant
-    settings (see get_deal_enums `settings`), cat_type_name and phase_name
-    may also be required — the server rejects the create with a clear message
-    if so.
+    Create a deal. Always required: title, customer_id, and a status
+    (status_name resolved against the tenant enums, or status_id). Every
+    other configurable field follows the tenant's CDESK deal form, read
+    live on every call: a field switched off (category type, phase,
+    responsible person, orderer) is refused when given, a required one
+    (any of those, plus code, coordinator_contact_ids and the four dates)
+    must be given. get_deal_enums lists every field's state under
+    `fields`; a call breaking a rule is rejected naming each parameter
+    and its setting.
 
     The deal number (CDD-<num>) is auto-assigned; `code` (rc_code) is
     auto-generated when omitted and the tenant has automatic codes enabled.
-    responsible_person_ids is strongly recommended (the standard UI form
-    requires it; the API stores it as a relation). Dates accept ISO-8601 — a
+    Dates accept ISO-8601 — a
     naive datetime is read as tenant-local time; due dates must not precede
     their opening dates. tag_ids attaches existing tags (see
     get_deal_enums `tags`).

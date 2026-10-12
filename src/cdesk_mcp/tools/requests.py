@@ -22,6 +22,7 @@ import asyncio
 import inspect
 import json
 import re
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
@@ -29,8 +30,23 @@ from mcp.types import ToolAnnotations
 
 from cdesk_mcp.cdesk_client import CdeskClient
 from cdesk_mcp.enums import EnumCache
+from cdesk_mcp.field_policy import (
+    REQUEST_FIELDS,
+    describe,
+    refuse_if_violated,
+    violations,
+)
 from cdesk_mcp.filters import build_request_filter, encode_sb
+from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
+    without_notify_flags as _without_notify_flags,
+    notify_block_value,
+    request_status_group,
+    with_status_groups,
+    list_meta,
+    TEXT_MATCH_NOTE,
+    EnumLabel,
+    add_enum_names,
     annotate_write_warnings,
     apply_field_scope,
     forbid_unknown_arguments,
@@ -106,6 +122,10 @@ _REQUEST_GATED_FIELDS: dict[str, str] = {
         "requires the tenant setting `request.desiredDate.enabled` and the "
         "`request/fields/desired_date` write right"
     ),
+    "due_date": (
+        "requires the tenant setting `request.dueDate.enabled` and the right to "
+        "change the due date"
+    ),
     "calendar_date_start": (
         "requires the tenant setting `request.calendar_date_start` and the "
         "`request/fields/calendar_date_start` write right"
@@ -163,6 +183,142 @@ def _ensure_periodic_field(
     return fieldset, fields
 
 
+# Enum-valued request fields and the label written next to each. Status and
+# priority are stored by enum ACTION CODE (cmpp: priority 0 = "3 - stredná",
+# status 10 = "prijaté"); `type` is the key of a key/value bucket ("H"); the
+# rest are enum ids. A write response's savedData uses the raw column names
+# (req_status / req_priority), hence the aliases. Bucket names are the ones
+# the write paths resolve against.
+_REQUEST_ENUM_LABELS = (
+    EnumLabel("status", "status", "status_name", by="action_code"),
+    EnumLabel("req_status", "status", "status_name", by="action_code"),
+    EnumLabel("priority", "priority", "priority_name", by="action_code"),
+    EnumLabel("req_priority", "priority", "priority_name", by="action_code"),
+    EnumLabel("type", "type", "type_name", by="key"),
+    EnumLabel("req_type", "type", "type_name", by="key"),
+    EnumLabel("urgency_id", "urgency", "urgency_name"),
+    EnumLabel("impact_id", "impact", "impact_name"),
+    EnumLabel("place_id", "place", "place_name"),
+    EnumLabel("cat_type_id", "cat_type_id", "cat_type_name"),
+    EnumLabel("cat_area_id", "cat_area", "cat_area_name"),
+    EnumLabel("cat_area_2nd_id", "cat_area_2nd", "cat_area_2nd_name"),
+    EnumLabel("close_reason_id", "close_reasons", "close_reason_name"),
+    EnumLabel("solver_method_id", "solver_method", "solver_method_name"),
+    EnumLabel("root_cause_id", "root_causes", "root_cause_name"),
+)
+
+
+def _auto_title(settings: Any, description: str | None) -> str | None:
+    """The title CDESK's web form generates when auto-naming is on and the
+    title is left empty (Module/Request/FE/js/editController.js
+    generateRequestTitle): the description without HTML tags, cut to
+    `max_auto_name_characters` (CDESK default 40) plus "...". None when
+    auto-naming is off or there is no description."""
+    if not isinstance(settings, dict) or not settings.get("auto_name_enabled"):
+        return None
+    if not description:
+        return None
+    text = re.sub(r"<[^>]*>", "", description)
+    try:
+        limit = int(settings.get("max_auto_name_characters") or 40)
+    except (TypeError, ValueError):
+        limit = 40
+    return text[:limit] + "..." if len(text) > limit else text
+
+
+async def _request_settings(cache: EnumCache) -> Any:
+    """The tenant's live request settings (`config` in v3/request/enums), or
+    None when unreadable — the form rules then constrain nothing."""
+    try:
+        await cache.load()
+        return cache.extra("config")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# --- time fields (UAT B3) -----------------------------------------------------
+# `duration_open` and `duration_reaction` are SLA WORKING seconds, not calendar
+# time (Model/Request.php calcOpenDuration): counted only inside the operating
+# hours of the request's SLA (or the default SLA's), holidays left out, minus
+# the time spent in statuses that stop the SLA clock and in closed statuses.
+# `duration_open` is computed once, when the request is closed (0 while open,
+# reset to 0 on reopen, always 0 without an SLA); `duration_reaction` at the
+# first reaction (null until then). The v3 endpoints return both (with
+# fieldset=all and in write responses) but the v3 spec documents no request
+# response field at all. A status-change write echoes the unrounded float
+# (78.175556) where the record stores 78. So every request result gets
+# explicit, unit-named values next to the raw ones.
+
+_CREATED_KEYS = ("idatetime",)
+_CLOSED_KEYS = ("close_date", "req_close_date")
+
+
+def _first(rec: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if rec.get(key):
+            return rec[key]
+    return None
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _seconds(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return round(value)
+
+
+def _add_time_fields(rec: Any, now: datetime | None = None) -> Any:
+    """Add `age_hours_calendar` (creation → close, or → now while open),
+    `sla_open_hours` (null unless the request is closed and has an SLA) and
+    `sla_reaction_hours` (null until the first reaction); round the two raw
+    duration fields to whole seconds."""
+    if not isinstance(rec, dict):
+        return rec
+    closed = _parse_dt(_first(rec, _CLOSED_KEYS))
+    created = _parse_dt(_first(rec, _CREATED_KEYS))
+    if created is not None:
+        end = closed or now or datetime.now(timezone.utc)
+        rec["age_hours_calendar"] = round((end - created).total_seconds() / 3600, 2)
+    if "duration_open" in rec:
+        seconds = _seconds(rec["duration_open"])
+        if seconds is not None:
+            rec["duration_open"] = seconds
+        no_sla = "sla_id" in rec and not rec.get("sla_id")
+        rec["sla_open_hours"] = (
+            round(seconds / 3600, 2)
+            if seconds is not None and closed is not None and not no_sla
+            else None
+        )
+    if "duration_reaction" in rec:
+        seconds = _seconds(rec["duration_reaction"])
+        if seconds is not None:
+            rec["duration_reaction"] = seconds
+        rec["sla_reaction_hours"] = round(seconds / 3600, 2) if seconds is not None else None
+    return rec
+
+
+async def _label_write_result(cache: EnumCache, result: dict[str, Any]) -> dict[str, Any]:
+    """Enum labels on a write response: the record is in `savedData` (or in
+    `data` on endpoints that return the record there)."""
+    _add_time_fields(result.get("savedData"))
+    _add_time_fields(result.get("data"))
+    await add_enum_names(
+        cache,
+        [result.get("savedData"), result.get("data")],
+        _REQUEST_ENUM_LABELS,
+    )
+    return result
+
+
 def _add_is_periodic(rec: Any) -> Any:
     """Derive the boolean is_periodic from periodical_request_id (>0 / non-null
     means the request was generated from a periodical request)."""
@@ -181,12 +337,15 @@ def register_request_tools(
     available."""
 
     @mcp.tool(
-        description=_LIST_REQUESTS_DESC,
+        description=_LIST_REQUESTS_DESC + "\n\n" + sort_note("requests") + "\n\n" + TEXT_MATCH_NOTE,
         annotations=ToolAnnotations(title="List requests", readOnlyHint=True),
     )
     async def list_requests(
         text_search: str | None = None,
         status_name: str | None = None,
+        status_group: Literal[
+            "open", "completed", "closed", "closed_and_completed", "waiting_for_response",
+        ] | None = None,
         priority_name: str | None = None,
         cat_type_name: str | None = None,
         base_type: str | None = None,
@@ -241,6 +400,7 @@ def register_request_tools(
             sb = build_request_filter(
                 text_search=text_search,
                 status_id=status_id,
+                status_group=status_group,
                 priority_id=priority_id,
                 cat_type_id=cat_type_id,
                 base_type=base_type,
@@ -265,7 +425,7 @@ def register_request_tools(
             fieldset, fields = _ensure_periodic_field(fieldset, fields)
             apply_field_scope(params, fieldset, fields)
             if sort:
-                params["sort"] = sort
+                params["sort"] = resolve_sort("requests", sort)
             # Flat query param, NOT an sb column (an sb deleted_at clause is
             # silently ignored). Verified live 2026-06-05: includeDeleted=1
             # surfaces soft-deleted requests and composes with sb filters.
@@ -275,7 +435,7 @@ def register_request_tools(
                 params["includeDeleted"] = 1
             if sb is not None:
                 params["sb"] = encode_sb(sb)
-            response = await client.get("v3/request", params=params)
+            response, paging = await client.get_page("v3/request", params=params)
         except RuntimeError:
             raise
         except ValueError as e:
@@ -286,11 +446,11 @@ def register_request_tools(
         records, meta = unwrap_list(response)
         for rec in records:
             _add_is_periodic(rec)
-        result = {"items": records, "meta": meta, "page": page, "per_page": per_page}
+            _add_time_fields(rec)
+        await add_enum_names(cache, records, _REQUEST_ENUM_LABELS)
+        result = {"items": records, "meta": list_meta(meta, paging, dropped=dropped_clauses), "page": page, "per_page": per_page}
         if dropped_clauses:
             result["unsupported_filters"] = unsupported_filter_directive(dropped_clauses)
-        if sort:
-            result["unsupported_sort"] = _sort_not_honored(sort)
         return result
 
     @mcp.tool(
@@ -321,7 +481,9 @@ def register_request_tools(
             raise RuntimeError(f"get_request input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="get_request", record_id=id) from e
-        return _add_is_periodic(unwrap_record(response))
+        record = _add_time_fields(_add_is_periodic(unwrap_record(response)))
+        await add_enum_names(cache, [record], _REQUEST_ENUM_LABELS)
+        return record
 
     @mcp.tool(
         description=_GET_REQUEST_CUSTOM_FIELDS_DESC,
@@ -353,7 +515,7 @@ def register_request_tools(
         description=_GET_REQUEST_ENUMS_DESC,
         annotations=ToolAnnotations(title="Get request enums", readOnlyHint=True),
     )
-    async def get_request_enums(refresh: bool = False) -> dict[str, list[dict[str, Any]]]:
+    async def get_request_enums(refresh: bool = False) -> dict[str, Any]:
         try:
             # Ensure the cache is populated — on a cold cache `snapshot()` is
             # empty until something triggers a load, so always load() (idempotent)
@@ -364,7 +526,22 @@ def register_request_tools(
                 await cache.load()
         except Exception as e:
             raise to_llm_error(e, operation="get_request_enums") from e
-        return cache.snapshot()
+        result: dict[str, Any] = dict(cache.snapshot())
+        result["status"] = with_status_groups(result.get("status"), request_status_group)
+        result["fields"] = {
+            "always_required": ["company", "description (unless a catalog hides it)",
+                                "type_code or type_name"],
+            "by_tenant_setting": describe(REQUEST_FIELDS, cache.extra("config")),
+            "note": (
+                "State of each configurable create_request/update_request "
+                "parameter on this tenant, from its live request settings: off "
+                "(refused when given), optional, or required (must be given on "
+                "create, cannot be cleared on update). Per-record rules — the "
+                "service area per customer/category, SLA-computed deadlines, "
+                "required custom fields per catalog — are checked by CDESK."
+            ),
+        }
+        return result
 
     @mcp.tool(
         description=_CREATE_REQUEST_DESC,
@@ -372,8 +549,8 @@ def register_request_tools(
     )
     async def create_request(
         company: int,
-        title: str,
-        description: str,
+        title: str | None = None,
+        description: str | None = None,
         status_name: str | None = None,
         type_name: str | None = None,
         type_code: str | None = None,
@@ -396,6 +573,8 @@ def register_request_tools(
         sla_id: int | None = None,
         superior_request_id: int | None = None,
         desired_date: str | None = None,
+        due_date: str | None = None,
+        due_date_fixed: bool | None = None,
         calendar_date_start: str | None = None,
         invoice_date: str | None = None,
         solution: str | None = None,
@@ -434,42 +613,50 @@ def register_request_tools(
         custom_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
-            # title and description are mandatory on this tenant (CDESK rejects
-            # the create with "Zadajte názov/popis požiadavky" otherwise) — they
-            # are required params, so just guard against blank/whitespace.
-            if not title.strip():
-                raise ValueError("title must be a non-empty string")
-            if not description.strip():
-                raise ValueError("description must be a non-empty string")
-            # A request type and a solver are mandatory on this tenant — CDESK
-            # rejects the create with "Vyberte druh požiadavky" / "Vyberte
-            # riešiteľa" (code 14) otherwise. Enforce here so the failure is a
-            # clear, early error instead of a relayed Slovak backend message.
+            if title is not None and not title.strip():
+                raise ValueError("title must be a non-empty string when given")
+            if description is not None and not description.strip():
+                raise ValueError("description must be a non-empty string when given")
+            # Fields with no setting behind them are always required.
+            fixed: list[str] = []
+            if description is None and catalog_id is None:  # a catalog may hide it
+                fixed.append("description is always required (unless a catalog hides it)")
             if type_code is None and type_name is None:
-                raise ValueError(
-                    'a request type is required: provide type_code (e.g. "H" for '
-                    "Helpdesk) or type_name — discover the allowed types via "
-                    "get_request_enums and let the user pick from a dropdown"
-                )
-            if solver_id is None and solver_group_id is None:
-                raise ValueError(
-                    "a solver is required: provide solver_id or solver_group_id"
-                )
-            # Priority is a tool-level requirement (CDESK itself would default
-            # it). Like the other enums, discover options via get_request_enums
-            # and let the user pick from a dropdown — don't guess.
-            if priority_name is None:
-                raise ValueError(
-                    "a priority is required: provide priority_name — discover the "
-                    "allowed priorities via get_request_enums and let the user "
-                    "pick from a dropdown"
-                )
+                fixed.append("type_code or type_name (the request type) is always required")
+            # Everything else follows the TENANT's form, read live on every call:
+            # an off field is refused, a required one must be given
+            # (field_policy.py). This names the parameter and the setting where
+            # CDESK answers a bare "Vyberte riešiteľa". Priority has no such
+            # rule — CDESK takes the SLA's default (verified live, cmpp 2026-10-12).
+            settings = await _request_settings(cache)
+            refuse_if_violated(fixed + violations(
+                REQUEST_FIELDS, settings, {
+                    "solver_id": solver_id, "solver_group_id": solver_group_id,
+                    "title": title, "code": code, "cat_type_name": cat_type_name,
+                    "cat_area_name": cat_area_name, "cat_area_2nd_name": cat_area_2nd_name,
+                    "desired_date": desired_date, "due_date": due_date,
+                    "due_date_fixed": due_date_fixed or None,  # False = not fixed, never "set"
+                    "close_reason_name": close_reason_name,
+                    "solver_method_name": solver_method_name,
+                    "root_cause_name": root_cause_name, "solution": solution,
+                    "urgency_name": urgency_name, "impact_name": impact_name,
+                    "catalog_id": catalog_id, "place_name": place_name,
+                    "branch_id": branch_id,
+                },
+            ))
+            # With auto-naming on, the CDESK web form fills an empty title from
+            # the description before saving; the server itself does not (live
+            # on cmpp 2026-10-12: a title-less create stored ''). Do what the
+            # form does so the request is not saved nameless.
+            if title is None:
+                title = _auto_title(settings, description)
             validate_custom_fields(custom_fields)
             # Naive datetimes are interpreted as TENANT-LOCAL wall-clock time
             # and sent with an explicit offset — CDESK reads naive values as
             # UTC (verified live 2026-06-05 on task valid_from; same backend
             # datetime path). Bare dates pass through unchanged.
             desired_date = localize_naive_datetime("desired_date", desired_date)
+            due_date = localize_naive_datetime("due_date", due_date)
             calendar_date_start = localize_naive_datetime(
                 "calendar_date_start", calendar_date_start
             )
@@ -569,6 +756,8 @@ def register_request_tools(
                     "sla_id": sla_id,
                     "superior_request_id": superior_request_id,
                     "desired_date": desired_date,
+                    "due_date": due_date,
+                    "due_date_fixed": None if due_date_fixed is None else int(due_date_fixed),
                     "calendar_date_start": calendar_date_start,
                     "invoice_date": invoice_date,
                     "solution": solution,
@@ -593,7 +782,7 @@ def register_request_tools(
                     "scheduling_mode": scheduling_mode,
                     "change_manager_id": change_manager_id,
                     "reaction_missed_id_solver": reaction_missed_id_solver,
-                    "notify_block": notify_block,
+                    "notify_block": notify_block_value(notify_block),
                     "notify_customer_block": notify_customer_block,
                     "notify_sms_block": notify_sms_block,
                     "from_email": from_email,
@@ -622,12 +811,13 @@ def register_request_tools(
         # solver_note: silently dropped like code (verified live 2026-06-05:
         # PUT with solver_note is a complete no-op — 200, not stored,
         # udatetime not even bumped). Diff both against savedData.
-        return annotate_write_warnings(
+        # Labels go on AFTER the diff, so it compares only CDESK's own keys.
+        return await _label_write_result(cache, annotate_write_warnings(
             response if isinstance(response, dict) else {"data": response},
             sent_body=body,
             check_fields=tuple(_REQUEST_GATED_FIELDS),
             field_notes=_REQUEST_GATED_FIELDS,
-        )
+        ))
 
     @mcp.tool(
         description=_UPDATE_REQUEST_DESC,
@@ -660,6 +850,8 @@ def register_request_tools(
         sla_id: int | None = None,
         superior_request_id: int | None = None,
         desired_date: str | None = None,
+        due_date: str | None = None,
+        due_date_fixed: bool | None = None,
         calendar_date_start: str | None = None,
         invoice_date: str | None = None,
         solution: str | None = None,
@@ -672,6 +864,9 @@ def register_request_tools(
         hour_rate: float | None = None,
         percent_done: int | None = None,
         custom_fields: dict[str, Any] | None = None,
+        notify_block: int | None = None,
+        notify_customer_block: int | None = None,
+        notify_sms_block: int | None = None,
     ) -> dict[str, Any]:
         try:
             if title is not None and not title.strip():
@@ -682,6 +877,7 @@ def register_request_tools(
             # UTC (verified live 2026-06-05 on task valid_from; same backend
             # datetime path). Bare dates pass through unchanged.
             desired_date = localize_naive_datetime("desired_date", desired_date)
+            due_date = localize_naive_datetime("due_date", due_date)
             calendar_date_start = localize_naive_datetime(
                 "calendar_date_start", calendar_date_start
             )
@@ -708,6 +904,26 @@ def register_request_tools(
                     "provide either type_code or type_name, not both "
                     "(type_code would silently override type_name)"
                 )
+            # The tenant's form rules apply to updates too: an off field may not
+            # be set, a required one not cleared (left out = unchanged). Checked
+            # before any name is resolved, so an off field is reported as off
+            # rather than as an unresolvable name.
+            refuse_if_violated(violations(
+                REQUEST_FIELDS, await _request_settings(cache), {
+                    "solver_id": solver_id, "solver_group_id": solver_group_id,
+                    "title": title, "code": code, "cat_type_name": cat_type_name,
+                    "cat_area_name": cat_area_name, "cat_area_2nd_name": cat_area_2nd_name,
+                    "desired_date": desired_date, "due_date": due_date,
+                    "due_date_fixed": due_date_fixed or None,  # False = not fixed, never "set"
+                    "close_reason_name": close_reason_name,
+                    "solver_method_name": solver_method_name,
+                    "root_cause_name": root_cause_name, "solution": solution,
+                    "urgency_name": urgency_name, "impact_name": impact_name,
+                    "catalog_id": catalog_id, "place_name": place_name,
+                    "branch_id": branch_id,
+                },
+                update=True,
+            ))
             # CDESK stores req_status and req_priority by the enum ACTION_CODE
             # (verified live), NOT the enum id — sending the id overflows the
             # tinyint column and silently defaults/corrupts the value.
@@ -783,6 +999,8 @@ def register_request_tools(
                     "sla_id": sla_id,
                     "superior_request_id": superior_request_id,
                     "desired_date": desired_date,
+                    "due_date": due_date,
+                    "due_date_fixed": None if due_date_fixed is None else int(due_date_fixed),
                     "calendar_date_start": calendar_date_start,
                     "invoice_date": invoice_date,
                     "solution": solution,
@@ -799,13 +1017,16 @@ def register_request_tools(
                     "planned_hours": planned_hours,
                     "hour_rate": hour_rate,
                     "percent_done_manual": percent_done,
+                    "notify_block": notify_block_value(notify_block),
+                    "notify_customer_block": notify_customer_block,
+                    "notify_sms_block": notify_sms_block,
                 }
             )
             # customFields keys are already wire-format (cfield_*) — set after
             # the body build so they bypass the LLM-name→CDESK-name rename map.
             if custom_fields:
                 body["customFields"] = custom_fields
-            if not body:
+            if not _without_notify_flags(body):
                 # An update with no field still issued a PUT, which changed
                 # nothing and bumped `udatetime` on a destructive-hinted tool.
                 # Fail before the write so "nothing happened" is explicit.
@@ -823,12 +1044,12 @@ def register_request_tools(
         except Exception as e:
             raise to_llm_error(e, operation="update_request", record_id=id) from e
         # solver_note: silently dropped like code (see create_request note).
-        return annotate_write_warnings(
+        return await _label_write_result(cache, annotate_write_warnings(
             response if isinstance(response, dict) else {"data": response},
             sent_body=body,
             check_fields=tuple(_REQUEST_GATED_FIELDS),
             field_notes=_REQUEST_GATED_FIELDS,
-        )
+        ))
 
     @mcp.tool(
         description=_DELETE_REQUEST_DESC,
@@ -845,7 +1066,13 @@ def register_request_tools(
         description=_SET_REQUEST_STATUS_DESC,
         annotations=ToolAnnotations(title="Set request status", destructiveHint=True),
     )
-    async def set_request_status(id: int, status_name: str) -> dict[str, Any]:
+    async def set_request_status(
+        id: int,
+        status_name: str,
+        notify_block: int | None = None,
+        notify_customer_block: int | None = None,
+        notify_sms_block: int | None = None,
+    ) -> dict[str, Any]:
         try:
             # req_status is stored/matched by enum ACTION_CODE, not the enum id.
             status_id = await resolve_enum_field_or_raise(
@@ -854,13 +1081,22 @@ def register_request_tools(
             if status_id is None:
                 raise RuntimeError("set_request_status requires a non-empty status_name")
             current = await _fetch_for_update_request(client, id)
-            body = {"status": status_id, "timestamp_check": current["timestamp_check"]}
+            body: dict[str, Any] = {"status": status_id, "timestamp_check": current["timestamp_check"]}
+            for key, value in (
+                ("notify_block", notify_block_value(notify_block)),
+                ("notify_customer_block", notify_customer_block),
+                ("notify_sms_block", notify_sms_block),
+            ):
+                if value is not None:
+                    body[key] = value
             response = await client.put(f"v3/request/{id}", json=body)
         except RuntimeError:
             raise
         except Exception as e:
             raise to_llm_error(e, operation="set_request_status", record_id=id) from e
-        return response if isinstance(response, dict) else {"data": response}
+        return await _label_write_result(
+            cache, response if isinstance(response, dict) else {"data": response}
+        )
 
     @mcp.tool(
         description=_LIST_REQUEST_DISCUSSION_DESC,
@@ -1023,39 +1259,6 @@ async def _fetch_for_update_request(client: CdeskClient, id: int) -> dict[str, A
     return record
 
 
-def _sort_not_honored(sort: str) -> dict[str, Any]:
-    """The `unsupported_sort` block attached whenever `sort` was passed.
-
-    The v3 request list accepts `sort` and does not honor it: "id", "-id",
-    "id desc" and an unknown column all return the same order (verified live
-    2026-06-05, re-confirmed 2026-07-30). Passing any value only flips to
-    oldest-first. Unknown FILTER columns already get this treatment via
-    `unsupported_filters`; sort had no runtime signal at all, so a caller that
-    asked for "the 5 highest-priority requests" received an arbitrary page in id
-    order with nothing indicating the ordering never applied.
-
-    Declarative on purpose — it states what the response is, not what to do
-    about it (the same reason `unsupported_filter_directive` reads the way it
-    does).
-    """
-    return {
-        "requested_sort": sort,
-        "applied": False,
-        "actual_order": "id ascending (oldest first)",
-        "what_this_means": (
-            f"The CDESK v3 request list does not honor `sort`: the column name "
-            f"and direction in {sort!r} had no effect, and these items are in id "
-            f"ascending (oldest-first) order — passing any sort value at all "
-            f"produces that, while omitting sort gives newest-first. The items "
-            f"are therefore NOT ordered by the requested field. Ordering by a "
-            f"field is only possible client-side, and only over the complete "
-            f"result set: a single page sorted locally gives the top of THAT "
-            f"page, not of the whole set, and `meta` carries no total to tell "
-            f"the two apart. The complete set is this call repeated with `page` "
-            f"incremented until a short or empty page comes back."
-        ),
-    }
-
 
 def _build_request_body(public_fields: dict[str, Any]) -> dict[str, Any]:
     """Map LLM-facing field names → CDESK field names, dropping Nones.
@@ -1140,8 +1343,9 @@ def _build_discussion_body(
         body["changeStatusToWaitingForCustomer"] = True
     if work_order_id is not None:
         body["work_order_id"] = work_order_id
-    if notify_block is not None:
-        body["notifyBlock"] = notify_block
+    block = notify_block_value(notify_block)
+    if block is not None:
+        body["notifyBlock"] = block
     if notify_customer_block is not None:
         body["notifyCustomerBlock"] = notify_customer_block
     if notify_sms_block is not None:
@@ -1287,17 +1491,8 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
     """
     List CDESK requests (helpdesk tickets) visible to your account. A
     request is the customer-facing ticket entity — distinct from internal
-    tasks. Returns a paginated `items` array; `meta` is usually empty on
-    this backend (no total count is sent — detect the last page by a
-    short/empty page, not by a total).
-
-    Ordering: omitting `sort` gives newest-first (usually what you want).
-    The sort COLUMN and direction are both IGNORED by the backend
-    (verified live 2026-06-05: "id", "-id", "id desc" and an unknown
-    column all produce the same order) — passing ANY sort value merely
-    flips the ordering to oldest-first (id ascending). So: omit sort for
-    newest-first, any value gives oldest-first, and a column name has no
-    effect — ordering by a specific field only works client-side.
+    tasks. Returns a paginated `items` array; `meta.total` is the number of records matching the filter across all pages (CDESK's own count) and `meta.last_page` tells whether this is the last page. A count question
+    ("how many …") is one call with per_page=1, read meta.total.
 
     Common filters:
       - text_search: free-text across the request's default columns.
@@ -1317,6 +1512,15 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
     Every returned item carries a derived `is_periodic` boolean (True when
     the request was generated from a periodical request) alongside the raw
     `periodical_request_id` it is derived from.
+
+    Enum fields carry their label alongside: `status_name`, `priority_name`,
+    `type_name`, `cat_type_name`, … sit next to the raw value. The raw
+    `status` and `priority` are enum ACTION CODES, not names or ids —
+    `priority: 2` is whatever entry has action code 2 (on some tenants
+    "dlhodobá"), not "2 - vysoká". The `*_name` values are the names the
+    status_name / priority_name / … parameters accept. A value with no
+    label (empty, or a category switched off on the tenant) has no
+    `*_name` key.
 
     Working filters: text_search, status_name, priority_name, cat_type_name,
     base_type, company, solver_id, solver_group_id, catalog_id, deal_id,
@@ -1354,6 +1558,25 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
     field group per record ("base"/"extended"/"all"/"custom"); fields is an
     exact whitelist of field names (returnFields; union with fieldset).
     Use fieldset="base" or fields=[...] to keep large lists compact.
+
+    status_group filters by CDESK's own status groups (what its UI quick filters
+    use): "open" (otvorené — every status below 80), "completed" (vyriešené —
+    80, 81, 85, 86), "closed" (uzavreté — ONLY 90, 91, 95: accepted, without
+    acceptance, refused), "closed_and_completed" (vyriešené, uzavreté — both;
+    i.e. everything no longer open) and "waiting_for_response" (čaká na
+    odozvu). A request in "ukončené" (80) is completed, not closed; "no longer
+    open" is closed_and_completed. Combine with per_page=1 and meta.total to
+    count. get_request_enums lists each status's group.
+
+    Time fields: `age_hours_calendar` is the calendar time from creation to
+    close (to now while the request is open), in hours. CDESK's own
+    `duration_open` / `duration_reaction` (seconds; with fieldset "all" and in
+    write results) are SLA WORKING time — only inside the SLA's operating
+    hours, without holidays and without time in statuses that stop the SLA
+    clock — not calendar time. `duration_open` is set when the request is
+    closed: it is 0 while open, after a reopen, and without an SLA, so
+    `sla_open_hours` is null then; `sla_reaction_hours` is null until the
+    first reaction.
     """
 )
 
@@ -1362,6 +1585,16 @@ _GET_REQUEST_DESC = inspect.cleandoc(
     Fetch a single request by id. Returns the request record including
     SLA metadata. (The optimistic-lock token for updates is fetched
     internally by update_request — you never need it.)
+
+    Time fields: `age_hours_calendar` is the calendar time from creation to
+    close (to now while the request is open), in hours. CDESK's own
+    `duration_open` / `duration_reaction` (seconds; with fieldset "all" and in
+    write results) are SLA WORKING time — only inside the SLA's operating
+    hours, without holidays and without time in statuses that stop the SLA
+    clock — not calendar time. `duration_open` is set when the request is
+    closed: it is 0 while open, after a reopen, and without an SLA, so
+    `sla_open_hours` is null then; `sla_reaction_hours` is null until the
+    first reaction.
 
     fieldset selects the field group returned: "base", "extended"
     (CDESK's default when omitted), "all" (base+extended+custom), or
@@ -1380,6 +1613,15 @@ _GET_REQUEST_DESC = inspect.cleandoc(
     request was generated from a periodical request) plus the raw
     `periodical_request_id` it rests on — both are included regardless of
     fieldset/fields.
+
+    Enum fields carry their label alongside: `status_name`, `priority_name`,
+    `type_name`, `cat_type_name`, … sit next to the raw value. The raw
+    `status` and `priority` are enum ACTION CODES, not names or ids —
+    `priority: 2` is whatever entry has action code 2 (on some tenants
+    "dlhodobá"), not "2 - vysoká". The `*_name` values are the names the
+    status_name / priority_name / … parameters accept. A value with no
+    label (empty, or a category switched off on the tenant) has no
+    `*_name` key.
     """
 )
 
@@ -1416,6 +1658,11 @@ _GET_REQUEST_ENUMS_DESC = inspect.cleandoc(
     Use this to discover which names are valid for create_request /
     update_request / set_request_status. Pass refresh=True to force a
     fresh fetch.
+
+    Also returns `fields`: the state of each configurable create_request /
+    update_request parameter on this tenant — off, optional or required —
+    derived from its live request settings, each with the setting behind
+    it, plus the parameters that are always required.
     """
 )
 
@@ -1439,11 +1686,26 @@ _CREATE_REQUEST_DESC = inspect.cleandoc(
     """
     Create a new CDESK request (helpdesk ticket).
 
-    Required: company (the company id the ticket belongs to),
-    title (req_title), description (HTML allowed), a request type
-    (type_code, e.g. "H" — or type_name), a priority (priority_name),
-    and a solver (solver_id or solver_group_id). The tool enforces all
-    of these up front with a clear error.
+    Always required: company (the company id the ticket belongs to),
+    description (HTML allowed; a catalog may hide it), and a request type
+    (type_code, e.g. "H" — or type_name). Every other configurable field
+    follows the tenant's CDESK form, read live on every call: a field the
+    tenant has switched off is refused when given, a required one must be
+    given, an optional one may be left out. Examples: use_solver_group
+    decides whether solver_id or solver_group_id is the required one (the
+    other is off or optional); the title is required unless the tenant
+    has auto-naming on — then a missing title is generated from the
+    description exactly as the CDESK web form does (HTML stripped, cut to
+    the tenant's max_auto_name_characters + "..."); code, category type,
+    desired date, close reason,
+    solution, urgency/impact, place, branch and catalog can each be off.
+    get_request_enums lists every field's state under `fields`; a call
+    breaking a rule is rejected naming each parameter and its setting.
+    Priority is optional — CDESK takes the SLA's default.
+    When the tenant flags any company tag as "requests may be added"
+    (CDESK's default customer-type tag does), only companies carrying such
+    a tag accept requests; any other company is refused with "Zadajte
+    aktívneho zákazníka" even though it is active.
 
     Dropdown / enum fields — do NOT guess a value. type, status,
     priority, urgency, impact, place, and the category fields
@@ -1482,7 +1744,10 @@ _CREATE_REQUEST_DESC = inspect.cleandoc(
         base type configured. (type_name is only usable on tenants whose type
         enum is id-based; this tenant's is key/value, so pass type_code.)
       - solver_id, solver_group_id: who handles the request (CDESK requires a
-        solver or solver group).
+        solver or solver group). Solver group ids are user-group ids
+        (list_user_groups; a root group, main_group=true, is not accepted);
+        whether the group is required follows use_solver_group
+        (get_request_enums → fields).
       - catalog_id: instantiate from a request-catalog template.
       - deal_id (id_rc) / project_contract_id: deal linkage.
       - desired_date, calendar_date_start, invoice_date, first_conclusion
@@ -1492,7 +1757,11 @@ _CREATE_REQUEST_DESC = inspect.cleandoc(
         `first_conclusion` belongs here even though the CDESK spec declares it
         a string: the column is a TIMESTAMP, so prose sent to it used to store
         as "0000-00-00 00:00:00". Non-dates are now rejected up front.
-        (The deadline `req_due_date` is SLA-computed and not directly settable.)
+      - due_date: the deadline ("Termín splnenia do"), ISO-8601 like the dates
+        above. CDESK computes it from the SLA when it is left out; a value sent
+        replaces it. Off while the tenant has the due-date field off (dueDate).
+        due_date_fixed=true marks it as fixed (not recomputed); available only
+        with the tenant's fixedDueDate setting.
       - solution, solver_note, note, code, computer_code: free-text
         bodies. NB: `code` requires the
         request/fields/code write right — without it CDESK silently
@@ -1529,6 +1798,10 @@ _CREATE_REQUEST_DESC = inspect.cleandoc(
 
     Returns: {data: <new id>, savedData: {...full record...}}; check the
     optional `warnings` list for silently-dropped/ignored fields.
+
+    Side effects (by CDESK): with the deal module and the tenant's automatic deal
+    selection on, a request saved without deal_id is linked to the customer's deal
+    when exactly one deal fits (taking the service area into account).
     """
 )
 
@@ -1545,7 +1818,11 @@ _UPDATE_REQUEST_DESC = inspect.cleandoc(
     enums are gated per tenant and are simply absent on some servers; the error
     says which, and names the setting behind it.
 
-    desired_date, calendar_date_start, invoice_date and first_conclusion are
+    due_date sets the deadline (CDESK computes it from the SLA otherwise), and
+    due_date_fixed=true keeps it from being recomputed — the latter only with
+    the tenant's fixedDueDate setting.
+
+    desired_date, due_date, calendar_date_start, invoice_date and first_conclusion are
     ISO-8601 datetimes — a value without an offset is read as tenant-local time
     (CDESK_TIMEZONE, default Europe/Bratislava). `first_conclusion` is one of
     them despite the CDESK spec declaring it a string: the column is a
@@ -1569,6 +1846,16 @@ _UPDATE_REQUEST_DESC = inspect.cleandoc(
 
     Returns: {data: <id>, savedData: {...full record...}}; check the
     optional `warnings` list for silently-dropped/ignored fields.
+        notify_block=1 sends no notification for this change; notify_customer_block
+    / notify_sms_block suppress only the customer e-mails / the SMS.
+
+    Side effects (by CDESK): moving a request to a closing status (80 ukončené,
+    81, 85, 86, 95 zamietnuté) sets its close_date and close user, computes
+    duration_open, sets first_conclusion on the first close to 80 and, on some
+    tenants, invoice_date (not for 95); moving it back below 80 clears the close
+    date, close reason, solver method and duration_open. A move straight to 90 /
+    91 does not run this.
+    A request without a deal can get one: see create_request.
     """
 )
 
@@ -1586,7 +1873,19 @@ _SET_REQUEST_STATUS_DESC = inspect.cleandoc(
     status name via the Request enum cache, handles the optimistic-lock
     fetch internally, and PUTs only the {status, timestamp_check} pair.
 
-    Returns the updated request record.
+    notify_block=1 sends no notification for this change (notify_customer_block
+    / notify_sms_block: none to the customer / no SMS).
+
+    Returns the updated request record. Closing a request makes CDESK compute
+    `duration_open` (SLA working seconds, see get_request); the result carries
+    it as `sla_open_hours` beside `age_hours_calendar`.
+
+    Side effects (by CDESK): moving a request to a closing status (80 ukončené,
+    81, 85, 86, 95 zamietnuté) sets its close_date and close user, computes
+    duration_open, sets first_conclusion on the first close to 80 and, on some
+    tenants, invoice_date (not for 95); moving it back below 80 clears the close
+    date, close reason, solver method and duration_open. A move straight to 90 /
+    91 does not run this.
     """
 )
 
@@ -1651,5 +1950,14 @@ _POST_REQUEST_DISCUSSION_DESC = inspect.cleandoc(
     in-app notification for, and CDESK's confirmation message; it
     carries a `warning` when a requested receiver is not in the recorded
     list or CDESK sent no confirmation.
+        notify_block (notifyBlock) currently stops only the extra notification a post
+    can trigger by changing the request status; CDESK still sends the post's own
+    e-mail (verified live 2026-10-12, reported to CDESK).
+
+    Side effects (by CDESK): with the tenant's automatic status change on, a post
+    by the request's solver (or a member of its solver group) moves a request in
+    "prijaté" / "priradené" to "v riešení", and a customer's post moves a request
+    in "čakanie na zákazníka" back to "v riešení"; change_status_to_waiting_for_customer
+    moves it to "čakanie na zákazníka".
     """
 )

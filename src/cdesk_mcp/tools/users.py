@@ -45,10 +45,15 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from cdesk_mcp import base_config
 from cdesk_mcp.cdesk_client import CdeskApiError, CdeskAuthError, CdeskClient
 from cdesk_mcp.filters import USER_TYPE_LABELS, build_user_filter, encode_sb
+from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
     annotate_write_warnings,
+    forbid_unknown_arguments,
+    list_meta,
+    TEXT_MATCH_NOTE,
     apply_field_scope,
     redact_secrets,
     to_llm_error,
@@ -70,7 +75,12 @@ _USER_CREATE_FIELDS = {
     # username-charset error while the same value under `user` succeeds —
     # verified live 2026-06-04). The LLM-facing param stays `login`.
     "login": "user",
-    "send_password_email": "sendPassword",   # CDESK camelCase (unusual)
+    # The v3 spec documents `sendPassword`, but the backend reads only
+    # `password_action` (User/Module.php:1085, :1560 sends the e-mail) and
+    # nothing maps one to the other: with `sendPassword` the user was created
+    # with no password and no e-mail (verified live on cmpp 2026-10-12;
+    # `password_action` answered "E-mail pre zmenu hesla bol úspešne odoslaný").
+    "send_password_email": "password_action",
     "company_id": "id_company",              # CDESK uses older naming
     "primary_group_id": "group_primary",     # clearer LLM name
     "group_ids": "groups",                   # consistent with tag_ids pattern
@@ -154,6 +164,60 @@ def _drop_oversized_user_keys(record: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
+# User groups (UAT B7). The v3 spec: user groups "are also solver groups and
+# approver groups", and `solver_group_id` is "FK to a user group id". The list
+# is trimmed to the identifying fields by default — a group record also carries
+# its rights and user settings. `main_group` marks a ROOT group (Administrators,
+# Operators, Customer accounts, …), which CDESK never offers as a request's
+# solver group (UserGroup::getSolverGroupList, withoutRootGroups).
+_MAX_GROUPS_PER_PAGE = 100
+_GROUP_LIST_FIELDS = (
+    "id", "name", "description", "enabled", "main_group", "parent_id",
+    "assigned_company_count",
+)
+# `id_parent` on a group is NOT its parent group (live: the PROBE group under
+# Operators read id_parent = the creating user's id); the parents are
+# `group_id`, which v3 documents as "Parent group ids".
+_GROUP_DETAIL_FIELDS = ("id", "name", "nick", "description", "enabled", "main_group")
+
+
+# whoami (UAT B6). The v3 API has no "current user" endpoint and its login
+# answer carries only tokens; core/base-config — the payload the CDESK web app
+# loads for every logged-in user, already used for the form rules — holds the
+# caller's own record in its `user` block. That block ALSO holds the session's
+# apitoken (`token`) and `gsh`, so only the fields named here ever leave it.
+_WHOAMI_FIELDS = (
+    ("id", "id"),
+    ("login", "user"),
+    ("name", "name"),
+    ("email", "email"),
+    ("company_id", "admin_main_company"),
+    ("type", "type"),
+    ("job_title_id", "job_title_id"),
+    ("language", "lang"),
+    ("timezone", "admin_timezone"),
+)
+_WHOAMI_ROLES = (
+    ("admin", "is_admin"),
+    ("operator", "is_operator"),
+    ("solver", "is_solver"),
+    ("request_solver", "is_request_solver"),
+    ("customer", "is_customer"),
+    ("authorizing_officer", "is_authorizing_officer"),
+)
+
+
+def whoami_record(base: Any) -> dict[str, Any] | None:
+    """The calling user's allow-listed fields from core/base-config, or None
+    when the payload has no usable `user` block."""
+    user = base_config.section(base, "user")
+    if not isinstance(user, dict) or not isinstance(user.get("id"), int):
+        return None
+    out: dict[str, Any] = {key: user.get(src) for key, src in _WHOAMI_FIELDS}
+    out["roles"] = {key: bool(user.get(src)) for key, src in _WHOAMI_ROLES}
+    return out
+
+
 def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
     """Register all User-module tools on the given FastMCP instance.
 
@@ -162,7 +226,84 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
     authorizing_officer/guest) are documented in tool descriptions."""
 
     @mcp.tool(
-        description=_LIST_USERS_DESC,
+        description=_WHOAMI_DESC,
+        annotations=ToolAnnotations(title="Who am I", readOnlyHint=True),
+    )
+    async def whoami() -> dict[str, Any]:
+        data = await base_config.load(client)
+        me = whoami_record(data)
+        if me is None:
+            raise RuntimeError(
+                "whoami: CDESK did not return the calling user's record "
+                "(core/base-config unreadable); try again, or check the "
+                "connection with server_info."
+            )
+        return me
+
+    @mcp.tool(
+        description=_LIST_USER_GROUPS_DESC,
+        annotations=ToolAnnotations(title="List user groups", readOnlyHint=True),
+    )
+    async def list_user_groups(
+        text_search: str | None = None,
+        page: int = 1,
+        per_page: int = 50,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        try:
+            if per_page < 1 or per_page > _MAX_GROUPS_PER_PAGE:
+                raise ValueError(
+                    f"per_page must be between 1 and {_MAX_GROUPS_PER_PAGE} (got {per_page})"
+                )
+            if page < 1:
+                raise ValueError(f"page must be 1 or greater (got {page})")
+            validate_fields(fields)
+            params: dict[str, Any] = {
+                "pg": page, "pp": per_page,
+                "returnFields[]": fields or list(_GROUP_LIST_FIELDS),
+            }
+            if text_search:
+                params["q"] = text_search
+            response, paging = await client.get_page("v3/user/groups", params=params)
+        except ValueError as e:
+            raise RuntimeError(f"list_user_groups input error: {e}") from e
+        except Exception as e:
+            raise to_llm_error(e, operation="list_user_groups") from e
+        records, meta = unwrap_list(response)
+        for row in records:
+            # CDESK sends main_group only for a root group and leaves the key
+            # out otherwise (live on cmpp 2026-10-12) — make it always a bool.
+            if isinstance(row, dict) and (fields is None or "main_group" in fields):
+                row["main_group"] = row.get("main_group") is True
+        return {"items": records, "meta": list_meta(meta, paging),
+                "page": page, "per_page": per_page}
+
+    @mcp.tool(
+        description=_GET_USER_GROUP_DESC,
+        annotations=ToolAnnotations(title="Get user group", readOnlyHint=True),
+    )
+    async def get_user_group(id: int) -> dict[str, Any]:
+        try:
+            response = await client.get(f"v3/user/groups/{id}")
+        except Exception as e:
+            raise to_llm_error(e, operation="get_user_group", record_id=id) from e
+        record = unwrap_record(response)
+        if not isinstance(record, dict):
+            raise RuntimeError(f"get_user_group: unexpected response for group {id}")
+        out = {key: record.get(key) for key in _GROUP_DETAIL_FIELDS}
+        out["main_group"] = record.get("main_group") is True  # absent = not a root group
+        members = record.get("assigned_user_id")
+        out["member_ids"] = members if isinstance(members, list) else []
+        parents = record.get("group_id")
+        out["parent_group_ids"] = parents if isinstance(parents, list) else []
+        children = record.get("child_group_id")
+        out["child_group_ids"] = children if isinstance(children, list) else []
+        return out
+
+    forbid_unknown_arguments(mcp, ("list_user_groups",))
+
+    @mcp.tool(
+        description=_LIST_USERS_DESC + "\n\n" + sort_note("users") + "\n\n" + TEXT_MATCH_NOTE,
         annotations=ToolAnnotations(title="List users", readOnlyHint=True),
     )
     async def list_users(
@@ -209,17 +350,17 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
             if only_deleted:
                 params["onlyDeleted"] = "1"
             if sort:
-                params["sort"] = sort
+                params["sort"] = resolve_sort("users", sort)
             if sb is not None:
                 params["sb"] = encode_sb(sb)
-            response = await client.get("v3/user", params=params)
+            response, paging = await client.get_page("v3/user", params=params)
         except ValueError as e:
             raise RuntimeError(f"list_users input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="list_users") from e
 
         records, meta = unwrap_list(response)
-        result = {"items": records, "meta": meta, "page": page, "per_page": per_page}
+        result = {"items": records, "meta": list_meta(meta, paging, dropped=dropped_clauses), "page": page, "per_page": per_page}
         if dropped_clauses:
             result["unsupported_filters"] = unsupported_filter_directive(dropped_clauses)
         return result
@@ -391,7 +532,7 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                     "ips": ips,
                     "password": password,
                     # M9.3: pass send_password_email through unchanged so an
-                    # explicit False reaches CDESK as `sendPassword: false`.
+                    # explicit False reaches CDESK as `password_action: false`.
                     "send_password_email": send_password_email,
                     "first_name": first_name,
                     "last_name": last_name,
@@ -683,7 +824,7 @@ _LIST_USERS_DESC = inspect.cleandoc(
       that derivation. Two consequences, both verified live 2026-07-31:
       (a) a user with NO group membership matches NO user_type value at all,
       and the API cannot assign groups (it accepts `groups`/`group_primary`
-      with a 200 and stores nothing — see docs/bugs.md), so every user created
+      with a 200 and stores nothing), so every user created
       through this connector is unreachable by this filter until a group is
       assigned in the CDESK UI; (b) the record field `type` ("M"/"C"/...) is
       NOT this derived user_type — a user whose `type` is "C" is matched by
@@ -706,15 +847,7 @@ _LIST_USERS_DESC = inspect.cleandoc(
 
     Pagination: page (1-based), per_page (default 20, max 100).
 
-    Ordering (re-verified live 2026-07-31 — the backend behaviour CHANGED):
-    omitting `sort` gives id ascending. A BARE COLUMN NAME now genuinely sorts
-    ASCENDING by that column ("name" confirmed against a user deliberately
-    given the highest id and an alphabetically-first name). A direction
-    modifier is NOT honored — "-name" fell back to id ascending, the default
-    order. So: for ascending order by one column pass the bare name;
-    DESCENDING is not available server-side — page the set and sort
-    client-side, and never assume a "-" prefix was applied. `meta` is usually
-    empty (no total count) — detect the last page by a short/empty page.
+    `meta.total` is the number of records matching the filter across all pages (CDESK's own count) and `meta.last_page` tells whether this is the last page.
 
     Response shaping (same semantics as get_user): fieldset selects the
     field group per record ("base"/"extended"/"all"/"custom"); fields is an
@@ -813,9 +946,9 @@ _CREATE_USER_DESC = inspect.cleandoc(
     - `password`: plain text, CDESK hashes it. It is visible in the MCP tool
       call args and may end up in client transcripts; send_password_email
       avoids that exposure entirely.
-    - `send_password_email=True`: CDESK auto-generates a strong password
-      and emails it to the new user. Safer; no plaintext in your AI
-      client's log.
+    - `send_password_email=True`: CDESK e-mails the new user a link to set
+      their own password (the "Vytvoriť heslo prostredníctvom emailu" option
+      of the CDESK form). Safer; no plaintext in your AI client's log.
 
     Access flags:
     - cdesk_access / cmonitor_access (both default unset → CDESK uses
@@ -880,5 +1013,46 @@ _DELETE_USER_DESC = inspect.cleandoc(
     links, which have to be broken before the delete can succeed.
 
     Returns: {deleted: <id>}.
+    """
+)
+
+
+_WHOAMI_DESC = inspect.cleandoc(
+    """
+    The CDESK user this connector acts as — the account whose rights every
+    tool call runs with (in http mode, whoever signed in): id, login, name,
+    email, company_id (the user's own company), type (CDESK's raw user-type
+    letter, "M"/"C"/…; not the derived user_type of list_users), job_title_id,
+    language, timezone, and roles (admin, operator, solver, request_solver,
+    customer, authorizing_officer). Its `id` is the solver_id / user id that
+    "my tasks", "my requests" or "what I logged" refer to.
+    """
+)
+
+_LIST_USER_GROUPS_DESC = inspect.cleandoc(
+    """
+    List CDESK user groups — the groups users belong to, which are ALSO the
+    solver groups (`solver_group_id` on requests and in catalog prefills) and
+    approver groups. Returns id, name, description, enabled,
+    main_group, parent_id and assigned_company_count per group (fields: pick
+    other top-level fields instead), plus meta.total.
+
+    main_group=true marks a ROOT group (Administrators, Operators, Customer
+    accounts, …): CDESK does not accept a root group as a request's solver
+    group. Whether a group fits a particular request (its customer, service
+    area, catalog) is decided by CDESK when the request is written — the v3
+    API has no list of the groups valid for one request.
+
+    text_search matches the group name. get_user_group gives one group's
+    member user ids.
+    """
+)
+
+_GET_USER_GROUP_DESC = inspect.cleandoc(
+    """
+    One CDESK user group (also a solver / approver group): id, name, nick,
+    description, enabled, main_group (true = a root group), the parent group
+    ids (parent_group_ids), the member user ids (member_ids — names via
+    get_user / list_users) and the ids of its child groups.
     """
 )

@@ -607,6 +607,7 @@ def build_task_filter(
     *,
     text_search: str | None = None,
     status_id: int | None = None,
+    status_group: str | None = None,
     type_id: int | None = None,
     solver_id: int | list[int] | None = None,
     customer_id: int | list[int] | None = None,
@@ -677,6 +678,10 @@ def build_task_filter(
         clauses.append(_text_leaf(text_search))
     if status_id is not None:
         clauses.append(_eq_leaf(_TASK_COLS["status"], status_id))
+    if status_group is not None:
+        clauses.append(_eq_leaf(
+            _TASK_COLS["status"], _status_group_value("tasks", status_group, TASK_STATUS_GROUPS),
+        ))
     if type_id is not None:
         clauses.append(_eq_leaf(_TASK_COLS["type_id"], type_id))
     if solver_id is not None:
@@ -772,10 +777,36 @@ def build_user_filter(
     return _wrap(clauses)
 
 
+# CDESK's own status groups (UAT B5). The v3 request and task lists apply them
+# when `status` carries the group value — the same quick filters the CDESK UI
+# offers (Module/Core/Controller/SimpleFilterEnumController.php) — through
+# Model/Request.php whereStatusValue and Model/Task.php whereFilter. Live on
+# cmpp 2026-10-12: open 5, completed 110, closed 0, closed_and_completed 110 of
+# 115 requests; tasks open 9, closed 0 of 9. NOT yet in the v3 spec, which
+# documents `status` only as an action code (see docs/bugs/missing_endpoints.md).
+REQUEST_STATUS_GROUPS: dict[str, int] = {
+    "open": 100,                  # otvorené — action code < 80
+    "completed": 250,             # vyriešené — 80, 81, 85, 86
+    "closed": 200,                # uzavreté — 90, 91, 95 only
+    "closed_and_completed": 210,  # vyriešené, uzavreté — both of the above
+    "waiting_for_response": 260,  # čaká na odozvu — open and waiting for a reaction
+}
+TASK_STATUS_GROUPS = ("open", "closed")  # < 80 (or no status) / >= 80
+
+
+def _status_group_value(kind: str, group: str, groups: Any) -> Any:
+    if group not in groups:
+        raise ValueError(
+            f"status_group must be one of {', '.join(groups)} for {kind} (got {group!r})"
+        )
+    return groups[group] if isinstance(groups, dict) else group
+
+
 def build_request_filter(
     *,
     text_search: str | None = None,
     status_id: int | None = None,
+    status_group: str | None = None,
     priority_id: int | None = None,
     cat_type_id: int | None = None,
     base_type: str | None = None,
@@ -846,6 +877,11 @@ def build_request_filter(
         clauses.append(_text_leaf(text_search))
     if status_id is not None:
         clauses.append(_eq_leaf(_REQUEST_COLS["status_id"], status_id))
+    if status_group is not None:
+        clauses.append(_eq_leaf(
+            _REQUEST_COLS["status_id"],
+            _status_group_value("requests", status_group, REQUEST_STATUS_GROUPS),
+        ))
     if priority_id is not None:
         clauses.append(_eq_leaf(_REQUEST_COLS["priority_id"], priority_id))
     if cat_type_id is not None:

@@ -3,10 +3,15 @@ envelope unwrapping, ISO-8601 date validation, error-wrapping."""
 
 from __future__ import annotations
 
+import contextvars
+import functools
+import inspect
 import re
 import unicodedata
-from datetime import datetime
-from typing import Any, NoReturn, TypeVar, cast
+from datetime import datetime, timezone
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any, Literal, NoReturn, TypeVar, cast
 
 from mcp.server.fastmcp import FastMCP
 
@@ -27,6 +32,24 @@ from cdesk_mcp.errors import translate_error
 # request / company / user). CDESK defaults to "extended" when omitted;
 # "all" and "custom" are the two that surface stored custom-field values.
 FIELDSETS = ("base", "extended", "all", "custom")
+
+# Appended to every description that exposes a free-text filter. CDESK's
+# whereSearch (Wrapper\BaseModel::whereSearch -> Str::splitText) splits the
+# value on whitespace and substring-matches each word INDEPENDENTLY, so a
+# multi-word value is not a phrase and word order is ignored. Live-verified on
+# v3/approval 2026-08-03: 'mandatory mcp' matched a record named "mcp test
+# mandatory" (that phrase occurs nowhere), 'and' matched "mandatory", and the
+# 1-char value 'a' matched 2 of 6 records. This matters beyond ergonomics —
+# verify_claims checks that a quote is a literal substring of the record, NOT
+# that the record is the right one, so a false text match can survive
+# verification with an accurate quote from the wrong record.
+TEXT_MATCH_NOTE = (
+    "Text matching is WORD-SPLIT, not phrase: the value is split on whitespace "
+    "and each word is substring-matched independently (case-insensitive, "
+    "AND-joined, word order ignored), so \"manual A\" also matches a record "
+    "titled \"manual B\". Short words are near-useless as filters — to target "
+    "one specific record, filter on its id or code, not its name."
+)
 
 def apply_field_scope(
     params: dict[str, Any],
@@ -93,6 +116,57 @@ def validate_custom_fields(custom_fields: Any) -> None:
             )
 
 
+# Set while a tool that is not read-only runs (mark_write_tools). The enum
+# resolvers then refuse a value the tenant has switched off (in_use = 0), as
+# the CDESK form does; read-only tools — list filters — still accept it, since
+# old records can sit in a value that is no longer in use (UAT B13).
+_WRITE_CALL: contextvars.ContextVar[bool] = contextvars.ContextVar("cdesk_write_call", default=False)
+
+
+def mark_write_tools(mcp: FastMCP) -> None:
+    """Wrap every registered tool whose annotations are not read-only so the
+    enum resolvers know a write is running. Applied once in build_server; a
+    no-op on the test FakeMCP (tests that need it set _WRITE_CALL directly)."""
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is None:
+        return
+    for tool in manager.list_tools():
+        annotations = getattr(tool, "annotations", None)
+        if annotations is not None and annotations.readOnlyHint is True:
+            continue
+        fn = getattr(tool, "fn", None)
+        if fn is None:
+            continue
+
+        def wrap(inner: Callable[..., Any]) -> Callable[..., Any]:
+            @functools.wraps(inner)
+            async def wrapped(*args: Any, **kwargs: Any) -> Any:
+                token = _WRITE_CALL.set(True)
+                try:
+                    result = inner(*args, **kwargs)
+                    if inspect.isawaitable(result):
+                        result = await result
+                    return result
+                finally:
+                    _WRITE_CALL.reset(token)
+            return wrapped
+
+        tool.fn = wrap(fn)
+        tool.is_async = True
+
+
+def _refuse_if_not_in_use(cache: EnumCache, bucket: str, entry: Any, name: str, kind: str) -> None:
+    if not _WRITE_CALL.get() or getattr(entry, "in_use", None) is not False:
+        return
+    rows = cache.snapshot().get(bucket, [])
+    active = [str(r["name"]) for r in rows
+              if isinstance(r, dict) and r.get("in_use") is not False and r.get("name")]
+    raise RuntimeError(
+        f"{kind} {name!r} is not in use on this tenant (switched off in CDESK, so "
+        f"its form does not offer it); in use: {', '.join(active) or '(none)'}."
+    )
+
+
 async def resolve_enum_or_raise(
     cache: EnumCache,
     bucket: str,
@@ -108,6 +182,20 @@ async def resolve_enum_or_raise(
     id) so the lookup is scoped to that parent — see EnumCache.resolve."""
     if not name:
         return None
+    if _WRITE_CALL.get():
+        # A write needs the entry, not just the id, to see its in_use flag.
+        try:
+            entry = await cache.resolve_entry(bucket, name, parent_id=parent_id)
+        except AmbiguousEnumNameError as e:
+            raise RuntimeError(
+                f"Ambiguous {kind} {name!r}: it exists under more than one parent. "
+                f"Specify the parent (e.g. its 1st-level name) so it resolves "
+                f"unambiguously."
+            ) from e
+        if entry is not None:
+            _refuse_if_not_in_use(cache, bucket, entry, name, kind)
+            return int(entry.id)
+        _raise_unknown_enum(cache, bucket, name, kind)
     try:
         resolved = await cache.resolve(bucket, name, parent_id=parent_id)
     except AmbiguousEnumNameError as e:
@@ -148,6 +236,7 @@ async def resolve_enum_field_or_raise(
             f"unambiguously."
         ) from e
     if entry is not None:
+        _refuse_if_not_in_use(cache, bucket, entry, name, kind)
         # getattr is untyped; both fields this is called with (action_code,
         # parent_id) are int | None on EnumEntry, so pin it to the declared type.
         value: int | None = getattr(entry, field)
@@ -219,6 +308,124 @@ def canon_name(value: str) -> str:
     cache-less modules (approvals, knowledge base) for local name matching."""
     decomposed = unicodedata.normalize("NFKD", value.casefold().strip())
     return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+@dataclass(frozen=True)
+class EnumLabel:
+    """One enum-valued record field and how to read its label.
+
+    `by` says which part of the enum entry the record stores: the enum `id`,
+    its `action_code` (Request status/priority — NOT the id), or the `key` of a
+    key/value bucket (the request type "druh", e.g. "H"). `name_key` is the key
+    the label is written to, matching the tool parameter that takes the name."""
+
+    field: str
+    bucket: str
+    name_key: str
+    by: Literal["id", "action_code", "key"] = "id"
+
+
+async def add_enum_names(
+    cache: EnumCache, records: Iterable[Any], labels: tuple[EnumLabel, ...]
+) -> None:
+    """Write each enum field's label next to its raw value, in place.
+
+    CDESK returns enum fields as bare numbers, and for requests `priority: 2`
+    is an ACTION CODE whose label may be "dlhodobá" while another entry is
+    literally named "2 - vysoká" — read as a name, the number is the wrong
+    answer (UAT 2026-10-09). The raw value is kept untouched (write-warning
+    diffs and update paths read it); `<field>_name` is inserted right after it.
+
+    Additive and best-effort: an existing key is never overwritten (CDESK's own
+    `fieldset=all` already sends e.g. `cat_type_name`), a value with no label
+    (empty, inactive, bucket switched off) gets no key, and an enum fetch
+    failure leaves the records exactly as CDESK sent them."""
+    targets = [r for r in records if isinstance(r, dict)]
+    if not targets or not any(lbl.field in r for r in targets for lbl in labels):
+        return
+    try:
+        await cache.load()
+    except Exception:  # noqa: BLE001 — labels are a convenience, never a failure
+        return
+    maps: dict[tuple[str, str], dict[Any, str]] = {}
+    for lbl in labels:
+        if (lbl.bucket, lbl.by) in maps:
+            continue
+        if lbl.by == "action_code":
+            maps[lbl.bucket, lbl.by] = cache.action_code_name_map(lbl.bucket)
+        elif lbl.by == "key":
+            maps[lbl.bucket, lbl.by] = cache.key_name_map(lbl.bucket)
+        else:
+            maps[lbl.bucket, lbl.by] = cache.id_name_map(lbl.bucket)
+    apply_enum_names(targets, labels, maps)
+
+
+def enum_rows_name_map(rows: Any, by: str) -> dict[Any, str]:
+    """value → display name over raw enum rows, for modules that fetch their
+    enums themselves instead of through an EnumCache. Rows are the tenant's
+    live payload ({id, action_code, name, …} or {key, value}); nothing here is
+    a fixed label. First match wins, like EnumCache.action_code_name_map.
+
+    `lang_name` wins over `name` when present: the v1 work-order settings rows
+    keep the base English text in `name` ("New") and the tenant's display name
+    in `lang_name` ("Nový", what the CDESK UI and the v3 enums show — cmpp
+    2026-10-09); in v3 rows the two are equal."""
+    out: dict[Any, str] = {}
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        value = row.get(by)
+        if by == "key":
+            name = row.get("value")
+        else:
+            lang_name = row.get("lang_name")
+            name = lang_name if isinstance(lang_name, str) and lang_name else row.get("name")
+        if isinstance(value, str) and value.isdigit() and by != "key":
+            value = int(value)
+        if value is not None and not isinstance(value, bool) and isinstance(name, str) and name:
+            out.setdefault(value, name)
+    return out
+
+
+def apply_enum_names(
+    records: Iterable[Any],
+    labels: tuple[EnumLabel, ...],
+    maps: Mapping[tuple[str, str], Mapping[Any, str]],
+) -> None:
+    """Insert `<field>_name` after each enum field, from ready-made name maps
+    keyed by (bucket, by). Same rules as add_enum_names: additive, never
+    overwrites, no key when there is no label. A label whose map is missing
+    is skipped."""
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        additions: dict[str, tuple[str, str]] = {}  # field -> (name_key, label)
+        for lbl in labels:
+            if lbl.field not in rec or lbl.name_key in rec:
+                continue
+            if any(key == lbl.name_key for key, _ in additions.values()):
+                continue  # an alias field (req_status vs status) already labelled it
+            value = rec[lbl.field]
+            if isinstance(value, str) and value.isdigit() and lbl.by != "key":
+                value = int(value)
+            if value is None or isinstance(value, (bool, dict, list)):
+                continue
+            label = maps.get((lbl.bucket, lbl.by), {}).get(value)
+            if label:
+                additions[lbl.field] = (lbl.name_key, label)
+        if not additions:
+            continue
+        # Rebuild so each label sits right after its raw field.
+        rebuilt: dict[str, Any] = {}
+        for key, val in rec.items():
+            rebuilt[key] = val
+            if key in additions:
+                name_key, label = additions[key]
+                rebuilt[name_key] = label
+        rec.clear()
+        rec.update(rebuilt)
 
 
 def unwrap_record(envelope: Any) -> Any:
@@ -318,8 +525,8 @@ _SECRET_KEY_EXACT = (
 )
 
 # A leading flag verb means the key is a SETTING about a credential, not the
-# credential: `sendPassword` is real — create_user maps send_password_email to
-# it — and is a boolean, as are has_password / use_password / is_secret.
+# credential: `sendPassword` (the v3 spec's name for the e-mail-a-password
+# flag) is a boolean, as are has_password / use_password / is_secret.
 _FLAG_LEADING_SEGMENTS = frozenset({
     "has", "use", "is", "enable", "enabled", "disable", "allow", "force",
     "show", "can", "send", "require", "required", "reset", "change", "verify",
@@ -478,7 +685,10 @@ def annotate_write_warnings(
     if isinstance(saved, dict):
         for field in check_fields:
             sent = sent_body.get(field)
-            if sent and str(saved.get(field) or "") != str(sent):
+            # write_values_match, not a string compare: CDESK echoes a datetime
+            # in UTC (09:30+01:00 → 08:30+00:00), a bool as "1.00", an id as a
+            # string — the same value, not a dropped one.
+            if sent and not write_values_match(sent, saved.get(field)):
                 reason = notes.get(field) or (
                     f"most likely because this account lacks the {field}-field "
                     f"write right"
@@ -511,6 +721,82 @@ def annotate_write_warnings(
     if warnings:
         response = {**response, "warnings": warnings}
     return response
+
+
+def notify_block_value(given: int | None) -> int | None:
+    """The `notify_block` a write sends (UAT B8): only what the call passed.
+    CDESK notifies by default; a call passes notify_block=1 when the user does
+    not want a notification for that write."""
+    return given
+
+
+_NOTIFY_FLAGS = frozenset({"notify_block", "notify_customer_block", "notify_sms_block"})
+
+
+def without_notify_flags(body: dict[str, Any]) -> dict[str, Any]:
+    """The write body minus the notification flags — what an update actually
+    changes. An update that carries only notify_block changes nothing and is
+    refused as empty."""
+    return {k: v for k, v in body.items() if k not in _NOTIFY_FLAGS}
+
+
+def request_status_group(action_code: Any) -> str | None:
+    """CDESK's group of a request status action code (Model/Request.php:
+    GROUP_SOLVED_STATUSES / GROUP_CLOSED_STATUSES, open = below 80) — fixed
+    system codes, the same on every tenant. None for a code in no group."""
+    if isinstance(action_code, bool) or not isinstance(action_code, int):
+        return None
+    if action_code < 80:
+        return "open"
+    if action_code in (80, 81, 85, 86):
+        return "completed"
+    if action_code in (90, 91, 95):
+        return "closed"
+    return None
+
+
+def task_status_group(action_code: Any) -> str | None:
+    """CDESK's group of a task status action code (Model/Task.php: open below
+    80, closed from 80)."""
+    if isinstance(action_code, bool) or not isinstance(action_code, int):
+        return None
+    return "open" if action_code < 80 else "closed"
+
+
+def with_status_groups(rows: Any, group_of: Callable[[Any], str | None]) -> Any:
+    """Copies of the status enum rows with `status_group` beside the action
+    code (the cached rows are not touched)."""
+    if not isinstance(rows, list):
+        return rows
+    out: list[Any] = []
+    for row in rows:
+        if isinstance(row, dict):
+            row = {**row, "status_group": group_of(row.get("action_code"))}
+        out.append(row)
+    return out
+
+
+def list_meta(
+    meta: dict[str, Any], paging: dict[str, Any], *, dropped: Any = None,
+) -> dict[str, Any]:
+    """A list result's `meta`: what the body carried, plus `total` (records
+    matching the filter, across all pages) and `last_page` from the v3 paging
+    headers (CdeskClient.get_page). When the tool stripped filter clauses CDESK
+    cannot apply (`dropped`), CDESK counted WITHOUT them, so the total would
+    describe a different set — it is left out and `total_omitted` says why."""
+    out = dict(meta)
+    if paging.get("last_page") is not None:
+        out["last_page"] = paging["last_page"]
+    total = paging.get("total")
+    if total is not None:
+        if dropped:
+            out["total_omitted"] = (
+                "CDESK counted the records without the criteria listed under "
+                "unsupported_filters, so its total does not describe this result"
+            )
+        else:
+            out["total"] = total
+    return out
 
 
 def unwrap_list(envelope: Any) -> tuple[list[Any], dict[str, Any]]:
@@ -668,6 +954,175 @@ def forbid_unknown_arguments(mcp: FastMCP, tool_names: tuple[str, ...]) -> None:
         model.model_rebuild(force=True)
 
 
+FIELDS_NOT_RETURNED_NOTE = (
+    "CDESK returned none of these requested fields on any record here — CDESK "
+    "drops a field name it does not know without a word (a field it knows comes "
+    "back even when empty). Usually a misspelled or wrong name: fieldset='all' "
+    "on one record shows the real names."
+)
+
+
+def fields_not_returned(fields: Any, records: Any) -> list[str]:
+    """The requested `fields` that appear on none of the returned records — the
+    names CDESK silently dropped (UAT B10). Live on cmpp 2026-10-12: a known
+    field comes back even when null (`due_date: None`), an unknown one
+    (`bogus_field`, `req_due_date`, users' `id_company`) is simply absent.
+    Empty when there is nothing to compare (no fields, no records)."""
+    if not isinstance(fields, list) or not fields:
+        return []
+    rows = [r for r in (records if isinstance(records, list) else [records]) if isinstance(r, dict)]
+    if not rows:
+        return []
+    seen: set[str] = set()
+    for row in rows:
+        seen.update(row)
+    return [f for f in fields if isinstance(f, str) and f not in seen]
+
+
+def _with_fields_check(result: Any, fields: Any) -> Any:
+    if not isinstance(result, dict):
+        return result
+    items = result.get("items")
+    records = items if isinstance(items, list) else result
+    missing = fields_not_returned(fields, records)
+    if missing:
+        result["fields_not_returned"] = {"fields": missing, "note": FIELDS_NOT_RETURNED_NOTE}
+    return result
+
+
+# --- what the LLM receives: compact enum rows and list items ------------------
+# Measured live on cmpp 2026-10-12 (UAT low-priority item 4): get_fill_enums
+# answered 46k chars (~11.6k tokens), a request status row alone ~875 chars —
+# icon and colour styles, admin/sort/timestamp columns, internal settings flags
+# and the name in 8 languages; list_requests spent half its fields on empty
+# values (17 of 34), a CI 86 of 108. Only the model's context pays for this.
+
+_ENUM_ROW_NOISE = frozenset({
+    "custom_icon_class", "predefined_icon_color_class", "custom_icon_color_style",
+    "custom_icon_background_style", "edit", "delete", "sort", "order",
+    "enum_name_id", "admin_id", "updated_at", "created_at", "deleted_at",
+    "lang_id", "lang_iso_code", "lang_name", "settings",
+})
+_ENUM_ROW_DROP_IF_EMPTY = frozenset({"short_name", "description", "char_code"})
+_LANG_COLUMN = re.compile(r"^lang_[a-z]{2,3}$")
+
+
+def _is_enum_row(value: dict[str, Any]) -> bool:
+    return "id" in value and "name" in value and any(k in _ENUM_ROW_NOISE for k in value)
+
+
+def compact_enum_rows(value: Any) -> Any:
+    """Strip CDESK's per-row noise from every enum row in an enums payload,
+    recursively: keep id, name, action_code, parent_id, in_use (as a bool) and
+    anything the connector added; drop styles, bookkeeping columns, the
+    internal `settings` flags and the per-language names (the tools resolve a
+    name in any language themselves). Other dicts and lists pass through."""
+    if isinstance(value, list):
+        return [compact_enum_rows(v) for v in value]
+    if not isinstance(value, dict):
+        return value
+    if not _is_enum_row(value):
+        return {k: compact_enum_rows(v) for k, v in value.items()}
+    out: dict[str, Any] = {}
+    for key, inner in value.items():
+        if key in _ENUM_ROW_NOISE or _LANG_COLUMN.match(key):
+            continue
+        if key in _ENUM_ROW_DROP_IF_EMPTY and inner in (None, ""):
+            continue
+        if key == "in_use" and isinstance(inner, (int, str)) and not isinstance(inner, bool):
+            try:
+                inner = int(inner) > 0
+            except ValueError:
+                pass
+        out[key] = inner
+    return out
+
+
+def drop_empty_fields(item: Any) -> Any:
+    """A list item without its empty fields (None, "", [], {}); 0 and False
+    are values and stay."""
+    if not isinstance(item, dict):
+        return item
+    return {k: v for k, v in item.items() if not (v is None or v == "" or v == [] or v == {})}
+
+
+def _wrap_result(mcp: FastMCP, select: Callable[[Any], bool], transform: Callable[[Any], Any]) -> None:
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is None:
+        return
+    for tool in manager.list_tools():
+        if not select(tool) or getattr(tool, "fn", None) is None:
+            continue
+
+        def wrap(inner: Callable[..., Any]) -> Callable[..., Any]:
+            @functools.wraps(inner)
+            async def wrapped(*args: Any, **kwargs: Any) -> Any:
+                result = inner(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
+                return transform(result)
+            return wrapped
+
+        tool.fn = wrap(tool.fn)
+        tool.is_async = True
+
+
+def _compact_list_result(result: Any) -> Any:
+    if isinstance(result, dict) and isinstance(result.get("items"), list):
+        result["items"] = [drop_empty_fields(i) for i in result["items"]]
+    return result
+
+
+def _compact_write_result(result: Any) -> Any:
+    # A write answers with the saved record; its empty fields say nothing about
+    # the write (an older backend sent ~200 of them per request — UAT L2).
+    if isinstance(result, dict) and isinstance(result.get("savedData"), dict):
+        result["savedData"] = drop_empty_fields(result["savedData"])
+    return result
+
+
+def _is_write_tool(tool: Any) -> bool:
+    annotations = getattr(tool, "annotations", None)
+    return not (annotations is not None and annotations.readOnlyHint is True)
+
+
+def compact_llm_payloads(mcp: FastMCP) -> None:
+    """Trim what the LLM receives (applied once in build_server, AFTER
+    annotate_unreturned_fields, so that check still sees CDESK's own keys):
+    get_*_enums results lose the enum-row noise, list_* items and the
+    savedData of write answers their empty fields."""
+    _wrap_result(mcp, lambda t: t.name.startswith("get_") and t.name.endswith("_enums"),
+                 compact_enum_rows)
+    _wrap_result(mcp, lambda t: t.name.startswith("list_"), _compact_list_result)
+    _wrap_result(mcp, _is_write_tool, _compact_write_result)
+
+
+def annotate_unreturned_fields(mcp: FastMCP) -> None:
+    """Wrap every registered tool that takes a `fields` whitelist so its result
+    names the requested fields CDESK silently dropped (`fields_not_returned`).
+    Applied once, after all modules registered (server.build_server); a no-op on
+    the test FakeMCP, which has no tool manager."""
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is None:
+        return
+    for tool in manager.list_tools():
+        fn = getattr(tool, "fn", None)
+        if fn is None or "fields" not in inspect.signature(fn).parameters:
+            continue
+
+        def wrap(inner: Callable[..., Any]) -> Callable[..., Any]:
+            @functools.wraps(inner)
+            async def wrapped(*args: Any, **kwargs: Any) -> Any:
+                result = inner(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
+                return _with_fields_check(result, kwargs.get("fields"))
+            return wrapped
+
+        tool.fn = wrap(fn)
+        tool.is_async = True
+
+
 def normalize_write_value(value: Any) -> Any:
     """Collapse a value to something comparable across the write/read boundary.
 
@@ -695,7 +1150,13 @@ def normalize_write_value(value: Any) -> Any:
             parsed = datetime.fromisoformat(text)
         except ValueError:
             return text
-        return parsed.date().isoformat() if len(text) <= 10 else parsed.isoformat()
+        if len(text) <= 10:
+            return parsed.date().isoformat()
+        # The same instant in another offset is the same value: CDESK echoes a
+        # datetime sent as 09:30+01:00 back as 08:30+00:00 (live 2026-10-12).
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc)
+        return parsed.isoformat()
     return value
 
 
@@ -709,7 +1170,64 @@ def write_values_match(sent: Any, stored: Any) -> bool:
     a, b = normalize_write_value(sent), normalize_write_value(stored)
     if a == b:
         return True
-    # A sent date without a time part matches a stored timestamp on the same day.
-    if isinstance(a, str) and isinstance(b, str) and len(a) == 10:
-        return b.startswith(a)
+    # A sent date without a time part matches a stored timestamp on the same day
+    # — that day as CDESK wrote it (its own offset), not the UTC instant.
+    if isinstance(a, str) and isinstance(b, str) and len(a) == 10 and isinstance(stored, str):
+        return stored.strip()[:10] == a
     return False
+
+
+def apply_clear_fields(
+    body: dict[str, Any],
+    clear_fields: Iterable[str] | None,
+    allowed: Mapping[str, str],
+) -> None:
+    """Send an explicit `null` for each field named in `clear_fields`, which is
+    how a v3 PUT clears a nullable field (an omitted field keeps its value).
+
+    `allowed` maps the tool's parameter name to the wire name, and only covers
+    fields the spec documents as clearable. Runs AFTER the body builders,
+    which drop None values. Raises ValueError for a name that cannot be
+    cleared, and for one the same call also sets. Mutates `body` in place."""
+    for name in clear_fields or ():
+        wire = allowed.get(name)
+        if wire is None:
+            raise ValueError(
+                f"clear_fields: {name!r} cannot be cleared; clearable fields: "
+                f"{', '.join(sorted(allowed))}"
+            )
+        if body.get(wire) is not None:
+            raise ValueError(
+                f"clear_fields: {name!r} is also being set in this call — "
+                f"set it or clear it, not both"
+            )
+        body[wire] = None
+
+
+_LANG_NAME_KEY = re.compile(r"^lang_(name|[a-z]{2,3})$")
+
+
+def match_status_name(rows: Any, canon: str) -> int | None:
+    """The `action_code` of the enum row whose `name` or any `lang_*` variant
+    equals `canon` (already passed through canon_name). For tenant status enums
+    read from the API (project and work-order statuses)."""
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        code = row.get("action_code")
+        if isinstance(code, bool) or not isinstance(code, int):
+            continue
+        for key, value in row.items():
+            if (key == "name" or _LANG_NAME_KEY.match(key)) and isinstance(value, str) \
+                    and canon_name(value) == canon:
+                return code
+    return None
+
+
+def status_choices(rows: Any) -> str:
+    """"code=name, ..." for an error message, from the tenant's status rows."""
+    return ", ".join(
+        f"{row.get('action_code')}={row.get('name')}"
+        for row in (rows if isinstance(rows, list) else [])
+        if isinstance(row, dict) and row.get("name")
+    )

@@ -8,7 +8,7 @@ case-insensitive (casefold). Both display name and every `lang_<locale>`
 variant participate, so the same status is reachable across languages.
 
 Lifetime — nothing is cached across tool calls. Enums change on the tenant at
-any time (a status renamed, a category added, a module switched on), so every
+any time (a status renamed, a category added, approvals switched on), so every
 tool call reads them from the API afresh:
 - The first lookup in a call fetches the endpoint; later lookups in the SAME
   call reuse that response (a create resolving status, priority and type makes
@@ -26,6 +26,7 @@ import contextvars
 import logging
 import re
 import unicodedata
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any, Protocol
@@ -37,6 +38,16 @@ _FUZZY_MIN_RATIO = 0.3
 # lang_<2-3 letter locale code> — accepts lang_en, lang_sk, lang_cs etc.
 # Rejects lang_id, lang_iso_code, lang_name, lang_updated_at, lang_description.
 _LANG_KEY_PATTERN = re.compile(r"^lang_[a-z]{2,3}$")
+
+
+# Top-level response keys kept as-is by EnumCache.extra(): the request-catalog
+# enums add `approval_rule_options` ({approval_rule_id, approval_rules,
+# simple_approval_rules} → [{id, name, category_id}]) when catalog approvals are
+# on for the tenant and the caller may read approval rules.
+# `config` is the request module's whole tenant-settings object, sent beside the
+# buckets by v3/request/enums; it decides which create fields the tenant
+# requires (use_solver_group, auto_name_enabled, code.status, …).
+_EXTRA_KEYS = ("approval_rule_options", "config")
 
 
 class _ClientProto(Protocol):
@@ -54,6 +65,10 @@ class EnumEntry:
     parent_id: int | None = None
     action_code: int | None = None
     lang_names: tuple[str, ...] = field(default_factory=tuple)
+    # CDESK's `in_use` flag (UAT B13): False = switched off on this tenant — the
+    # CDESK form no longer offers it, but old records may still carry it.
+    # None when the bucket does not report it.
+    in_use: bool | None = None
 
     def all_names(self) -> tuple[str, ...]:
         # Deduplicate while preserving order.
@@ -97,9 +112,11 @@ class _Loaded:
     # switched-off module is detectable on the endpoints CDESK does NOT gate
     # (deal create/delete return 200 with the module off).
     settings: dict[str, Any]
+    # Top-level keys some endpoints send beside the buckets, kept verbatim.
+    extras: dict[str, Any]
 
 
-_EMPTY = _Loaded(buckets={}, raw_buckets={}, settings={})
+_EMPTY = _Loaded(buckets={}, raw_buckets={}, settings={}, extras={})
 
 # The enums fetched during the current tool call, keyed by EnumCache instance.
 # Unset (None) until the first lookup of a call; see the module docstring.
@@ -155,6 +172,10 @@ class EnumCache:
         """The endpoint's `settings` object ({} when it sends none)."""
         return self._state().settings
 
+    def extra(self, key: str) -> Any:
+        """A top-level response key the buckets do not cover, or None."""
+        return self._state().extras.get(key)
+
     @property
     def loaded(self) -> bool:
         """Whether the enums were already fetched in the current tool call."""
@@ -181,12 +202,18 @@ class EnumCache:
 
     async def _fetch(self) -> _Loaded:
         response = await self._client.get(self._endpoint)
+        normalize = _RESPONSE_NORMALIZERS.get(self._endpoint)
+        if normalize is not None:
+            response = normalize(response)
         buckets = _parse_response(response, self._endpoint)
         settings = response.get("settings") if isinstance(response, dict) else None
         loaded = _Loaded(
             buckets=buckets,
             raw_buckets=_extract_keyvalue_buckets(response),
             settings=settings if isinstance(settings, dict) else {},
+            extras={
+                k: v for k, v in response.items() if k in _EXTRA_KEYS
+            } if isinstance(response, dict) else {},
         )
         log.info(
             "EnumCache[%s] fetched: %s",
@@ -297,6 +324,16 @@ class EnumCache:
                 out.setdefault(entry.action_code, entry.name)
         return out
 
+    def key_name_map(self, bucket: str) -> dict[Any, str]:
+        """key → label for ONE key/value-shaped bucket (e.g. the request `type`
+        "druh": "H" → "Helpdesk"), which the int-id maps above can't hold."""
+        out: dict[Any, str] = {}
+        for row in self._raw_buckets.get(bucket, []):
+            key, value = row.get("key"), row.get("value")
+            if key is not None and isinstance(value, str):
+                out.setdefault(key, value)
+        return out
+
     def find_candidates(
         self,
         bucket: str,
@@ -370,6 +407,8 @@ class EnumCache:
                     record["action_code"] = entry.action_code
                 if entry.lang_names:
                     record["lang_names"] = list(entry.lang_names)
+                if entry.in_use is not None:
+                    record["in_use"] = entry.in_use
                 out[bucket].append(record)
         # Surface key/value buckets (e.g. request `type`) that the int-id model
         # can't hold — the LLM needs these codes (e.g. the create_request type
@@ -434,10 +473,92 @@ def _extract_keyvalue_buckets(response: object) -> dict[str, list[dict[str, Any]
                 continue
             if isinstance(r.get("id"), int) and not isinstance(r.get("id"), bool):
                 continue  # real int-id entry — handled by the typed path
-            kv.append({"key": r.get("key"), "value": r.get("value")})
+            # Some buckets label their keys under `title` instead (the catalog
+            # `prioritize` and `description_edit`), which read as all-null.
+            value = r.get("value")
+            if value is None:
+                value = r.get("title")
+            kv.append({"key": r.get("key"), "value": value})
         if kv:
             out[bucket_name] = kv
     return out
+
+
+def _restricts_as_keyvalue(rows: Any) -> list[dict[str, Any]]:
+    """`restricts` rows carry a STRING id ("" / "limited") that the int-id model
+    rejects; they are the restriction modes, so surface them as key/value."""
+    if not isinstance(rows, list):
+        return []
+    return [
+        {"key": r.get("id"), "value": r.get("name")}
+        for r in rows if isinstance(r, dict)
+    ]
+
+
+def _flatten_catalog_enums(response: Any) -> Any:
+    """The request-catalog enums endpoint nests several buckets one or two levels
+    down, where the list-only parser skipped them — so `cat_types` (the request
+    type a catalog tile belongs to) and `cat_areas` never reached the cache.
+    Rewrites them as ordinary list buckets (shapes as served 2026-09-25):
+
+      cat_status  {enums, restricts}                  → cat_status, cat_status_restricts
+      flow_status {initial_enums, targets_enums}      → flow_status_initial, flow_status_targets
+      cat_types   {status, enums, restricts}          → cat_types, cat_types_restricts
+      cat_areas   {enumCatAreas: {enumList: {enums}},
+                   enumCatAreas2nd: {enumList: {enums}}} → cat_areas, cat_areas_2nd
+      updates     {"1": {name, is_*...}, ...}         → updates [{id, name}]
+
+    Scoped to this one endpoint: request, fill and deal enums also carry dict
+    buckets, and their shapes are not the same."""
+    if not isinstance(response, dict) or not isinstance(response.get("enums"), dict):
+        return response
+    enums: dict[str, Any] = dict(response["enums"])
+
+    def nested(bucket: str, *path: str) -> Any:
+        node: Any = enums.get(bucket)
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        return node
+
+    flat: dict[str, Any] = {}
+    for bucket in ("cat_status", "cat_types"):
+        if isinstance(enums.get(bucket), dict):
+            flat[bucket] = nested(bucket, "enums") or []
+            flat[f"{bucket}_restricts"] = _restricts_as_keyvalue(
+                nested(bucket, "restricts")
+            )
+    if isinstance(enums.get("flow_status"), dict):
+        flat["flow_status_initial"] = nested("flow_status", "initial_enums") or []
+        flat["flow_status_targets"] = nested("flow_status", "targets_enums") or []
+        enums.pop("flow_status")
+    if isinstance(enums.get("cat_areas"), dict):
+        # CatArea::getEnumList puts BOTH levels in enumCatAreas.enumList.enums;
+        # a 2nd-level area has a parent (parent_id != 0 — Model/Fill.php
+        # 4325-4330 splits them the same way). enumCatAreas2nd carries only
+        # its status, so reading the areas there always gave an empty list.
+        areas = nested("cat_areas", "enumCatAreas", "enumList", "enums") or []
+        if isinstance(areas, dict):
+            areas = list(areas.values())
+        rows = [a for a in areas if isinstance(a, dict)] if isinstance(areas, list) else []
+        flat["cat_areas"] = [a for a in rows if not a.get("parent_id")]
+        flat["cat_areas_2nd"] = [a for a in rows if a.get("parent_id")]
+    updates = enums.get("updates")
+    if isinstance(updates, dict):
+        flat["updates"] = [
+            {"id": key, "name": row.get("name")}
+            for key, row in updates.items()
+            if isinstance(row, dict) and str(key).isdigit()
+        ]
+    tags = response.get("tags")
+    if isinstance(tags, list) and "tags" not in enums:
+        flat["tags"] = tags
+    enums.update(flat)
+    return {**response, "enums": enums}
+
+
+_RESPONSE_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
+    "v3/request-catalog/enums": _flatten_catalog_enums,
+}
 
 
 def _parse_entry(record: dict[str, Any]) -> EnumEntry:
@@ -494,12 +615,24 @@ def _parse_entry(record: dict[str, Any]) -> EnumEntry:
     else:
         action_code_int = None
 
+    raw_in_use = record.get("in_use")
+    in_use: bool | None
+    if isinstance(raw_in_use, bool):
+        in_use = raw_in_use
+    elif isinstance(raw_in_use, int):
+        in_use = raw_in_use > 0
+    elif isinstance(raw_in_use, str) and raw_in_use.strip().lstrip("-").isdigit():
+        in_use = int(raw_in_use) > 0
+    else:
+        in_use = None
+
     return EnumEntry(
         id=id_int,
         name=name_str,
         parent_id=parent_id_int,
         action_code=action_code_int,
         lang_names=tuple(lang_names),
+        in_use=in_use,
     )
 
 

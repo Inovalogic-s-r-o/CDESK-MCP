@@ -26,7 +26,13 @@ from mcp.types import ToolAnnotations
 
 from cdesk_mcp.cdesk_client import CdeskClient
 from cdesk_mcp.filters import build_ci_filter, encode_sb
+from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
+    list_meta,
+    TEXT_MATCH_NOTE,
+    EnumLabel,
+    apply_enum_names,
+    enum_rows_name_map,
     to_llm_error,
     unsupported_filter_directive,
     unwrap_list,
@@ -36,6 +42,18 @@ from cdesk_mcp.tools._helpers import (
 )
 
 _MAX_PER_PAGE = 100
+
+# A CI's `status_id` holds the status enum ID (cmpp CI 143910: 183778 = "na
+# sklade", whose action code is 10). The name comes from the live
+# v3/cmdb/ci/enums rows, read WITH inactive ones so a CI sitting in a status
+# since switched off still gets its name. Type/maingroup/company names are
+# already joined in by CDESK (ci_type_name, maingroup_name, company_name).
+_CI_ENUM_LABELS = (EnumLabel("status_id", "status", "status_name"),)
+
+# Type/maingroup write keys that carry an icon only when `thumb` is true — the
+# v1 handler clears icon/icon_color when it is false, so passing an icon without
+# thumb silently does nothing.
+_ICON_KEYS = ("icon", "icon_color")
 
 
 def _unresolvable_maingroup_hint(exc: Exception, maingroup_id: str | None) -> str | None:
@@ -74,7 +92,7 @@ def register_cmdb_tools(
     """Register all CMDB-module tools on the given FastMCP instance."""
 
     @mcp.tool(
-        description=_LIST_CIS_DESC,
+        description=_LIST_CIS_DESC + "\n\n" + sort_note("configuration_items") + "\n\n" + TEXT_MATCH_NOTE,
         annotations=ToolAnnotations(title="List configuration items", readOnlyHint=True),
     )
     async def list_configuration_items(
@@ -126,20 +144,12 @@ def register_cmdb_tools(
             if include_deleted:
                 params["withTrashed"] = "1"
             if sort:
-                # A BARE column name is the only shape that works here, and it
-                # sorts ascending. The v1 handler actually reads sort as an array
-                # of [column, direction] pairs (apiportal CIController.php:1095),
-                # but sending that shape (sort[0][0]=name) returns HTTP 500 — so
-                # a plain string it is, and direction is not selectable. The
-                # column is checked against CI::getOrderColsAllowed
-                # (Model/CMDB/CI.php:4923); anything outside it emits NO order by
-                # at all (BaseModel.php:791-806), i.e. an arbitrary order rather
-                # than an error. Live-verified 2026-07-30 — do not restore the
-                # old "sort has no observable effect" claim without a retest.
-                params["sort"] = sort
+                # column / column.desc, checked against the CI sort allow-list
+                # (sort_columns.py; live-verified 2026-10-12, both directions).
+                params["sort"] = resolve_sort("configuration_items", sort)
             if sb is not None:
                 params["sb"] = encode_sb(sb)
-            response = await client.get("v3/cmdb/ci", params=params)
+            response, paging = await client.get_page("v3/cmdb/ci", params=params)
         except ValueError as e:
             raise RuntimeError(f"list_configuration_items input error: {e}") from e
         except Exception as e:
@@ -149,7 +159,8 @@ def register_cmdb_tools(
             raise to_llm_error(e, operation="list_configuration_items") from e
 
         records, meta = unwrap_list(response)
-        result = {"items": records, "meta": meta, "page": page, "per_page": per_page}
+        await _label_cis(client, records)
+        result = {"items": records, "meta": list_meta(meta, paging, dropped=dropped_clauses), "page": page, "per_page": per_page}
         if dropped_clauses:
             result["unsupported_filters"] = unsupported_filter_directive(dropped_clauses)
         return result
@@ -172,7 +183,9 @@ def register_cmdb_tools(
             raise to_llm_error(
                 e, operation="get_configuration_item", record_id=id,
             ) from e
-        return unwrap_record(response)
+        record = unwrap_record(response)
+        await _label_cis(client, [record])
+        return record
 
     @mcp.tool(
         description=_GET_CI_ENUMS_DESC,
@@ -282,13 +295,13 @@ def register_cmdb_tools(
             params: dict[str, Any] = {"pg": page, "pp": per_page}
             if fields:
                 params["returnFields[]"] = fields
-            response = await client.get("v3/cmdb/maingroups", params=params)
+            response, paging = await client.get_page("v3/cmdb/maingroups", params=params)
         except ValueError as e:
             raise RuntimeError(f"list_cmdb_maingroups input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="list_cmdb_maingroups") from e
         records, meta = unwrap_list(response)
-        return {"items": records, "meta": meta, "page": page, "per_page": per_page}
+        return {"items": records, "meta": list_meta(meta, paging, dropped=None), "page": page, "per_page": per_page}
 
     @mcp.tool(
         description=_LIST_TYPES_DESC,
@@ -316,13 +329,13 @@ def register_cmdb_tools(
                 params["categoryId"] = category_id
             if maingroup_id is not None:
                 params["maingroupId"] = maingroup_id
-            response = await client.get("v3/cmdb/types", params=params)
+            response, paging = await client.get_page("v3/cmdb/types", params=params)
         except ValueError as e:
             raise RuntimeError(f"list_cmdb_types input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="list_cmdb_types") from e
         records, meta = unwrap_list(response)
-        return {"items": records, "meta": meta, "page": page, "per_page": per_page}
+        return {"items": records, "meta": list_meta(meta, paging, dropped=None), "page": page, "per_page": per_page}
 
     @mcp.tool(
         description=_GET_TYPE_PROPERTIES_DESC,
@@ -348,6 +361,22 @@ def register_cmdb_tools(
             unwrap_record(response),
             kind=f"dynamic property definitions on CMDB type {type_id}",
         )
+
+
+
+async def _label_cis(client: CdeskClient, records: list[Any]) -> None:
+    """Add status_name next to status_id from the live CI status rows
+    (inactive included); best-effort."""
+    targets = [r for r in records if isinstance(r, dict) and "status_id" in r]
+    if not targets:
+        return
+    try:
+        rows = unwrap_record(await client.get("v3/cmdb/ci/enums", params={"all": "1"}))
+    except Exception:  # noqa: BLE001 — labels never fail the tool
+        return
+    apply_enum_names(targets, _CI_ENUM_LABELS, {
+        ("status", "id"): enum_rows_name_map(rows, "id"),
+    })
 
 
 # --- Tool descriptions --------------------------------------------------
@@ -390,28 +419,7 @@ _LIST_CIS_DESC = inspect.cleandoc(
 
       - fields: exact whitelist of top-level field names to keep per CI
         record (returnFields; unknown names silently ignored).
-      - sort: ONE column name, ascending, e.g. sort="name". Default order
-        without it is newest-updated first.
-        Accepted columns, per the backend's own sort allowlist (name and
-        status_id live-verified 2026-07-30, the rest read from it): id,
-        name, description, status_id, created_at, updated_at,
-        creator_name, updated_by_name, and the joined-name columns
-        company_name, ci_type_name, maingroup_name, owner_name,
-        place_name, branch_name (plus the asset-management columns
-        purchase_date, assignment_date, inventory_number, cost, supplier).
-        Three limits, all live-verified 2026-07-30:
-          * ASCENDING ONLY. There is no descending form — "-name" is not
-            "name desc", it is an unrecognized column (see below). To get
-            a descending order, page the set and reverse it yourself.
-          * An unrecognized column is SILENTLY IGNORED and the rows come
-            back in NO defined order — not the default one. So the raw FK
-            columns company_id, type_id and owner_id do nothing here
-            (sort by company_name / ci_type_name / owner_name instead),
-            and a typo yields an arbitrary order that looks sorted. If the
-            order matters for correctness, verify it in the items rather
-            than trusting the parameter.
-          * Pass ONE bare column name. Do not send an indexed/array form
-            (sort[0][0]=...): the endpoint answers HTTP 500 to it.
+      - sort: see the sort paragraph below.
 
     Returns paginated items + meta.
     """

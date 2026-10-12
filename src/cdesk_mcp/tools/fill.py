@@ -30,9 +30,20 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from cdesk_mcp import base_config
 from cdesk_mcp.cdesk_client import CdeskClient
+from cdesk_mcp.field_policy import (
+    FILL_FIELDS,
+    describe,
+    fill_settings,
+    refuse_if_violated,
+    violations,
+)
 from cdesk_mcp.filters import build_fill_filter, encode_sb
+from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
+    list_meta,
+    TEXT_MATCH_NOTE,
     apply_field_scope,
     to_llm_error,
     unsupported_filter_directive,
@@ -47,16 +58,19 @@ from cdesk_mcp.tz import localize_naive_datetime, tenant_timezone
 # response sizes within an LLM's context budget.
 _MAX_PER_PAGE = 100
 
-# assign_id → the body field that MUST accompany it (7 = days-off needs none).
-# Used for a clear client-side error instead of the backend's opaque 400.
-_ASSIGN_PARENT: dict[int, str | None] = {
+# assign_id → the body field that MUST accompany it. Used for a clear
+# client-side error instead of the backend's opaque 400. Backend constants
+# (Model/Fill.php getEnumAssign). 7 = days-off is NOT a valid fill parent:
+# CDESK refuses it every time with "Vyberte väzbu" (verified live on cmpp
+# 2026-10-12; getEnumAssign(true) leaves ASSIGN_DAYSOFF out) — days-off fills
+# are made by the days-off module, not here.
+_ASSIGN_PARENT: dict[int, str] = {
     1: "company_id",
     2: "deal_id",
     3: "request_id",
     4: "work_order_id",
     5: "task_id",
     6: "project_contract_id",
-    7: None,
 }
 
 
@@ -68,7 +82,7 @@ def register_fill_tools(
     EnumCache — Fill resolves no enum names client-side (see get_fill_enums)."""
 
     @mcp.tool(
-        description=_LIST_FILLS_DESC,
+        description=_LIST_FILLS_DESC + "\n\n" + sort_note("fills") + "\n\n" + TEXT_MATCH_NOTE,
         annotations=ToolAnnotations(title="List fills", readOnlyHint=True),
     )
     async def list_fills(
@@ -123,10 +137,10 @@ def register_fill_tools(
             params: dict[str, Any] = {"pg": page, "pp": per_page}
             apply_field_scope(params, fieldset, fields)
             if sort:
-                params["sort"] = sort
+                params["sort"] = resolve_sort("fills", sort)
             if sb is not None:
                 params["sb"] = encode_sb(sb)
-            response = await client.get("v3/fill", params=params)
+            response, paging = await client.get_page("v3/fill", params=params)
         except RuntimeError:
             raise
         except ValueError as e:
@@ -135,7 +149,10 @@ def register_fill_tools(
             raise to_llm_error(e, operation="list_fills") from e
 
         records, meta = unwrap_list(response)
-        result = {"items": records, "meta": meta, "page": page, "per_page": per_page}
+        warning = await _add_list_minutes(client, records, params)
+        result: dict[str, Any] = {"items": records, "meta": list_meta(meta, paging, dropped=dropped_clauses), "page": page, "per_page": per_page}
+        if warning:
+            result["warnings"] = [warning]
         if dropped_clauses:
             result["unsupported_filters"] = unsupported_filter_directive(dropped_clauses)
         return result
@@ -162,7 +179,9 @@ def register_fill_tools(
             raise RuntimeError(f"get_fill input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="get_fill", record_id=id) from e
-        return unwrap_record(response)
+        record = unwrap_record(response)
+        _add_detail_minutes(record)
+        return record
 
     @mcp.tool(
         description=_GET_FILL_ENUMS_DESC,
@@ -176,9 +195,20 @@ def register_fill_tools(
         # The fill enums endpoint returns {data: false, enums: {...}} — the real
         # payload (maingroups, invoicing statuses/dates, deal & request
         # category types, ...) lives under `enums`, not `data`.
-        if isinstance(response, dict) and "enums" in response:
-            return response["enums"]
-        return unwrap_record(response)
+        result = response["enums"] if isinstance(response, dict) and "enums" in response else unwrap_record(response)
+        if isinstance(result, dict):
+            result = {**result, "fields": {
+                "by_tenant_setting": describe(
+                    FILL_FIELDS, fill_settings(await base_config.load(client))
+                ),
+                "note": (
+                    "State of each configurable create_fill/update_fill parameter "
+                    "on this tenant, from its live fill form settings: off (refused "
+                    "when given), optional, or required (must be given on create, "
+                    "cannot be cleared on update)."
+                ),
+            }}
+        return result
 
     @mcp.tool(
         description=_CREATE_FILL_DESC,
@@ -198,7 +228,6 @@ def register_fill_tools(
         description: str | None = None,
         private_description: str | None = None,
         used_material: str | None = None,
-        duration: int | None = None,
         other_time: int | None = None,
         quantity: float | None = None,
         simple_use: bool | None = None,
@@ -225,6 +254,17 @@ def register_fill_tools(
                 raise ValueError("valid_from and valid_to are required (ISO-8601)")
             valid_from, valid_to = localized_from, localized_to
             _ensure_chronological(valid_from, valid_to)
+            # The worker is always required — by the CDESK form and the API
+            # ("Zadajte riešiteľa", verified live on cmpp 2026-10-12).
+            if solver_id is None:
+                raise ValueError("solver_id (the worker) is required")
+            # The tenant's fill FORM rules, read live from core/base-config (fill
+            # settings are not in v3; v1 fill/settings is admin-only).
+            refuse_if_violated(violations(
+                FILL_FIELDS, fill_settings(await base_config.load(client)),
+                {"description": description, "place_id": place_id,
+                 "place_custom": place_custom, "billing_item_id": billing_item_id},
+            ))
             parents = {
                 "company_id": company_id,
                 "deal_id": deal_id,
@@ -245,7 +285,6 @@ def register_fill_tools(
                     "description": description,
                     "private_description": private_description,
                     "used_material": used_material,
-                    "duration": duration,
                     "other_time": other_time,
                     "quantity": quantity,
                     "simple_use": simple_use,
@@ -270,7 +309,7 @@ def register_fill_tools(
             raise RuntimeError(f"create_fill input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="create_fill") from e
-        return response if isinstance(response, dict) else {"data": response}
+        return _with_write_minutes(response)
 
     @mcp.tool(
         description=_UPDATE_FILL_DESC,
@@ -291,7 +330,6 @@ def register_fill_tools(
         description: str | None = None,
         private_description: str | None = None,
         used_material: str | None = None,
-        duration: int | None = None,
         other_time: int | None = None,
         quantity: float | None = None,
         simple_use: bool | None = None,
@@ -309,6 +347,14 @@ def register_fill_tools(
         rma: int | None = None,
     ) -> dict[str, Any]:
         try:
+            # Same fill form rules: an off field may not be set, a required one
+            # not cleared (left out = unchanged).
+            refuse_if_violated(violations(
+                FILL_FIELDS, fill_settings(await base_config.load(client)),
+                {"description": description, "place_id": place_id,
+                 "place_custom": place_custom, "billing_item_id": billing_item_id},
+                update=True,
+            ))
             valid_from = localize_naive_datetime("valid_from", valid_from)
             valid_to = localize_naive_datetime("valid_to", valid_to)
             if valid_from is not None and valid_to is not None:
@@ -352,7 +398,6 @@ def register_fill_tools(
                     "description": description,
                     "private_description": private_description,
                     "used_material": used_material,
-                    "duration": duration,
                     "other_time": other_time,
                     "quantity": quantity,
                     "simple_use": simple_use,
@@ -378,7 +423,7 @@ def register_fill_tools(
             raise RuntimeError(f"update_fill input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="update_fill", record_id=id) from e
-        return response if isinstance(response, dict) else {"data": response}
+        return _with_write_minutes(response)
 
     @mcp.tool(
         description=_DELETE_FILL_DESC,
@@ -395,15 +440,15 @@ def register_fill_tools(
 # --- internals ----------------------------------------------------------
 
 def _validate_assign(assign_id: int, parents: dict[str, Any]) -> None:
-    """assign_id must be 1..7 and carry its matching parent id (clearer than
+    """assign_id must be 1..6 and carry its matching parent id (clearer than
     the backend's opaque 400)."""
     if assign_id not in _ASSIGN_PARENT:
         raise ValueError(
-            f"assign_id must be one of 1..7 (1=company, 2=deal, 3=request, "
-            f"4=work order, 5=task, 6=project contract, 7=days-off); got {assign_id}"
+            f"assign_id must be one of 1..6 (1=company, 2=deal, 3=request, "
+            f"4=work order, 5=task, 6=project contract); got {assign_id}"
         )
     required = _ASSIGN_PARENT[assign_id]
-    if required is not None and parents.get(required) is None:
+    if parents.get(required) is None:
         raise ValueError(
             f"assign_id={assign_id} requires {required} to identify the parent"
         )
@@ -446,6 +491,102 @@ _FILL_CREATE_FIELDS: dict[str, str] = {
 }
 
 
+# --- worked time -------------------------------------------------------------
+# CDESK sends a fill's time in two shapes under one name (Model/Fill.php
+# transformFill, live-verified on cmpp 2026-10-12):
+#   - the detail / write response `duration`: the STORED worked time in seconds —
+#     valid_to − valid_from plus `other_time` (the correction, seconds), set on
+#     every save (Fill.php 1012-1023); what CDESK bills and sums in reports;
+#   - the list `duration`: TEXT of the from→to span only ("1h"), without the
+#     correction; the stored seconds are `durationSeconds`, sent only with
+#     fieldset=all. `other_time` is text there too ("30min").
+# Every fill result therefore gets `duration_minutes` / `other_time_minutes`
+# (int), the stored worked time and its correction, computed the same way.
+
+_LIST_TIME_FIELDS = ["id", "durationSeconds", "other_time_h"]
+
+
+def _minutes(seconds: Any) -> int | None:
+    if isinstance(seconds, bool):
+        return None
+    if isinstance(seconds, (int, float)):
+        return round(seconds / 60)
+    return None
+
+
+def _hours_to_minutes(hours: Any) -> int | None:
+    if hours is None or isinstance(hours, bool):
+        return None
+    try:
+        return round(float(str(hours).replace(",", ".")) * 60)
+    except ValueError:
+        return None
+
+
+def _add_detail_minutes(record: Any) -> None:
+    """A detail or write record: `duration` / `other_time` are seconds."""
+    if not isinstance(record, dict):
+        return
+    duration = _minutes(record.get("duration"))
+    if duration is not None:
+        record["duration_minutes"] = duration
+    other = _minutes(record.get("other_time"))
+    if other is not None:
+        record["other_time_minutes"] = other
+
+
+def _add_row_minutes(row: dict[str, Any], seconds: Any, other_hours: Any) -> None:
+    duration = _minutes(seconds)
+    if duration is not None:
+        row["duration_minutes"] = duration
+    other = _hours_to_minutes(other_hours)
+    if other is not None:
+        row["other_time_minutes"] = other
+
+
+async def _add_list_minutes(
+    client: CdeskClient, rows: list[Any], params: dict[str, Any],
+) -> str | None:
+    """Give every list row its minutes. A page read with fieldset=all already
+    carries the seconds; otherwise one extra read of the same page returns only
+    id + seconds (a few KB, instead of the ~5x larger fieldset=all page) and is
+    merged by id. Returns a warning when the minutes could not be added."""
+    records = [r for r in rows if isinstance(r, dict)]
+    missing = [r for r in records if "durationSeconds" not in r]
+    for r in records:
+        if "durationSeconds" in r:
+            _add_row_minutes(r, r.get("durationSeconds"), r.get("other_time_h"))
+    if not missing:
+        return None
+    side = {k: v for k, v in params.items() if k not in ("fieldset", "returnFields[]")}
+    side["returnFields[]"] = _LIST_TIME_FIELDS
+    try:
+        times, _ = unwrap_list(await client.get("v3/fill", params=side))
+    except Exception:  # noqa: BLE001 — the page itself is fine; say what is missing
+        times = []
+    by_id = {t.get("id"): t for t in times if isinstance(t, dict)}
+    unmatched = 0
+    for r in missing:
+        t = by_id.get(r.get("id"))
+        if t is None:
+            unmatched += 1
+            continue
+        _add_row_minutes(r, t.get("durationSeconds"), t.get("other_time_h"))
+    if unmatched:
+        return (
+            f"duration_minutes could not be read for {unmatched} fill(s) on this "
+            f"page; get_fill gives a fill's worked time (duration, in seconds)."
+        )
+    return None
+
+
+def _with_write_minutes(response: Any) -> dict[str, Any]:
+    result = response if isinstance(response, dict) else {"data": response}
+    _add_detail_minutes(result.get("data"))
+    _add_detail_minutes(result.get("savedData"))
+    return result
+
+
 def _build_fill_body(public_fields: dict[str, Any]) -> dict[str, Any]:
     """Drop None values and rename the few params whose CDESK field name
     differs (see _FILL_CREATE_FIELDS). Everything else maps 1:1."""
@@ -479,8 +620,14 @@ def _ensure_chronological(valid_from: str, valid_to: str) -> None:
 _LIST_FILLS_DESC = inspect.cleandoc(
     """
     List CDESK fills (fulfillments — logged work/time records). Returns a
-    paginated `items` array; `meta` is usually empty (no total count — detect
-    the last page by a short/empty page).
+    paginated `items` array; `meta.total` is the number of records matching the filter across all pages (CDESK's own count) and `meta.last_page` tells whether this is the last page.
+
+    Worked time: every item carries `duration_minutes` (int) — the fill's
+    stored worked time, i.e. valid_to − valid_from plus `other_time`, the value
+    CDESK bills and sums in its reports — and `other_time_minutes`, the
+    correction part. CDESK's own `duration` field in this list is TEXT of the
+    from→to span only ("1h 24min", without the correction), and `other_time`
+    is text too ("30min"); get_fill returns both in seconds.
 
     Date window: pass worked_from / worked_to (ISO-8601) to scope the search to
     a work-date range. There is NO implicit month bound — re-verified live
@@ -506,7 +653,9 @@ _LIST_FILLS_DESC = inspect.cleandoc(
     columns: fill_id, assign_id, company_id, solver_id, request_id, deal_id,
     project_contract_id, place_id, description (CONTAINS), used_material
     (CONTAINS), task, deal, work_order (ISNULL/ISNOTNULL link filters),
-    duration (HOURS, numeric comparators), invoiced_status, rma, is_signed,
+    duration (the stored worked time incl. other_time, in HOURS, numeric
+    comparators — {"col": "duration", "c": ">=", "q": 1.5}; sorting by
+    `duration` orders by the from→to span instead), invoiced_status, rma, is_signed,
     start_date (BETWEEN or =, strict W3C bounds), plus the no-col text leaf. The
     documented `request` key and the whole `end_date` column are NOT honored and
     are stripped (`end_date` is not in the allowlist at all — bound the window
@@ -523,6 +672,10 @@ _GET_FILL_DESC = inspect.cleandoc(
     fieldset selects the field group returned: "base", "extended" (CDESK's
     default when omitted), "all" (base+extended+custom), or "custom". fields is
     an exact whitelist of field names (returnFields; union with fieldset).
+
+    `duration` here is the stored worked time in SECONDS (valid_to − valid_from
+    plus `other_time`, the correction, also seconds); `duration_minutes` /
+    `other_time_minutes` give the same in minutes, as list_fills does.
     """
 )
 
@@ -539,15 +692,29 @@ _CREATE_FILL_DESC = inspect.cleandoc(
     Create a fill (log work/time). `assign_id` selects the parent kind and
     dictates which parent id is REQUIRED: 1=company→company_id, 2=deal→
     deal_id, 3=request→request_id, 4=work order→work_order_id, 5=task→
-    task_id, 6=project contract→project_contract_id, 7=days-off→none.
+    task_id, 6=project contract→project_contract_id. (Days-off fills are not
+    created here — CDESK refuses assign_id 7.)
 
     valid_from / valid_to (ISO-8601; an explicit offset like +02:00 is
     recommended — a naive datetime is read as tenant-local) are required and
-    valid_to must be ≥ valid_from; `duration` is normally derived from them.
-    `solver_id` (the worker) is typically required by the tenant — pass it
-    explicitly. An already-invoiced parent or tenant billing settings may
+    valid_to must be ≥ valid_from. CDESK sets the worked time from them on
+    every save: valid_to − valid_from plus `other_time` (seconds, may be
+    negative), the way to correct it — there is no duration to set directly.
+    The result carries `duration_minutes` / `other_time_minutes`.
+    `solver_id` (the worker) is always required. An already-invoiced parent or tenant billing settings may
     require billing_item_id and will reject the write (HTTP 409). Fetch
     tenant-specific ids via get_fill_enums and the related module list tools.
+
+    `description`, the place (`place_id` / `place_custom`) and
+    `billing_item_id` follow the tenant's CDESK fill form, read live on
+    every call (also on update_fill): a field switched off is refused when
+    given, a required one must be given. get_fill_enums lists their state
+    under `fields`. Fills dated in the past and fills on a closed request
+    can also be refused by tenant settings.
+
+    Side effects (by CDESK): a fill on a request in "prijaté" or "priradené" moves
+    that request to "v riešení" (action code 30) on tenants with the automatic
+    status change after a fill (live on cmpp 2026-10-12: 10 → 30).
     """
 )
 
@@ -557,6 +724,8 @@ _UPDATE_FILL_DESC = inspect.cleandoc(
     and the version token are handled internally (GET → mutate → PUT). Changing
     `assign_id` requires sending the new matching parent id. An already-invoiced
     fill is write-blocked (HTTP 409) unless you hold the invoiced-write right.
+    The worked time follows valid_from / valid_to plus `other_time` (seconds),
+    recomputed by CDESK on every save; the result carries `duration_minutes`.
     """
 )
 

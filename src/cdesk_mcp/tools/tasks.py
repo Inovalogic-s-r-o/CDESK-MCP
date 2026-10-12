@@ -13,16 +13,31 @@ from __future__ import annotations
 
 import inspect
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from cdesk_mcp import base_config
 from cdesk_mcp.cdesk_client import CdeskClient
 from cdesk_mcp.enums import EnumCache
+from cdesk_mcp.field_policy import (
+    TASK_FIELDS,
+    describe,
+    refuse_if_violated,
+    task_settings,
+    violations,
+)
 from cdesk_mcp.filters import build_task_filter, encode_sb, reject_sb_raw_with_typed
+from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
-    annotate_write_warnings,
+    notify_block_value,
+    task_status_group,
+    with_status_groups,
+    list_meta,
+    TEXT_MATCH_NOTE,
+    EnumLabel,
+    add_enum_names,
     apply_field_scope,
     resolve_enum_or_raise,
     to_llm_error,
@@ -54,6 +69,27 @@ _TASK_CREATE_FIELDS = {
 # doesn't refuse larger values, so this is purely a defensive guard.
 _MAX_PER_PAGE = 100
 
+# Enum-valued task fields and the label written next to each. Task status and
+# types are stored by enum ID (cmpp: status 183850 = "prijatá"), unlike the
+# Request module's action codes. `assign_id` is the parent kind (cmpp:
+# 4 = "Spoločnosť").
+_TASK_ENUM_LABELS = (
+    EnumLabel("status", "status", "status_name"),
+    EnumLabel("type_id", "type", "type_name"),
+    EnumLabel("type_2nd_id", "type2nd", "type_2nd_name"),
+    EnumLabel("place_id", "place", "place_name"),
+    EnumLabel("assign_id", "assign", "assign_name"),
+)
+
+
+async def _label_write_result(cache: EnumCache, result: dict[str, Any]) -> dict[str, Any]:
+    """Enum labels on a write response's record (`savedData`, or `data` when
+    the endpoint returns the record there)."""
+    await add_enum_names(
+        cache, [result.get("savedData"), result.get("data")], _TASK_ENUM_LABELS
+    )
+    return result
+
 
 def register_task_tools(
     mcp: FastMCP,
@@ -64,12 +100,13 @@ def register_task_tools(
     by build_server when client + cache are both available."""
 
     @mcp.tool(
-        description=_LIST_TASKS_DESC,
+        description=_LIST_TASKS_DESC + "\n\n" + sort_note("tasks") + "\n\n" + TEXT_MATCH_NOTE,
         annotations=ToolAnnotations(title="List tasks", readOnlyHint=True),
     )
     async def list_tasks(
         text_search: str | None = None,
         status_name: str | None = None,
+        status_group: Literal["open", "closed"] | None = None,
         type_name: str | None = None,
         solver_id: int | list[int] | None = None,
         customer_id: int | list[int] | None = None,
@@ -99,6 +136,7 @@ def register_task_tools(
             reject_sb_raw_with_typed(sb_raw, {
                 "text_search": text_search,
                 "status_name": status_name,
+                "status_group": status_group,
                 "type_name": type_name,
                 "solver_id": solver_id,
                 "customer_id": customer_id,
@@ -119,6 +157,7 @@ def register_task_tools(
             sb = build_task_filter(
                 text_search=text_search,
                 status_id=status_id,
+                status_group=status_group,
                 type_id=type_id,
                 solver_id=solver_id,
                 customer_id=customer_id,
@@ -134,10 +173,10 @@ def register_task_tools(
             params: dict[str, Any] = {"pg": page, "pp": per_page}
             apply_field_scope(params, fieldset, fields)
             if sort:
-                params["sort"] = sort
+                params["sort"] = resolve_sort("tasks", sort)
             if sb is not None:
                 params["sb"] = encode_sb(sb)
-            response = await client.get("v3/task", params=params)
+            response, paging = await client.get_page("v3/task", params=params)
         except RuntimeError:
             raise  # already a friendly message (from resolve_enum_or_raise)
         except ValueError as e:
@@ -146,7 +185,8 @@ def register_task_tools(
             raise to_llm_error(e, operation="list_tasks") from e
 
         records, meta = unwrap_list(response)
-        result = {"items": records, "meta": meta, "page": page, "per_page": per_page}
+        await add_enum_names(cache, records, _TASK_ENUM_LABELS)
+        result = {"items": records, "meta": list_meta(meta, paging, dropped=dropped_clauses), "page": page, "per_page": per_page}
         if dropped_clauses:
             result["unsupported_filters"] = unsupported_filter_directive(dropped_clauses)
         return result
@@ -181,13 +221,15 @@ def register_task_tools(
             raise RuntimeError(f"get_task input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="get_task", record_id=id) from e
-        return unwrap_record(response)
+        record = unwrap_record(response)
+        await add_enum_names(cache, [record], _TASK_ENUM_LABELS)
+        return record
 
     @mcp.tool(
         description=_GET_TASK_ENUMS_DESC,
         annotations=ToolAnnotations(title="Get task enums", readOnlyHint=True),
     )
-    async def get_task_enums(refresh: bool = False) -> dict[str, list[dict[str, Any]]]:
+    async def get_task_enums(refresh: bool = False) -> dict[str, Any]:
         try:
             if refresh:
                 await cache.refresh()
@@ -195,7 +237,20 @@ def register_task_tools(
                 await cache.load()  # populate a cold cache (snapshot is empty otherwise)
         except Exception as e:
             raise to_llm_error(e, operation="get_task_enums") from e
-        return cache.snapshot()
+        result: dict[str, Any] = dict(cache.snapshot())
+        result["status"] = with_status_groups(result.get("status"), task_status_group)
+        result["fields"] = {
+            "by_tenant_setting": describe(
+                TASK_FIELDS, task_settings(await base_config.load(client))
+            ),
+            "note": (
+                "State of each configurable create_task/update_task parameter on "
+                "this tenant, from its live task form settings: off (refused when "
+                "given), optional, or required (must be given on create, cannot be "
+                "cleared on update)."
+            ),
+        }
+        return result
 
     @mcp.tool(
         description=_CREATE_TASK_DESC,
@@ -205,7 +260,7 @@ def register_task_tools(
         name: str,
         solver_id: int,
         valid_from: str,
-        valid_to: str,
+        valid_to: str | None = None,
         description: str | None = None,
         status_name: str | None = None,
         type_name: str | None = None,
@@ -226,6 +281,7 @@ def register_task_tools(
         offer_item_id: int | None = None,
         notify: dict[str, Any] | None = None,
         attachment: list[dict[str, Any]] | None = None,
+        notify_block: int | None = None,
     ) -> dict[str, Any]:
         try:
             # Naive datetimes are interpreted as TENANT-LOCAL wall-clock time
@@ -238,11 +294,29 @@ def register_task_tools(
             # required str params. The guard below narrows them for the reassign.
             localized_from = localize_naive_datetime("valid_from", valid_from)
             localized_to = localize_naive_datetime("valid_to", valid_to)
-            if not localized_from or not localized_to:
-                raise ValueError("valid_from and valid_to are required (ISO-8601)")
+            if not localized_from:
+                raise ValueError("valid_from is required (ISO-8601)")
+            # The CDESK form requires the end ("Splniť do") only for a task
+            # that is not all-day (Task/FormConfig.php ngRequired fullday ===
+            # false); for an all-day task CDESK sets the end of that day itself
+            # (verified live on cmpp 2026-10-12). The API accepts a missing end
+            # either way; the tool follows the form.
+            if not localized_to and not fullday:
+                raise ValueError(
+                    "valid_to is required unless the task is all-day (fullday=True)"
+                )
             valid_from, valid_to = localized_from, localized_to
-            _ensure_chronological(valid_from, valid_to)
+            if valid_to is not None:
+                _ensure_chronological(valid_from, valid_to)
 
+            # The tenant's task FORM rules, read live from core/base-config (the
+            # task settings are not in v3 and v1 task/settings is admin-only):
+            # an off field is refused, a required one must be given.
+            refuse_if_violated(violations(
+                TASK_FIELDS, task_settings(await base_config.load(client)),
+                {"type_name": type_name, "type_2nd_name": type_2nd_name,
+                 "watcher_ids": watcher_ids},
+            ))
             status_id = await resolve_enum_or_raise(cache, "status", status_name, kind="status")
             type_id = await resolve_enum_or_raise(cache, "type", type_name, kind="type")
             # type_2nd is hierarchical: it needs its parent type to resolve. Without
@@ -260,6 +334,7 @@ def register_task_tools(
 
             body = _build_task_body(
                 {
+                    "notify_block": notify_block_value(notify_block),
                     "name": name,
                     "solver_id": solver_id,
                     "valid_from": valid_from,
@@ -295,10 +370,8 @@ def register_task_tools(
             raise RuntimeError(f"create_task input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="create_task") from e
-        return annotate_write_warnings(
-            response if isinstance(response, dict) else {"data": response},
-            sent_body=body,
-            check_fields=(),
+        return await _label_write_result(
+            cache, response if isinstance(response, dict) else {"data": response}
         )
 
     @mcp.tool(
@@ -333,6 +406,7 @@ def register_task_tools(
         attachment: list[dict[str, Any]] | None = None,
         subordinate_task_id: int | None = None,
         duration_gap: int | None = None,
+        notify_block: int | None = None,
     ) -> dict[str, Any]:
         try:
             if name is not None and not name.strip():
@@ -347,6 +421,15 @@ def register_task_tools(
             if valid_from is not None and valid_to is not None:
                 _ensure_chronological(valid_from, valid_to)
 
+            # The tenant's task FORM rules, read live from core/base-config (the
+            # task settings are not in v3 and v1 task/settings is admin-only):
+            # an off field is refused, a required one must be given / not cleared.
+            refuse_if_violated(violations(
+                TASK_FIELDS, task_settings(await base_config.load(client)),
+                {"type_name": type_name, "type_2nd_name": type_2nd_name,
+                 "watcher_ids": watcher_ids},
+                update=True,
+            ))
             status_id = await resolve_enum_or_raise(cache, "status", status_name, kind="status")
             type_id = await resolve_enum_or_raise(cache, "type", type_name, kind="type")
             # type_2nd is hierarchical: resolving it needs its parent type. On a
@@ -377,6 +460,7 @@ def register_task_tools(
                     _ensure_chronological(current_from, valid_to)
             body = _build_task_body(
                 {
+                    "notify_block": notify_block_value(notify_block),
                     "name": name,
                     "description": description,
                     "solver_id": solver_id,
@@ -413,10 +497,8 @@ def register_task_tools(
             raise RuntimeError(f"update_task input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="update_task", record_id=id) from e
-        return annotate_write_warnings(
-            response if isinstance(response, dict) else {"data": response},
-            sent_body=body,
-            check_fields=(),
+        return await _label_write_result(
+            cache, response if isinstance(response, dict) else {"data": response}
         )
 
     @mcp.tool(
@@ -434,20 +516,27 @@ def register_task_tools(
         description=_SET_TASK_STATUS_DESC,
         annotations=ToolAnnotations(title="Set task status", destructiveHint=True),
     )
-    async def set_task_status(id: int, status_name: str) -> dict[str, Any]:
+    async def set_task_status(
+        id: int, status_name: str, notify_block: int | None = None,
+    ) -> dict[str, Any]:
         try:
             status_id = await resolve_enum_or_raise(cache, "status", status_name, kind="status")
             if status_id is None:
                 raise RuntimeError("set_task_status requires a non-empty status_name")
             current = await _fetch_for_update(client, id)
-            body = {"status": status_id}
+            body: dict[str, Any] = {"status": status_id}
+            block = notify_block_value(notify_block)
+            if block is not None:
+                body["notify_block"] = block
             _apply_lock_token(body, current)
             response = await client.put(f"v3/task/{id}", json=body)
         except RuntimeError:
             raise
         except Exception as e:
             raise to_llm_error(e, operation="set_task_status", record_id=id) from e
-        return response if isinstance(response, dict) else {"data": response}
+        return await _label_write_result(
+            cache, response if isinstance(response, dict) else {"data": response}
+        )
 
     @mcp.tool(
         description=_ADD_WATCHERS_DESC,
@@ -457,6 +546,13 @@ def register_task_tools(
         try:
             if not watcher_ids:
                 raise RuntimeError("add_task_watchers requires a non-empty watcher_ids list")
+            # Same task form rule as create/update_task: no watchers while the
+            # tenant has them switched off. (Removing stays allowed — it only
+            # clears what is already there.)
+            refuse_if_violated(violations(
+                TASK_FIELDS, task_settings(await base_config.load(client)),
+                {"watcher_ids": watcher_ids}, update=True,
+            ))
             current = await _fetch_for_update(client, id)
             current_watchers = _normalize_int_list(current.get("task_watchers_ids"))
             merged = sorted(set(current_watchers) | set(watcher_ids))
@@ -465,9 +561,13 @@ def register_task_tools(
             response = await client.put(f"v3/task/{id}", json=body)
         except RuntimeError:
             raise
+        except ValueError as e:
+            raise RuntimeError(f"add_task_watchers input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="add_task_watchers", record_id=id) from e
-        return response if isinstance(response, dict) else {"data": response}
+        return await _label_write_result(
+            cache, response if isinstance(response, dict) else {"data": response}
+        )
 
     @mcp.tool(
         description=_REMOVE_WATCHERS_DESC,
@@ -487,7 +587,9 @@ def register_task_tools(
             raise
         except Exception as e:
             raise to_llm_error(e, operation="remove_task_watchers", record_id=id) from e
-        return response if isinstance(response, dict) else {"data": response}
+        return await _label_write_result(
+            cache, response if isinstance(response, dict) else {"data": response}
+        )
 
 
 # --- internals ----------------------------------------------------------
@@ -599,17 +701,15 @@ _LIST_TASKS_DESC = inspect.cleandoc(
     `lastPage` boolean — use them rather than inferring the end from a short
     page.
 
-    Ordering (re-verified live 2026-07-30 — the backend behaviour CHANGED):
-    omitting `sort` gives newest-first (id descending), usually what you
-    want. A BARE COLUMN NAME now genuinely sorts ASCENDING by that column
-    ("name" and "valid_from" both confirmed). But any direction modifier and
-    any unrecognised column silently fall back to id ASCENDING with no error
-    — "-name", "name desc", "-valid_from", "-id" and a bogus column all did.
-    Note "id" and "created_at" are indistinguishable from that fallback on
-    ordered data, so don't read them as honored. Practical rule: for
-    ascending order by one column pass the bare name; DESCENDING by anything
-    other than the default is NOT available server-side — page the set and
-    sort client-side, and never assume a "-" prefix was applied.
+    status_group filters by CDESK's own task groups: "open" (every status
+    below action code 80, and tasks with no status) or "closed" (80 and up).
+    get_task_enums lists each status's group.
+
+    Enum fields carry their label alongside: `status_name`, `type_name`,
+    `type_2nd_name`, `place_name`, `assign_name` sit next to the raw enum id
+    (e.g. `status: 183850, status_name: "prijatá"`) and are the names the
+    status_name / type_name / … parameters accept.
+
 
     Common filters:
       - text_search: free-text across task name/num, solver, creator, customer.
@@ -652,6 +752,11 @@ _GET_TASK_DESC = inspect.cleandoc(
     error if the task doesn't exist or your account doesn't have admin
     scope over it.
 
+    Enum fields carry their label alongside: `status_name`, `type_name`,
+    `type_2nd_name`, `place_name`, `assign_name` sit next to the raw enum id
+    (e.g. `status: 183850, status_name: "prijatá"`) and are the names the
+    status_name / type_name / … parameters accept.
+
     fieldset selects the field group returned: "base", "extended"
     (CDESK's default when omitted), "all" (base+extended+custom), or
     "custom". Despite the name, "custom" is NOT empty and is not
@@ -684,7 +789,12 @@ _CREATE_TASK_DESC = inspect.cleandoc(
     """
     Create a new task in CDESK.
 
-    Required: name, solver_id, valid_from, valid_to.
+    Required: name, solver_id, valid_from, and valid_to unless the task is
+    all-day (fullday=True — CDESK then ends it at the end of that day).
+    type_name, type_2nd_name and watcher_ids follow the tenant's CDESK task
+    form, read live on every call (also on update_task): switched off →
+    refused when given; required → must be given. get_task_enums lists
+    their state under `fields`.
     valid_from / valid_to are ISO-8601 datetimes. A datetime WITHOUT a
     timezone offset is interpreted as TENANT-LOCAL wall-clock time
     (CDESK_TIMEZONE, default Europe/Bratislava) and sent with the proper
@@ -719,6 +829,8 @@ _CREATE_TASK_DESC = inspect.cleandoc(
         processAttachment shape — requires pre-uploaded file hashes).
 
     Returns the created task's id + full record (CDESK's savedData).
+    
+    notify_block=1 sends no notification (e-mail / SMS) for this write.
     """
 )
 
@@ -741,6 +853,8 @@ _UPDATE_TASK_DESC = inspect.cleandoc(
       - subordinate_task_id + duration_gap: shift dependent subordinate
         tasks by N days when moving dates under auto-scheduling
         (duration_gap is applied, not stored).
+    
+    notify_block=1 sends no notification (e-mail / SMS) for this write.
     """
 )
 
@@ -761,6 +875,8 @@ _SET_TASK_STATUS_DESC = inspect.cleandoc(
     status_name is resolved via get_task_enums (matches across the
     tenant's localized name variants). Internal GET → PUT to handle
     optimistic locking.
+    
+    notify_block=1 sends no notification (e-mail / SMS) for this write.
     """
 )
 

@@ -48,6 +48,14 @@ _PASSWORD_KEY_PATTERN = re.compile(
 )
 _BODY_PREVIEW_MAX = 200
 
+# CDESK message codes that mean "missing / not reachable / the operation
+# failed" with no further reason — backend constants from apiportal
+# Wrapper/Response.php, the same on every tenant: ACCESS_DENIED 2, NOT_EXISTS
+# 4, LOAD_ERROR 112, SAVE_ERROR 114, CREATE_ERROR 116, DELETE_ERROR 118. A 404
+# whose body carries ANY other code is a refusal with a reason, not a missing
+# record (see the 404 branch of _translate_status).
+_NOT_FOUND_CODES = frozenset({2, 4, 112, 114, 116, 118})
+
 
 def translate_error(
     exc: Exception,
@@ -152,6 +160,20 @@ def _translate_status(
             f"module-enabled global settings."
         )
     if status == 404:
+        codes, _messages = _extract_cdesk_messages(body)
+        if any(code not in _NOT_FOUND_CODES for code in codes):
+            # A refusal, not a missing record: v1 handlers end EVERY failure
+            # path in a 404 (e.g. Customer::deleteIndex returns
+            # jsonError_deleteRecord + 404 when isDisposable() blocks the
+            # delete), and the body then carries the real reason next to the
+            # generic "Záznam sa nepodarilo zmazať" (cmpp 2026-10-09: codes
+            # [8, 118], "…ukončite jeho otvorené Úlohy").
+            base = (
+                f"CDESK refused '{operation}'{rid_suffix}. It answered HTTP 404, "
+                f"but the reason it gave is not that the record is missing — the "
+                f"record exists and the operation was blocked"
+            )
+            return _append_cdesk(base, cdesk) + "."
         base = f"Record not found{rid_suffix} during '{operation}'"
         if cdesk:
             return _append_cdesk(base, cdesk) + "."

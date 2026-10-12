@@ -135,6 +135,23 @@ class CdeskApiError(RuntimeError):
         super().__init__(f"CDESK body-level error (HTTP {http_status}): {summary}")
 
 
+
+def page_info(headers: Any) -> dict[str, Any]:
+    """{"total": int | None, "last_page": bool | None} from v3 list headers
+    (X-TotalRecords / X-LastPage; header names are case-insensitive)."""
+    def header(name: str) -> str | None:
+        try:
+            value = headers.get(name) if headers is not None else None
+        except Exception:  # noqa: BLE001 — a malformed header is just absent
+            return None
+        return value if isinstance(value, str) and value.strip() else None
+
+    total_raw, last_raw = header("x-totalrecords"), header("x-lastpage")
+    total = int(total_raw) if total_raw is not None and total_raw.strip().isdigit() else None
+    last = None if last_raw is None else last_raw.strip() not in ("0", "", "false")
+    return {"total": total, "last_page": last}
+
+
 class CdeskClient:
     """Async wrapper over httpx.AsyncClient with CDESK login + retries.
 
@@ -315,6 +332,17 @@ class CdeskClient:
 
     async def get(self, path: str, *, params: dict[str, Any] | None = None) -> Any:
         return await self._request("GET", path, params=params)
+
+    async def get_page(
+        self, path: str, *, params: dict[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any]]:
+        """A list GET plus its paging: (body, {"total", "last_page"}). v3 sends
+        the paging only as response headers — X-TotalRecords (the count of
+        the FILTERED set) and X-LastPage — documented in the v3 spec ("Pagination
+        is always returned in headers"); `get` drops headers. A value the
+        response lacks is None."""
+        body, headers = await self._request("GET", path, params=params, with_headers=True)
+        return body, page_info(headers)
 
     async def post(self, path: str, *, json: dict[str, Any] | None = None) -> Any:
         return await self._request("POST", path, json=json)
@@ -752,9 +780,11 @@ class CdeskClient:
         *,
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
+        with_headers: bool = False,
     ) -> Any:
         """Two-level retry: outer handles 401 (relogin once), inner handles
-        5xx/429/network with exponential backoff."""
+        5xx/429/network with exponential backoff. `with_headers` returns
+        (body, response headers) instead of the body."""
         rel_path = path.lstrip("/")
 
         # Outer pass: at most two iterations (original + post-relogin).
@@ -778,7 +808,7 @@ class CdeskClient:
                 raise
 
             if not response.content:
-                return None
+                return (None, response.headers) if with_headers else None
             parsed = response.json()
 
             # CDESK signals many failures (optimistic-lock conflicts,
@@ -786,7 +816,7 @@ class CdeskClient:
             # the body. Surface those as exceptions so tools' try/except
             # routes them through translate_error like any HTTP failure.
             _raise_if_body_signals_error(parsed, response.status_code)
-            return parsed
+            return (parsed, response.headers) if with_headers else parsed
 
         raise RuntimeError("unreachable: outer relogin loop must return or raise")
 
