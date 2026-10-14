@@ -16,11 +16,11 @@ Two consumers, which is why this lives in its own module rather than in
 ``azure_login.py``: the login page's ``POST /login/probe`` (always mounted) and
 ``/login/azure/start`` (mounted only when Microsoft sign-in is enabled).
 
-WHAT THIS MUST NOT BECOME. ``oauth/login.py`` carries a scar comment (see the
-``authenticate()`` call there) about a ``GET /auth/me`` pre-flight probe that was
-deleted: when that one endpoint began returning 500 on a tenant whose data
-endpoints were fine, nobody could sign in. This endpoint is public and documented,
-which makes it a better probe — not a safe gate. Hence the status taxonomy below
+WHAT THIS MUST NOT BECOME. Gating sign-in on this probe would make every login
+depend on one endpoint's health (see the ``authenticate()`` call in
+``oauth/login.py``, which deliberately validates with POST /auth/login alone).
+This endpoint is public and documented, which makes it a good probe — not a safe
+gate. Hence the status taxonomy below
 separates "reached it, it is definitively not a CDESK" from "could not get a clear
 answer", and callers must only ever block on the former.
 """
@@ -126,7 +126,7 @@ def connector_url(base_url: str) -> str:
 
     Shares ``normalize_api_base`` with ``CdeskClient`` on purpose. ``check_base_url``
     deliberately does NOT strip a trailing ``/api`` (the client handles it), so
-    naive concatenation here produced ``/api/api/auth/connector`` — a 404 — for
+    naive concatenation here would produce ``/api/api/auth/connector`` — a 404 — for
     ``cdesk.example.com/api``, which is an address that signs in perfectly well."""
     return normalize_api_base(base_url) + _CONNECTOR_PATH
 

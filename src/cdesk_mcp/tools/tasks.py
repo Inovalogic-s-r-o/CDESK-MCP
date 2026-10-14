@@ -1,8 +1,7 @@
-"""Task module MCP tools (M7).
+"""Task module MCP tools.
 
-Nine tools that expose CDESK's Task v3 CRUD + intent helpers to the LLM.
-Wires together CdeskClient (M3), EnumCache (M5), filter builder (M6), and
-error translator (M4).
+Tools that expose CDESK's Task v3 CRUD + intent helpers to the LLM. Wires
+together CdeskClient, EnumCache, the filter builder, and the error translator.
 
 Optimistic locking is hidden: update_task, set_task_status, and the watcher
 intent helpers internally do GET → mutate → PUT (re-using the `timestamp_check`
@@ -64,15 +63,14 @@ _TASK_CREATE_FIELDS = {
     "duration_gap": "durationGap",  # CDESK camelCase (update-only, not stored)
 }
 
-# Pagination upper bound for list_tasks. Architecture.md set 100 as the cap
-# to keep response sizes within an LLM's context budget. CDESK itself
-# doesn't refuse larger values, so this is purely a defensive guard.
+# Pagination upper bound for list_tasks, keeping response sizes within an
+# LLM's context budget. CDESK itself doesn't refuse larger values, so this is
+# purely a defensive guard.
 _MAX_PER_PAGE = 100
 
 # Enum-valued task fields and the label written next to each. Task status and
-# types are stored by enum ID (cmpp: status 183850 = "prijatá"), unlike the
-# Request module's action codes. `assign_id` is the parent kind (cmpp:
-# 4 = "Spoločnosť").
+# types are stored by enum ID, unlike the Request module's action codes.
+# `assign_id` is the parent kind (e.g. "Spoločnosť").
 _TASK_ENUM_LABELS = (
     EnumLabel("status", "status", "status_name"),
     EnumLabel("type_id", "type", "type_name"),
@@ -149,7 +147,7 @@ def register_task_tools(
             })
             status_id = await resolve_enum_or_raise(cache, "status", status_name, kind="status")
             type_id = await resolve_enum_or_raise(cache, "type", type_name, kind="type")
-            # sb_raw clauses on columns the live endpoint doesn't honor are
+            # sb_raw clauses on columns the endpoint doesn't honor are
             # stripped (not forwarded — the backend would silently ignore them
             # and return the unfiltered set anyway) and reported back via
             # `unsupported_filters` so the agent filters the items itself.
@@ -202,8 +200,8 @@ def register_task_tools(
     ) -> Any:
         try:
             # A non-positive id can't exist, and the backend 500s on it rather
-            # than 404ing (live: id=-1 → HTTP 500, while id=0 and a huge id both
-            # give a clean "record not found"). Without this guard the client
+            # than 404ing (id=-1 → HTTP 500, while id=0 and a huge id both give
+            # a clean "record not found"). Without this guard the client
             # spends its whole 5xx backoff budget on provably bad input and then
             # tells the agent the service is down for 30s. id=0 is included: the
             # backend handles it, but no record can have it either.
@@ -286,8 +284,8 @@ def register_task_tools(
         try:
             # Naive datetimes are interpreted as TENANT-LOCAL wall-clock time
             # and sent with an explicit offset: CDESK reads a naive value as
-            # UTC (verified live 2026-06-05 — naive 8:00 displayed as 10:00 in
-            # the CEST tenant UI), while an explicit offset round-trips
+            # UTC (a naive 8:00 displays as 10:00 in a CEST tenant's UI), while
+            # an explicit offset round-trips
             # correctly. localize_naive_datetime also validates the ISO shape.
             # Via locals: localize_naive_datetime is str | None -> str | None (it
             # maps "" to None), so it can't be assigned straight back onto these
@@ -297,10 +295,9 @@ def register_task_tools(
             if not localized_from:
                 raise ValueError("valid_from is required (ISO-8601)")
             # The CDESK form requires the end ("Splniť do") only for a task
-            # that is not all-day (Task/FormConfig.php ngRequired fullday ===
-            # false); for an all-day task CDESK sets the end of that day itself
-            # (verified live on cmpp 2026-10-12). The API accepts a missing end
-            # either way; the tool follows the form.
+            # that is not all-day; for an all-day task CDESK sets the end of
+            # that day itself. The API accepts a missing end either way; the
+            # tool follows the form.
             if not localized_to and not fullday:
                 raise ValueError(
                     "valid_to is required unless the task is all-day (fullday=True)"
@@ -351,7 +348,7 @@ def register_task_tools(
                     "parent_task_id": parent_task_id,
                     "fullday": fullday,
                     "private": private,
-                    # M7.3: pass 0 through (0 is a valid percent_done value).
+                    # Pass 0 through (0 is a valid percent_done value).
                     # _build_task_body drops None but keeps 0.
                     "percent_done": percent_done,
                     "scheduling_mode": scheduling_mode,
@@ -415,7 +412,7 @@ def register_task_tools(
             # naive value as UTC (see create_task), so attach the offset here.
             valid_from = localize_naive_datetime("valid_from", valid_from)
             valid_to = localize_naive_datetime("valid_to", valid_to)
-            # M7.2: catch valid_to < valid_from before we round-trip. Also
+            # Catch valid_to < valid_from before we round-trip. Also
             # cross-check against the current value if only one side is changing
             # — that's the common LLM pattern ("change the deadline to ...").
             if valid_from is not None and valid_to is not None:
@@ -599,12 +596,11 @@ async def _fetch_for_update(client: CdeskClient, id: int) -> dict[str, Any]:
     lock into a follow-up PUT.
 
     CDESK's optimistic lock reads `timestamp_check` from the PUT body — not
-    `updated_at`, despite the OpenAPI documentation claiming otherwise. Verified
-    against `apiportal/inovalogic/Wrapper/BaseModel.php::hasBeenUpdated`. We
-    require `timestamp_check` to be present; without it we can't safely PUT.
+    `updated_at`, despite the OpenAPI documentation claiming otherwise.
+    `timestamp_check` must be present; without it a PUT is not safe.
 
-    fieldset=all is required: the v3 fieldset default (`extended`) no longer
-    includes `timestamp_check` — only `all` carries it (verified live). It also
+    fieldset=all is required: the v3 fieldset default (`extended`) does not
+    include `timestamp_check` — only `all` carries it. It also
     guarantees `task_watchers_ids` is present for the watcher merge logic."""
     envelope = await client.get(f"v3/task/{id}", params={"fieldset": "all"})
     record = unwrap_record(envelope)
@@ -659,7 +655,7 @@ def _ensure_chronological(valid_from: str, valid_to: str) -> None:
     # +00:00 value) while the other is naive — after localize_naive_datetime
     # only bare DATES stay naive. Comparing aware vs naive raises TypeError;
     # interpret a naive value in the TENANT timezone, matching the semantics
-    # localize gives time-bearing values. Treating it as UTC mis-rejected
+    # localize gives time-bearing values. Treating it as UTC would mis-reject
     # valid ranges like valid_from="2026-06-05" + valid_to="...T01:00:00"
     # (01:00 CEST = 23:00Z the day BEFORE bare-date midnight read as UTC).
     def _as_aware(dt: datetime) -> datetime:
@@ -672,8 +668,8 @@ def _ensure_chronological(valid_from: str, valid_to: str) -> None:
 
 
 def _normalize_int_list(value: Any) -> list[int]:
-    """Coerce a possibly-None / possibly-mixed list to list[int]. CDESK has
-    been seen to return None or [] for unset multi-value fields."""
+    """Coerce a possibly-None / possibly-mixed list to list[int]. CDESK can
+    return None or [] for unset multi-value fields."""
     if not value:
         return []
     if not isinstance(value, list):
@@ -707,7 +703,7 @@ _LIST_TASKS_DESC = inspect.cleandoc(
 
     Enum fields carry their label alongside: `status_name`, `type_name`,
     `type_2nd_name`, `place_name`, `assign_name` sit next to the raw enum id
-    (e.g. `status: 183850, status_name: "prijatá"`) and are the names the
+    (e.g. `status: <id>, status_name: "prijatá"`) and are the names the
     status_name / type_name / … parameters accept.
 
 
@@ -731,7 +727,7 @@ _LIST_TASKS_DESC = inspect.cleandoc(
     For filter combinations not expressible above, pass sb_raw as an sb filter
     object for the CDESK API v3 task list (JSON string or object, structured
     tree form; see docs/cdesk-api-v3.json).
-    Only the LIVE-VERIFIED working columns are applied
+    Only the columns known to work are applied
     server-side (id, code, status, type_id, solver_id, place_id,
     company_id, request_id, deal_id, project_contract_id,
     created_at, updated_at, close_date (W3C datetime values),
@@ -754,7 +750,7 @@ _GET_TASK_DESC = inspect.cleandoc(
 
     Enum fields carry their label alongside: `status_name`, `type_name`,
     `type_2nd_name`, `place_name`, `assign_name` sit next to the raw enum id
-    (e.g. `status: 183850, status_name: "prijatá"`) and are the names the
+    (e.g. `status: <id>, status_name: "prijatá"`) and are the names the
     status_name / type_name / … parameters accept.
 
     fieldset selects the field group returned: "base", "extended"
@@ -762,8 +758,8 @@ _GET_TASK_DESC = inspect.cleandoc(
     "custom". Despite the name, "custom" is NOT empty and is not
     user-defined custom fields — on this module it returns the joined and
     computed extras (nested `solver`/`company`/`statusObj` objects,
-    `task_watchers_ids`, `is_completed`, `rights`, …). Live field counts on
-    this tenant: base 7, extended 24, custom 31, all 55.
+    `task_watchers_ids`, `is_completed`, `rights`, …). Typical field counts:
+    base 7, extended 24, custom 31, all 55.
 
     fields: an exact whitelist of field names to return (CDESK's
     returnFields). Composes with fieldset as a union; unknown names are
@@ -773,15 +769,14 @@ _GET_TASK_DESC = inspect.cleandoc(
 
 _GET_TASK_ENUMS_DESC = inspect.cleandoc(
     """
-    Return the cached lookup tables for the Task module. Each bucket name
-    maps to a list of records with id, display name, and any localized
-    name variants. Use this to discover which status / type / tag names
-    are valid for create_task / update_task / set_task_status in the
-    current CDESK tenant.
+    Return the lookup tables for the Task module, read from CDESK on every
+    call. Each bucket name maps to a list of records with id, display name,
+    and any localized name variants. Use this to discover which status /
+    type / tag names are valid for create_task / update_task /
+    set_task_status in the current CDESK tenant.
 
-    Pass refresh=True to force a fresh fetch (after an admin adds new
-    enum values, for example). Cache auto-refreshes on resolve-miss and
-    after a 1-hour TTL.
+    Values are never cached between calls, so a value an admin has just
+    added or switched off shows up at once; `refresh` makes no difference.
     """
 )
 

@@ -1,17 +1,19 @@
-"""Customer module MCP tools (M8).
+"""Customer module MCP tools.
 
-Seven tools that expose CDESK's Customer v3 CRUD + an intent helper +
-the custom-field catalog.
-Mirrors the M7 Task tools pattern (CdeskClient + filter builder + error
-translator), minus the enum cache (no /v3/company/enums endpoint).
+Tools that expose CDESK's Customer v3 CRUD + an intent helper + the
+custom-field catalog. Mirrors the Task tools pattern (CdeskClient + filter
+builder + error translator), minus the enum cache (no /v3/company/enums
+endpoint).
 
 Optimistic locking is hidden: update_customer internally does GET → grab
 timestamp_check → PUT. The LLM never sees the version token. CDESK reads
 `timestamp_check` from the PUT body despite the OpenAPI spec claiming
-`updated_at` — verified against BaseModel::hasBeenUpdated in M7.
+`updated_at`.
 """
 
 from __future__ import annotations
+
+import asyncio
 
 import inspect
 from typing import Any
@@ -29,7 +31,7 @@ from cdesk_mcp.field_policy import (
     refuse_if_violated,
     violations,
 )
-from cdesk_mcp.filters import build_customer_filter, encode_sb
+from cdesk_mcp.filters import adapt_sb_for_cdesk, build_customer_filter, encode_sb, ensure_fill_start_date_window
 from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
     drop_empty_fields,
@@ -48,24 +50,31 @@ from cdesk_mcp.tools._helpers import (
     validate_fieldset,
     yn as _yn,
 )
+from cdesk_mcp.tools._local_filter import (
+    NOT_EQUAL_CMP,
+    RANGE_CMPS,
+    ColumnRule,
+    filtered_page,
+    numeric_picker,
+    split_conditions,
+)
 from cdesk_mcp.tz import localize_naive_datetime
 
 # LLM-friendly name → CDESK field name. Centralised so the LLM vocabulary
 # stays clean while CDESK quirks live in one place.
 _CUSTOMER_CREATE_FIELDS = {
     "tag_ids": "tag_id",  # CDESK uses singular `tag_id` for an array of int ids
-    "postal_code": "zip",  # M8.11: avoid shadowing the Python `zip()` builtin
+    "postal_code": "zip",  # avoid shadowing the Python `zip()` builtin
 }
 
 _MAX_PER_PAGE = 100
 
 
-# What a customer write answers with (UAT low-priority L1): an older backend
-# sends the whole customer model back — ~25 kB on UAT, with a serialized PHP
-# settings blob and the mail-server configuration — and even the current one
-# carries empty fields. None of it tells the model anything about the write
-# (passwords were already masked by redact_secrets). get_customer still returns
-# a full record when asked.
+# What a customer write answers with: CDESK can send the whole customer model
+# back — tens of kB, with a serialized settings blob and the mail-server
+# configuration — plus many empty fields. None of it tells the model anything
+# about the write (passwords are already masked by redact_secrets).
+# get_customer still returns a full record when asked.
 _CUSTOMER_INTERNAL_PREFIXES = ("pop3_", "smtp_", "imap_", "broad_read_", "error_evaluation_")
 _CUSTOMER_INTERNAL_KEYS = frozenset({"auto_mail_server", "settings", "easyclickSettings"})
 
@@ -127,16 +136,30 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
             apply_field_scope(params, fieldset, fields)
             if sort:
                 params["sort"] = resolve_sort("customers", sort)
+            sb, local = split_conditions(adapt_sb_for_cdesk(sb, "customers"), _customer_condition)
             if sb is not None:
                 params["sb"] = encode_sb(sb)
-            response, paging = await client.get_page("v3/company", params=params)
+            local_info: dict[str, Any] | None = None
+            if not local:
+                response, paging = await client.get_page("v3/company", params=params)
+                records, meta = unwrap_list(response)
+            else:
+                records, meta, paging, local_info = await filtered_page(
+                    client, "v3/company", params, local, page=page, per_page=per_page,
+                    fields=fields, cap=_LOCAL_FILTER_CAP,
+                    narrow_hint="narrow the filter first (text_search, status, or another sb_raw condition such as company.city)",
+                    note="CDESK cannot apply these conditions; the connector "
+                         "fetched every customer matching the rest of the filter and "
+                         "applied the condition itself.",
+                )
         except ValueError as e:
             raise RuntimeError(f"list_customers input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="list_customers") from e
 
-        records, meta = unwrap_list(response)
         result = {"items": records, "meta": list_meta(meta, paging, dropped=dropped_clauses), "page": page, "per_page": per_page}
+        if local_info is not None:
+            result["filtered_by_connector"] = local_info
         if dropped_clauses:
             result["unsupported_filters"] = unsupported_filter_directive(dropped_clauses)
         return result
@@ -409,16 +432,56 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
     )
     async def delete_customer(id: int) -> dict[str, Any]:
         try:
+            linked = await _linked_records(client, id)
+        except Exception as e:
+            raise to_llm_error(e, operation="delete_customer", record_id=id) from e
+        if linked:
+            raise RuntimeError(
+                f"delete_customer refused: customer {id} still has "
+                f"{', '.join(linked)}. CDESK would delete the customer and leave "
+                f"those records pointing at a customer that no longer exists; "
+                f"move them to another customer or delete them first."
+            )
+        try:
             await client.delete(f"v3/company/{id}")
         except Exception as e:
             raise to_llm_error(e, operation="delete_customer", record_id=id) from e
-        # M8.10: match delete_task's `{deleted: <id>}` shape for consistency.
+        # Match delete_task's `{deleted: <id>}` shape for consistency.
         # CDESK's delete response shape varies (None for 204, envelope for 200);
         # the LLM doesn't need that — it just needs confirmation the id is gone.
         return {"deleted": id}
 
 
 # ---------- helpers (module-private) -------------------------------------
+
+# Records that point at a customer. CDESK refuses a customer delete only for
+# an open task: one with closed tasks or fills is deleted and those records
+# keep pointing at it. The list filter key per module, and how each is named.
+_LINKED_LISTS = (
+    ("v3/request", "id_company", "requests"),
+    ("v3/task", "company_id", "tasks"),
+    ("v3/fill", "company_id", "fills"),
+    ("v3/contract", "id_customer", "deals"),
+    ("v3/project", "company_id", "projects"),
+)
+
+
+async def _linked_records(client: CdeskClient, customer_id: int) -> list[str]:
+    """The kinds of record still linked to the customer, e.g. ["tasks"]."""
+
+    async def has_any(path: str, col: str) -> bool:
+        sb: dict[str, Any] = {"group": True, "o": "AND", "query": [
+            {"col": col, "c": "=", "q": customer_id, "o": "AND"},
+        ]}
+        if path == "v3/fill":
+            # Without a date window the fill list covers the current month only.
+            widened = ensure_fill_start_date_window(sb)
+            sb = widened if isinstance(widened, dict) else sb
+        rows, _ = unwrap_list(await client.get(path, params={"pg": 1, "pp": 1, "sb": encode_sb(sb)}))
+        return bool(rows)
+
+    found = await asyncio.gather(*(has_any(path, col) for path, col, _ in _LINKED_LISTS))
+    return [name for (_, _, name), hit in zip(_LINKED_LISTS, found) if hit]
 
 
 def _build_customer_body(raw: dict[str, Any]) -> dict[str, Any]:
@@ -437,11 +500,11 @@ async def _fetch_for_update(client: CdeskClient, id: int) -> dict[str, Any]:
     """Fetch a customer and unwrap to the record dict, ready to feed the
     optimistic lock into a follow-up PUT.
 
-    Per the M7 finding, CDESK reads `timestamp_check` from the PUT body
-    (not `updated_at`). We require it to be present in the GET response.
+    CDESK reads `timestamp_check` from the PUT body (not `updated_at`), so it
+    must be present in the GET response.
 
-    fieldset=all is required: the v3 fieldset default (`extended`) no longer
-    includes `timestamp_check` — only `all` carries it (verified live)."""
+    fieldset=all is required: the v3 fieldset default (`extended`) does not
+    include `timestamp_check` — only `all` carries it."""
     envelope = await client.get(f"v3/company/{id}", params={"fieldset": "all"})
     record = unwrap_record(envelope)
     if not isinstance(record, dict):
@@ -459,6 +522,17 @@ async def _fetch_for_update(client: CdeskClient, id: int) -> dict[str, Any]:
 
 # ---------- tool descriptions --------------------------------------------
 
+# Conditions CDESK cannot apply on the customer list, applied by the connector
+# (tools/_local_filter.py): a range on `hour_rate` answers HTTP 500 (BETWEEN
+# matches nothing), and a range or `!=` on `id` is read as equality.
+_LOCAL_FILTER_CAP = 2000
+_customer_condition = numeric_picker({
+    "hour_rate": ColumnRule(RANGE_CMPS),
+    "id": ColumnRule(RANGE_CMPS | {NOT_EQUAL_CMP}),
+})
+
+
+
 _LIST_CUSTOMERS_DESC = inspect.cleandoc(
     """
     List customers (companies / partners) visible to your account. Returns a
@@ -471,8 +545,8 @@ _LIST_CUSTOMERS_DESC = inspect.cleandoc(
       them at once (e.g. text_search="Bratislava").
     - sb_raw: an sb filter object for the CDESK API v3 company list (JSON
       string or object, structured tree form; see docs/cdesk-api-v3.json).
-      Advanced; mutually exclusive with the typed filters. Only the
-      LIVE-VERIFIED working columns are applied server-side — id, name,
+      Advanced; mutually exclusive with the typed filters. Only the columns
+      known to work are applied server-side — id, name,
       status, hour_rate, ico, dic, icdph, email, phone, created_at,
       updated_at (strict W3C datetimes), the dotted address columns
       company.city / company.street / company.zip / company.country, plus the
@@ -480,6 +554,18 @@ _LIST_CUSTOMERS_DESC = inspect.cleandoc(
       server-side — prefer it over paging the full set. Clauses on any other
       column (e.g. `code`, `company_num`, `type`, `sla_id`) are STRIPPED, and
       the response carries an `unsupported_filters` block naming them.
+      A range on hour_rate (>, >=, <, <=, BETWEEN), and a range or a
+      single-value '!=' on id, are applied by this tool, because CDESK
+      cannot compare them that way: it fetches every customer
+      matching the rest of the filter (up to 2000) and keeps the matching
+      ones; the result carries a `filtered_by_connector` block. Such a
+      condition must be joined to the rest by AND. `name` '=' with an
+      integer filters the customer id. Date presets (TODAY, THIS_WEEK, …)
+      on created_at / updated_at are sent as the BETWEEN window they name,
+      in tenant time; updated_at falls back to the creation date for a
+      customer never updated, so it is never empty. A list of values in
+      '=' or '!=' matches any / none of them. '!=' leaves out customers
+      with an empty value in that column.
 
     Pagination: page (1-based), per_page (default 20, max 100).
 
@@ -506,7 +592,7 @@ _GET_CUSTOMER_DESC = inspect.cleandoc(
     Despite the name, "custom" is NOT custom-fields-only: alongside
     `customFields` it returns ~40 joined and computed extras, including the
     tenant `settings` matrix, `easyclickSettings`, `solvers`, `sla` and the
-    shipping/invoicing address blocks (verified live 2026-07-31). It is a
+    shipping/invoicing address blocks. It is a
     LARGE payload — when you only need the stored cfield_* values, pass their
     exact keys via `fields` instead.
 
@@ -529,11 +615,10 @@ _GET_CUSTOMER_CUSTOM_FIELDS_DESC = inspect.cleandoc(
     (scalar for single-value fields; for select/relation fields send the
     option id); (4) read stored values via get_customer(id, fieldset="all").
 
-    KNOWN LIMITATION (2026-06-04): the tenant currently ignores
-    customFields writes silently — values do not persist. After any
-    write, a get_customer(id, fieldset="custom") read shows whether the
-    value actually persisted; a value that did not stick was not
-    stored despite the 200 (backend fix pending).
+    KNOWN LIMITATION: the tenant currently ignores customFields writes
+    silently — values do not persist. After any write, a
+    get_customer(id, fieldset="custom") read shows whether the value actually
+    persisted; a value that did not stick was not stored despite the 200.
     """
 )
 
@@ -638,8 +723,10 @@ _UPDATE_CUSTOMER_DESC = inspect.cleandoc(
 
 _DELETE_CUSTOMER_DESC = inspect.cleandoc(
     """
-    Delete a customer by id. Fails with 409 if the customer has dependent
-    records (deals, tasks, requests, etc.). The 409 names the blocking
-    links, which have to be broken before the delete can succeed.
+    Delete a customer by id. Refused while any request, task, fill, deal or
+    project still belongs to the customer (open or closed); the error names
+    which kinds, and those records have to be moved to another customer or
+    deleted first. Before deleting, the tool checks each of these lists for
+    the customer.
     """
 )

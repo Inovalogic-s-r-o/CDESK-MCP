@@ -14,11 +14,8 @@ GET (fieldset=all) → mutate → PUT, echoing the `timestamp_check` token; the 
 never sees it. The backend hard-blocks writes to already-invoiced fills (HTTP
 409) — that surfaces through the normal error translator.
 
-Live-audited 2026-06-24 (scripts/probe_fill_filters.py): the date window filters
-via a `start_date` BETWEEN leaf (built by build_fill_filter). That audit also
-found the list defaulting to the CURRENT CALENDAR MONTH with no window, but the
-backend has since CHANGED: re-verified 2026-07-31, a windowless list returned
-fills dated four months back. Do not rely on an implicit month bound.
+The date window filters via a `start_date` BETWEEN leaf (built by
+build_fill_filter). A windowless list has no implicit month bound.
 """
 
 from __future__ import annotations
@@ -59,11 +56,9 @@ from cdesk_mcp.tz import localize_naive_datetime, tenant_timezone
 _MAX_PER_PAGE = 100
 
 # assign_id → the body field that MUST accompany it. Used for a clear
-# client-side error instead of the backend's opaque 400. Backend constants
-# (Model/Fill.php getEnumAssign). 7 = days-off is NOT a valid fill parent:
-# CDESK refuses it every time with "Vyberte väzbu" (verified live on cmpp
-# 2026-10-12; getEnumAssign(true) leaves ASSIGN_DAYSOFF out) — days-off fills
-# are made by the days-off module, not here.
+# client-side error instead of the backend's opaque 400. 7 = days-off is NOT a
+# valid fill parent: CDESK refuses it every time with "Vyberte väzbu" —
+# days-off fills are made by the days-off module, not here.
 _ASSIGN_PARENT: dict[int, str] = {
     1: "company_id",
     2: "deal_id",
@@ -71,6 +66,11 @@ _ASSIGN_PARENT: dict[int, str] = {
     4: "work_order_id",
     5: "task_id",
     6: "project_contract_id",
+}
+_PARENT_ASSIGN: dict[str, int] = {field: kind for kind, field in _ASSIGN_PARENT.items()}
+_ASSIGN_NAMES: dict[int, str] = {
+    1: "company", 2: "deal", 3: "request", 4: "work order", 5: "task",
+    6: "project contract",
 }
 
 
@@ -136,6 +136,7 @@ def register_fill_tools(
             )
             params: dict[str, Any] = {"pg": page, "pp": per_page}
             apply_field_scope(params, fieldset, fields)
+            added_times = _ask_for_list_times(params, fields)
             if sort:
                 params["sort"] = resolve_sort("fills", sort)
             if sb is not None:
@@ -150,6 +151,11 @@ def register_fill_tools(
 
         records, meta = unwrap_list(response)
         warning = await _add_list_minutes(client, records, params)
+        if added_times:
+            records = [
+                {k: v for k, v in r.items() if k not in added_times} if isinstance(r, dict) else r
+                for r in records
+            ]
         result: dict[str, Any] = {"items": records, "meta": list_meta(meta, paging, dropped=dropped_clauses), "page": page, "per_page": per_page}
         if warning:
             result["warnings"] = [warning]
@@ -255,7 +261,7 @@ def register_fill_tools(
             valid_from, valid_to = localized_from, localized_to
             _ensure_chronological(valid_from, valid_to)
             # The worker is always required — by the CDESK form and the API
-            # ("Zadajte riešiteľa", verified live on cmpp 2026-10-12).
+            # ("Zadajte riešiteľa").
             if solver_id is None:
                 raise ValueError("solver_id (the worker) is required")
             # The tenant's fill FORM rules, read live from core/base-config (fill
@@ -359,21 +365,24 @@ def register_fill_tools(
             valid_to = localize_naive_datetime("valid_to", valid_to)
             if valid_from is not None and valid_to is not None:
                 _ensure_chronological(valid_from, valid_to)
+            parents = {
+                "company_id": company_id,
+                "deal_id": deal_id,
+                "request_id": request_id,
+                "work_order_id": work_order_id,
+                "task_id": task_id,
+                "project_contract_id": project_contract_id,
+            }
             # Changing assign_id requires sending the new matching parent id.
             if assign_id is not None:
-                _validate_assign(
-                    assign_id,
-                    {
-                        "company_id": company_id,
-                        "deal_id": deal_id,
-                        "request_id": request_id,
-                        "work_order_id": work_order_id,
-                        "task_id": task_id,
-                        "project_contract_id": project_contract_id,
-                    },
-                )
+                _validate_assign(assign_id, parents)
 
             current = await _fetch_for_update(client, id)
+            # Without a new assign_id the stored one decides which parent
+            # CDESK keeps.
+            stored_assign = current.get("assign_id")
+            if assign_id is None and stored_assign in _ASSIGN_PARENT:
+                _refuse_foreign_parents(stored_assign, parents)
             if valid_from is not None and valid_to is None:
                 current_to = current.get("valid_to")
                 if isinstance(current_to, str):
@@ -452,6 +461,23 @@ def _validate_assign(assign_id: int, parents: dict[str, Any]) -> None:
         raise ValueError(
             f"assign_id={assign_id} requires {required} to identify the parent"
         )
+    _refuse_foreign_parents(assign_id, parents)
+
+
+def _refuse_foreign_parents(assign_id: int, parents: dict[str, Any]) -> None:
+    """A fill is linked to its company plus the ONE parent its assign_id names;
+    CDESK answers 200 and drops any other parent id, so the link the caller
+    meant would be lost without a word."""
+    required = _ASSIGN_PARENT.get(assign_id)
+    for field, value in parents.items():
+        if value is None or field in ("company_id", required):
+            continue
+        raise ValueError(
+            f"assign_id={assign_id} ({_ASSIGN_NAMES[assign_id]}) links the fill only "
+            f"to {required}; CDESK does not store {field} on it. To log the work on "
+            f"that record, use assign_id={_PARENT_ASSIGN[field]} "
+            f"({_ASSIGN_NAMES[_PARENT_ASSIGN[field]]}); otherwise leave {field} out."
+        )
 
 
 async def _fetch_for_update(client: CdeskClient, id: int) -> dict[str, Any]:
@@ -486,24 +512,42 @@ _FILL_CREATE_FIELDS: dict[str, str] = {
     # The deal link: the tool param is `deal_id` (CDESK calls the module
     # Zákazky), but the CDESK body field is still `contract_id`. Sending
     # `deal_id` is silently ignored and the create is then rejected with
-    # 'Vyberte zákazku' (code 4) — verified live 2026-07-31.
+    # 'Vyberte zákazku' (code 4).
     "deal_id": "contract_id",
 }
 
 
 # --- worked time -------------------------------------------------------------
-# CDESK sends a fill's time in two shapes under one name (Model/Fill.php
-# transformFill, live-verified on cmpp 2026-10-12):
+# CDESK sends a fill's time in two shapes under one name:
 #   - the detail / write response `duration`: the STORED worked time in seconds —
 #     valid_to − valid_from plus `other_time` (the correction, seconds), set on
-#     every save (Fill.php 1012-1023); what CDESK bills and sums in reports;
+#     every save; what CDESK bills and sums in reports;
 #   - the list `duration`: TEXT of the from→to span only ("1h"), without the
-#     correction; the stored seconds are `durationSeconds`, sent only with
-#     fieldset=all. `other_time` is text there too ("30min").
+#     correction; the stored seconds are `durationSeconds`, sent with
+#     fieldset=all or when named in `returnFields[]`. `other_time` is text
+#     there too ("30min").
 # Every fill result therefore gets `duration_minutes` / `other_time_minutes`
 # (int), the stored worked time and its correction, computed the same way.
 
 _LIST_TIME_FIELDS = ["id", "durationSeconds", "other_time_h"]
+_LIST_TIME_COLUMNS = ("durationSeconds", "other_time_h")
+
+
+def _ask_for_list_times(params: dict[str, Any], fields: list[str] | None) -> list[str]:
+    """Add the time columns to the list request: on fills a fieldset and
+    `returnFields[]` combine, so the page itself carries them and no second
+    read is needed. Returns the columns the caller did not ask for, to be
+    removed from the rows again."""
+    if fields:
+        added = [c for c in _LIST_TIME_COLUMNS if c not in fields]
+        params["returnFields[]"] = [*fields, *added]
+        return added
+    if params.get("fieldset") == "all":
+        return []
+    params.setdefault("fieldset", "extended")
+    params["returnFields[]"] = list(_LIST_TIME_COLUMNS)
+    return list(_LIST_TIME_COLUMNS)
+
 
 
 def _minutes(seconds: Any) -> int | None:
@@ -630,14 +674,10 @@ _LIST_FILLS_DESC = inspect.cleandoc(
     is text too ("30min"); get_fill returns both in seconds.
 
     Date window: pass worked_from / worked_to (ISO-8601) to scope the search to
-    a work-date range. There is NO implicit month bound — re-verified live
-    2026-07-31 with fills dated one and four months back, both of which a
-    windowless call returned. (An earlier audit on 2026-06-24 found the v1 list
-    limited to the current calendar month; the backend changed, so older notes
-    and any code written against that assumption are stale.) A windowless call
-    is therefore the whole visible set, not just this month.
+    a work-date range. There is NO implicit month bound: a windowless call
+    is the whole visible set, not just this month.
 
-    Common filters (all live-verified 2026-06-24):
+    Common filters:
       - worked_from / worked_to: work-date window (bounds fills.valid_from via a
         start_date BETWEEN; a one-sided bound is extended to far past/future).
       - solver_id / company_id / request_id / deal_id: int or list[int].
@@ -649,7 +689,7 @@ _LIST_FILLS_DESC = inspect.cleandoc(
 
     For advanced filters pass sb_raw as an sb filter object for the CDESK API v3
     fill list (JSON string or object, structured tree form; see
-    docs/cdesk-api-v3.json). LIVE-VERIFIED working
+    docs/cdesk-api-v3.json). Working
     columns: fill_id, assign_id, company_id, solver_id, request_id, deal_id,
     project_contract_id, place_id, description (CONTAINS), used_material
     (CONTAINS), task, deal, work_order (ISNULL/ISNOTNULL link filters),
@@ -659,8 +699,8 @@ _LIST_FILLS_DESC = inspect.cleandoc(
     start_date (BETWEEN or =, strict W3C bounds), plus the no-col text leaf. The
     documented `request` key and the whole `end_date` column are NOT honored and
     are stripped (`end_date` is not in the allowlist at all — bound the window
-    through `start_date` instead, which accepts `=` as well as BETWEEN;
-    verified live 2026-07-31) — clauses on any other column are reported in `unsupported_filters`
+    through `start_date` instead, which accepts `=` as well as BETWEEN) —
+    clauses on any other column are reported in `unsupported_filters`
     for you to apply client-side after paging the full set.
     """
 )
@@ -693,7 +733,9 @@ _CREATE_FILL_DESC = inspect.cleandoc(
     dictates which parent id is REQUIRED: 1=company→company_id, 2=deal→
     deal_id, 3=request→request_id, 4=work order→work_order_id, 5=task→
     task_id, 6=project contract→project_contract_id. (Days-off fills are not
-    created here — CDESK refuses assign_id 7.)
+    created here — CDESK refuses assign_id 7.) A fill is linked to its
+    company_id plus that one parent; any other parent id is refused, because
+    CDESK does not store it.
 
     valid_from / valid_to (ISO-8601; an explicit offset like +02:00 is
     recommended — a naive datetime is read as tenant-local) are required and
@@ -714,7 +756,7 @@ _CREATE_FILL_DESC = inspect.cleandoc(
 
     Side effects (by CDESK): a fill on a request in "prijaté" or "priradené" moves
     that request to "v riešení" (action code 30) on tenants with the automatic
-    status change after a fill (live on cmpp 2026-10-12: 10 → 30).
+    status change after a fill.
     """
 )
 
@@ -722,7 +764,9 @@ _UPDATE_FILL_DESC = inspect.cleandoc(
     """
     Update a fill (partial — send only the fields to change). Optimistic locking
     and the version token are handled internally (GET → mutate → PUT). Changing
-    `assign_id` requires sending the new matching parent id. An already-invoiced
+    `assign_id` requires sending the new matching parent id; a parent id that
+    does not match the fill's assign_id (the new one, else the stored one) is
+    refused, because CDESK does not store it. An already-invoiced
     fill is write-blocked (HTTP 409) unless you hold the invoiced-write right.
     The worked time follows valid_from / valid_to plus `other_time` (seconds),
     recomputed by CDESK on every save; the result carries `duration_minutes`.

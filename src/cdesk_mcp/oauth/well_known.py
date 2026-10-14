@@ -15,8 +15,7 @@ de-prefixed companion route. Its body still advertises the fully-prefixed
 ``resource`` + ``authorization_servers`` (so the token audience and OAuth
 endpoints stay correct); only the route *path* is stripped to match the proxy.
 
-No-op when ``CDESK_PUBLIC_URL`` has no path (root hosting, e.g. the dev-tunnel
-``/host-cdesk`` flow) — the SDK's own root-level routes already serve everything.
+No-op when ``CDESK_PUBLIC_URL`` has no path (root hosting) — the SDK's own root-level routes already serve everything.
 """
 
 from __future__ import annotations

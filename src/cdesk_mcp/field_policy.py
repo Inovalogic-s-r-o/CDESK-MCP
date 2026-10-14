@@ -8,12 +8,12 @@ or left out. The same tables feed the `fields` block of the get_*_enums tools,
 so what the model is shown and what the write tools enforce cannot drift.
 
 What lives here is CDESK's form logic — which setting controls which field and
-what each value means — read from the backend source (FormConfig.php ngIf /
-ngRequired and the models' validate()) and the same on every tenant. The
-setting VALUES are tenant data and are always read live by the caller.
+what each value means — mirroring CDESK's own form configuration and model
+validation, the same on every tenant. The setting VALUES are tenant data and
+are always read live by the caller.
 
 Not covered, by design: fields without a setting (fixed rules, enforced by the
-tools as before), the calling user's rights (not readable through the API —
+tools directly), the calling user's rights (not readable through the API —
 CDESK drops a value the user may not write, and the write tools warn), and
 per-record rules (service area per customer/category, SLA-computed deadlines),
 which CDESK checks itself. A setting the tenant does not report leaves its
@@ -92,8 +92,7 @@ def switch(path: str) -> Callable[[Mapping[str, Any]], tuple[State, str] | None]
     return decide
 
 
-# --- requests (v3/request/enums `config`; Model/Request.php getFields/validate,
-#     Model/Request/RequestColumnsTrait.php, Module/Request/Module.php) ---------
+# --- requests (v3/request/enums `config`) -------------------------------------
 
 def _request_solver(s: Mapping[str, Any]) -> tuple[State, str] | None:
     group = _get(s, "use_solver_group")
@@ -118,7 +117,7 @@ def _request_title(s: Mapping[str, Any]) -> tuple[State, str] | None:
 
 def _request_cat_type(s: Mapping[str, Any]) -> tuple[State, str] | None:
     # The category type is also kept while service areas are on — the form
-    # needs it to pick an area (RequestColumnsTrait.php cat_type block).
+    # needs it to pick an area.
     level = _int(_get(s, "enumCatTypes.status"))
     if level is None:
         return None
@@ -144,11 +143,11 @@ def _request_desired_date(s: Mapping[str, Any]) -> tuple[State, str] | None:
 
 
 def _request_due_date(s: Mapping[str, Any]) -> tuple[State, str] | None:
-    # Request/FormConfig.php due_date: shown while dueDate.enabled; the form
-    # marks it required by dueDate.required, but it prefills the date from the
-    # SLA, so a create without one is not refused here — CDESK fills or refuses
-    # it. The fixed-due-date checkbox only exists with fixedDueDate.enabled
-    # (FE edit/basic.twig), which the backend checks only on create.
+    # Shown while dueDate.enabled; the form marks it required by
+    # dueDate.required, but it prefills the date from the SLA, so a create
+    # without one is not refused here — CDESK fills or refuses it. The
+    # fixed-due-date checkbox only exists with fixedDueDate.enabled, which
+    # CDESK checks only on create.
     enabled = _get(s, "dueDate.enabled")
     if enabled is None:
         return None
@@ -180,8 +179,7 @@ REQUEST_FIELDS: tuple[FieldRule, ...] = (
 )
 
 
-# --- deals (v3/contract/enums `settings`; Module/Contract/FormConfig.php,
-#     Module/Contract/Module.php checkRequiredFields, Model/Contract.php) -------
+# --- deals (v3/contract/enums `settings`) -------------------------------------
 
 def _deal_code(s: Mapping[str, Any]) -> tuple[State, str] | None:
     level = _int(_get(s, "rc_code"))
@@ -196,10 +194,9 @@ def _deal_code(s: Mapping[str, Any]) -> tuple[State, str] | None:
 
 def _deal_cat_type(s: Mapping[str, Any]) -> tuple[State, str] | None:
     # The form shows it only while types.status > 0. `types` is written only
-    # when the "Typy zákazky" settings page is saved
-    # (Contract/Controller/Settings.php postTypeSettings), so a tenant that
-    # never saved it sends no `types` at all — and its form hides the field
-    # (confirmed in the cmpp UI 2026-10-12: disabled there until switched on).
+    # when the deal-type settings page ("Typy zákazky") is saved, so a tenant
+    # that never saved it sends no `types` at all — and its form hides the
+    # field.
     level = _int(_get(s, "types.status")) or 0
     where = f"types.status = {level}" if "types" in s else "types not set (never saved — form hides it)"
     if level == 2:
@@ -238,8 +235,8 @@ DEAL_FIELDS: tuple[FieldRule, ...] = (
 )
 
 
-# --- projects (v3/project?include_metadata `config`;
-#     Module/Project/FormConfig.php — CDESK's API itself enforces none) -------
+# --- projects (v3/project?include_metadata `config`; CDESK's API itself
+#     enforces none of these) ------------------------------------------------
 
 PROJECT_FIELDS: tuple[FieldRule, ...] = (
     FieldRule(("type_id", "type_name"), levels("type")),
@@ -254,8 +251,7 @@ PROJECT_FIELDS: tuple[FieldRule, ...] = (
 )
 
 
-# --- work orders (v1 workorder/settings `general`; Module/WorkOrder/FormConfig.php
-#     188-201, Module/WorkOrder/Module.php 782-788) -----------------------------
+# --- work orders (core/base-config `modules.workorder.settings`) -------------
 
 def _wo_assign_due(s: Mapping[str, Any]) -> tuple[State, str] | None:
     enabled = _get(s, "assignDueDate.enabled")
@@ -287,7 +283,7 @@ WORKORDER_FIELDS: tuple[FieldRule, ...] = (
 # task_settings / fill_settings / customer_settings below).
 
 def _task_type_2nd(s: Mapping[str, Any]) -> tuple[State, str] | None:
-    # Task/FormConfig.php: shown while type.status is on (and a type is chosen),
+    # Shown while type.status is on (and a type is chosen),
     # required when type2nd.status is 2.
     level = _int(_get(s, "type.status"))
     if level is None:
@@ -308,8 +304,8 @@ TASK_FIELDS: tuple[FieldRule, ...] = (
 
 
 def task_settings(base: Any) -> dict[str, Any] | None:
-    """The mapping TASK_FIELDS reads: modules.task.settings (what the task
-    form's `editCtrl.config` is) plus `task.taskWatchers` (BASE_CONFIG.task)."""
+    """The mapping TASK_FIELDS reads: modules.task.settings (the task form's
+    config) plus `task.taskWatchers`."""
     if not isinstance(base, Mapping):
         return None
     settings = _get(base, "modules.task.settings")
@@ -326,8 +322,8 @@ def _fill_description(s: Mapping[str, Any]) -> tuple[State, str] | None:
 
 
 def _fill_place(s: Mapping[str, Any]) -> tuple[State, str] | None:
-    # Fill/FE/template/edit/basic/core.twig: shown only while places are on
-    # system-wide AND fill.place.enabled > 0; FormConfig: required at 2.
+    # Shown only while places are on system-wide AND fill.place.enabled > 0;
+    # required at 2.
     level = _int(_get(s, "place.enabled"))
     if level is None:
         return None
@@ -338,8 +334,7 @@ def _fill_place(s: Mapping[str, Any]) -> tuple[State, str] | None:
 
 
 def _fill_billing_item(s: Mapping[str, Any]) -> tuple[State, str] | None:
-    # Fill/FE/js/editController.js showBillingItemSelect / isRequiredBillingItem:
-    # hidden while the deal module is off; required for every fill when both
+    # Hidden while the deal module is off; required for every fill when both
     # billingItemRequired and billingItemRequiredStrict are on (project-contract
     # fills only with billingItemForProjectContract). The non-strict case
     # depends on the record's parent — CDESK decides that one.
@@ -377,7 +372,7 @@ def fill_settings(base: Any) -> dict[str, Any] | None:
 
 
 def _customer_type(s: Mapping[str, Any]) -> tuple[State, str] | None:
-    # Customer/Module.php:959-967 — on CREATE a company needs a customer-type
+    # On CREATE a company needs a customer-type
     # tag when customer.customer_type is 2. The type tags are the ones
     # core/base-config lists as defaultCompanyTags.
     level = _int(_get(s, "customer_type"))
@@ -388,8 +383,8 @@ def _customer_type(s: Mapping[str, Any]) -> tuple[State, str] | None:
     return ("required" if level == 2 else "optional"), where
 
 
-# Address/contact fields: the customer form only ever REQUIRES them (ngRequired
-# at 2, never hidden — Customer/FormConfig.php). Apply on create and update.
+# Address/contact fields: the customer form only ever REQUIRES them (at 2; it
+# never hides them). Apply on create and update.
 CUSTOMER_UPDATE_FIELDS: tuple[FieldRule, ...] = (
     *(
         FieldRule((param,), levels(key, hidable=False))
@@ -432,14 +427,13 @@ def customer_type_tags(given_tag_ids: Any, settings: Any) -> list[int]:
 
 # --- CMDB configuration items -----------------------------------------------
 # The CI form's own config, read live: for a new CI the v1 `cmdb/type/{id}/template`
-# the web form loads (TypeController::__getTemplate, no ACL check), for an
-# existing one `v3/cmdb/ci/{id}?include_metadata=true` → `config`. Both already
-# apply the type's relations (1 off / 2 optional / 3 required) and the tenant's
-# switches (branches, places, cost centres, security attributes, BCM), so the
-# rules below only read enabled/required. What the config does not carry is the
-# category's form template (Module/CMDB/FE/template/<category>/tab/basic.twig):
-# a field missing from that template is off whatever the type says. Rules from
-# Module/CMDB/FormConfig.php `ci/edit` ngIf / ngRequired.
+# the web form loads (no ACL check), for an existing one
+# `v3/cmdb/ci/{id}?include_metadata=true` → `config`. Both already apply the
+# type's relations (1 off / 2 optional / 3 required) and the tenant's switches
+# (branches, places, cost centres, security attributes, BCM), so the rules below
+# only read enabled/required. What the config does not carry is the category's
+# form layout: a field missing from a category's form is off whatever the type
+# says (the _CI_WITH_* sets below).
 
 _CI_CATEGORIES = {
     3: "device", 4: "place", 5: "branch", 9: "service", 10: "general",
@@ -449,7 +443,7 @@ _CI_CATEGORIES = {
 _ALL_CI = frozenset(_CI_CATEGORIES)
 _CI_WITH_BRANCH = frozenset({3, 4, 9, 10, 13, 14, 15, 16})
 _CI_WITH_PLACE = frozenset({3, 9, 10, 13, 14, 15, 16})
-_CI_WITH_COSTCENTER = frozenset({3, 10, 12, 13, 14})  # also the backend's list
+_CI_WITH_COSTCENTER = frozenset({3, 10, 12, 13, 14})  # the same list CDESK checks
 _CI_WITH_OWNER = frozenset({3, 9, 10, 13, 14, 15, 16})
 _CI_WITH_COMPANY = _ALL_CI - {11}  # approver/manager/owner also need a company
 _CI_SERVICE = frozenset({9})
@@ -495,7 +489,7 @@ def _ci_name(s: Mapping[str, Any]) -> tuple[State, str] | None:
         return None
     if mode == 1:
         return "off", "name_generate = 1 (CDESK builds the name from a property; a given name is ignored)"
-    return "required", f"name_generate = {mode}"  # 2 = prefix: the backend still requires it
+    return "required", f"name_generate = {mode}"  # 2 = prefix: CDESK still requires it
 
 
 def _ci_company(s: Mapping[str, Any]) -> tuple[State, str] | None:
@@ -526,7 +520,7 @@ def _ci_statuses(s: Mapping[str, Any]) -> tuple[State, str] | None:
 
 def _ci_solver(relation: str, *, group: bool) -> Callable[[Mapping[str, Any]], tuple[State, str] | None]:
     # use_solver_group picks the solver GROUP field; the solver itself is then
-    # only offered once a group is chosen (solverSection.twig) — optional.
+    # only offered once a group is chosen — optional.
     def decide(s: Mapping[str, Any]) -> tuple[State, str] | None:
         decided = _ci_block(relation, _ALL_CI)(s)
         if decided is None or decided[0] == "off":
@@ -626,8 +620,8 @@ def ci_settings(form: Any, base: Any) -> dict[str, Any] | None:
         "config": config,
         "category_id": data.get("category_id"),
         "include_in_asset_management": None if asset is None else bool(asset),
-        # base-config carries a `request` block only while requests are on
-        # (Core/Module.php); without it the CI form runs in solver mode.
+        # base-config carries a `request` block only while requests are on;
+        # without it the CI form runs in solver mode.
         "use_solver_group": (
             None if not isinstance(base, Mapping)
             else isinstance(request, Mapping) and request.get("use_solver_group") is True
@@ -637,15 +631,13 @@ def ci_settings(form: Any, base: Any) -> dict[str, Any] | None:
 
 
 # --- request catalogs (v3/request-catalog/enums `config` = the request settings,
-#     plus core/base-config `request` / `project` / `fill`, as BASE_CONFIG in the
-#     form; Module/RequestCatalog/FormConfig.php `edit` and
-#     FE/template/edit/basic.twig) ---------------------------------------------
+#     plus core/base-config `request` / `project` / `fill`) ---------------------
 # `base_params.<key>` stands for one entry of the tools' base_params (its
 # `value`); the filing fields also have their own parameters. A hyperlink
-# template (type "X") shows only the link and its target (basic.twig 8-13).
+# template (type "X") shows only the link and its target.
 
 _HYPERLINK = "X"
-CHANGE_MANAGER_CUSTOM = 1  # ChangeManagement::TYPE_CUSTOM: a named change manager
+CHANGE_MANAGER_CUSTOM = 1  # CDESK's custom change-manager type: a named change manager
 
 
 def _catalog_hyperlink(s: Mapping[str, Any]) -> bool:
@@ -675,7 +667,7 @@ def _catalog_hyperlink_field(s: Mapping[str, Any]) -> tuple[State, str] | None:
 
 
 def _catalog_code(s: Mapping[str, Any]) -> tuple[State, str] | None:
-    # Catalog.php getFields: `code` is a writable field only while request
+    # `code` is a writable field only while request
     # codes are on; the form never requires it on a catalog.
     level = _int(_get(s, "code.status"))
     if level is None:
@@ -773,7 +765,7 @@ def _catalog_solver_group(s: Mapping[str, Any]) -> tuple[State, str] | None:
 
 
 def _catalog_base_switch(key: str) -> Callable[[Mapping[str, Any]], tuple[State, str] | None]:
-    """A BASE_CONFIG.request switch (> 0 shows the field)."""
+    """A base-config `request` switch (> 0 shows the field)."""
     def decide(s: Mapping[str, Any]) -> tuple[State, str] | None:
         request = _get(s, "base_request")
         if not isinstance(request, Mapping):

@@ -1,16 +1,16 @@
 """Tenant-local timezone handling for naive datetimes.
 
-WHY THIS EXISTS (bug found live 2026-06-05): CDESK's v3 API interprets a
-NAIVE datetime ("2026-06-05T08:00:00") as UTC — a task created with naive
-8:00–12:00 was stored as 08:00+00:00 and the tenant UI (Europe/Bratislava,
-CEST) displayed it as 10:00–14:00, two hours off what the user asked for.
-An EXPLICIT offset is honored correctly (08:00+02:00 → stored 06:00+00:00 →
-displayed 08:00). Users and LLMs naturally speak in wall-clock tenant time,
-so the MCP attaches the tenant offset to naive datetimes before sending.
+WHY THIS EXISTS: CDESK's v3 API interprets a NAIVE datetime
+("2026-06-05T08:00:00") as UTC — a task sent with naive 8:00–12:00 is stored
+as 08:00+00:00 and a tenant UI in Europe/Bratislava (CEST) displays it as
+10:00–14:00, two hours off what the user asked for. An EXPLICIT offset is
+honored correctly (08:00+02:00 → stored 06:00+00:00 → displayed 08:00).
+Users and LLMs naturally speak in wall-clock tenant time, so the MCP attaches
+the tenant offset to naive datetimes before sending.
 
 The tenant timezone comes from the CDESK_TIMEZONE env var (IANA name, e.g.
-"Europe/Bratislava" — the default, matching cmpp.seal.sk). The `tzdata`
-package provides the IANA database on Windows.
+"Europe/Bratislava" — the default). The `tzdata` package provides the IANA
+database on Windows.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ def tenant_timezone() -> tzinfo:
 
     Falls back to DEFAULT_TENANT_TZ on an unknown name, and to UTC only if
     even the default can't load (missing tzdata) — logged, never raised, so
-    a misconfigured timezone degrades to the old naive-as-UTC behavior
+    a misconfigured timezone degrades to CDESK's own naive-as-UTC reading
     instead of breaking every datetime-carrying tool. Cached for the process
     lifetime; tests clear via tenant_timezone.cache_clear()."""
     name = os.getenv("CDESK_TIMEZONE", "").strip() or DEFAULT_TENANT_TZ

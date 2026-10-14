@@ -1,8 +1,8 @@
 """Backwards-compatible re-export shim.
 
-The OAuth authorization-server implementation moved into the ``cdesk_mcp.oauth``
-package (provider / models / proxy / login). This module re-exports the public
-names so existing imports keep working. Prefer importing from ``cdesk_mcp.oauth``
+The OAuth authorization-server implementation lives in the ``cdesk_mcp.oauth``
+package (provider / models / proxy / login). This module re-exports its public
+names so imports of ``cdesk_mcp.oauth_provider`` keep working. Prefer importing from ``cdesk_mcp.oauth``
 directly.
 """
 

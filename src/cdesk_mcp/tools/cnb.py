@@ -1,12 +1,14 @@
-"""CNB-only MCP tools.
+"""MCP tools for the CNB-specific bulk CMDB export.
 
-The CNB customer server exposes one endpoint beyond the curated v3 surface:
-``GET /cnb/cmdb/export`` — a streamed dump of EVERY CMDB CI record with a fixed
-column set (no params, no paging, no field selection). On any non-CNB server it
-returns 404.
+CDESK servers configured for CNB expose one endpoint beyond the curated v3
+surface: ``GET /cnb/cmdb/export`` — a dump of EVERY CMDB CI record with a fixed
+column set and no field selection. It is paged: `pg` (1-based) and `pp`
+(max 5000) are REQUIRED, and a call without them is a 400 (code 6). On a server
+whose CMDB lacks the export's custom fields it answers code 14; the spec
+documents 404 for a server without the endpoint.
 
 Because the dump is the whole dataset, returning it inline would overwhelm the
-LLM's context. So ``export_cmdb_ci`` fetches it once, parks it in a per-tenant
+LLM's context. So ``export_cmdb_ci`` reads every page, parks the rows in a per-tenant
 TTL snapshot (``ExportSnapshotStore``) and returns a small manifest;
 ``get_cmdb_export_page`` serves windows of rows (with optional column
 projection) from that snapshot. Everything flows through tool results, so this
@@ -35,14 +37,21 @@ from cdesk_mcp.tools._helpers import to_llm_error, validate_fields
 
 _EXPORT_PATH = "cnb/cmdb/export"
 _MAX_PAGE = 500
+# Rows per export request — the server's maximum (`pp` above it is a 400).
+_EXPORT_PAGE_SIZE = 5000
+# Hard stop for the page loop (2.5M rows), so a server that ignored `pg` and
+# kept answering full pages could not loop forever.
+_MAX_EXPORT_PAGES = 500
 _NON_CNB_MSG = (
     "This CDESK server is not a CNB server, so the bulk CI export endpoint "
     "(cnb/cmdb/export) isn't available here — it exists only on the CNB customer "
     "server."
 )
-# CDESK signals "unknown/inaccessible property fields" as body-level code 14
-# (HTTP 200) or, per the OpenAPI spec, as HTTP 400. Same root cause either way:
-# the export's fixed column set references custom fields not present here.
+# CDESK signals "unknown/inaccessible property fields" as code 14 — as HTTP 400
+# or, on some servers, as HTTP 200 with a body-level error. The export's fixed
+# column set references custom fields not present on every server.
+# Code 14 is ALSO the "pp above the maximum" answer, so the message decides
+# whenever there is one; the bare code only when CDESK sent no text.
 _MISSING_FIELDS_CODE = 14
 
 
@@ -64,22 +73,22 @@ def _cdesk_errors(body: object) -> tuple[list[int], str]:
 
 
 def _is_missing_fields_error(codes: list[int], joined: str) -> bool:
-    if _MISSING_FIELDS_CODE in codes:
-        return True
     low = joined.lower()
-    # Locale-independent fallback: CDESK's Slovak phrasing names the property
-    # fields ("pole_vlastností") it couldn't resolve.
-    return "pole_vlastnos" in low or ("polia" in low and "prístupn" in low)
+    if low:
+        # CDESK's Slovak phrasing names the property fields ("pole_vlastností")
+        # it couldn't resolve; the pp-limit error shares code 14 but not this.
+        return "pole_vlastnos" in low or ("polia" in low and "prístupn" in low)
+    return _MISSING_FIELDS_CODE in codes
 
 
 def _missing_fields_msg(detail: str) -> str:
     base = (
         "The CNB CMDB export can't run on this CDESK server: its configured column "
         "set references CMDB custom fields that aren't defined (or aren't accessible) "
-        "here. This endpoint is wired to the production CNB tenant's CMDB schema, so "
-        "it typically fails on dev/test tenants that lack those custom fields. To run "
-        "it, use the production CNB tenant, or have the export's column configuration "
-        "repointed to fields that exist on this server."
+        "here. The export's columns are defined for the CNB tenant's CMDB schema, so "
+        "it fails on any server that lacks those custom fields. To run it, use the "
+        "CNB tenant, or have the export's column configuration repointed to fields "
+        "that exist on this server."
     )
     return f"{base} CDESK reported: {detail}" if detail else base
 
@@ -91,6 +100,16 @@ def _safe_json(response: httpx.Response | None) -> object:
         return response.json()
     except ValueError:
         return None
+
+
+def _export_rows(response: object) -> list[Any]:
+    """One page of the export: a raw JSON array, NOT a {data, ...} envelope
+    (an envelope is tolerated defensively)."""
+    if isinstance(response, list):
+        return response
+    if isinstance(response, dict) and isinstance(response.get("data"), list):
+        return list(response["data"])
+    return []
 
 
 def _columns_of(rows: list[Any]) -> list[str]:
@@ -113,6 +132,8 @@ def register_cnb_tools(
         annotations=ToolAnnotations(title="Export CMDB CI", readOnlyHint=True),
     )
     async def export_cmdb_ci() -> dict[str, Any]:
+        rows: list[Any] = []
+        truncated = False
         data = await base_config.load(client)
         if isinstance(data, dict) and data.get("cnb_server") is False:
             raise RuntimeError(
@@ -121,21 +142,34 @@ def register_cnb_tools(
                 "pages through CIs on any tenant."
             )
         try:
-            response = await client.get(_EXPORT_PATH)
+            for page in range(1, _MAX_EXPORT_PAGES + 1):
+                batch = _export_rows(await client.get(
+                    _EXPORT_PATH, params={"pg": page, "pp": _EXPORT_PAGE_SIZE},
+                ))
+                rows.extend(batch)
+                # The total and last-page flag come only as response headers,
+                # which the client does not surface, so a short page is the
+                # end. A page larger than `pp` means the server ignored paging
+                # and sent everything at once.
+                if len(batch) != _EXPORT_PAGE_SIZE:
+                    break
+            else:
+                truncated = True
         except httpx.HTTPStatusError as e:
             status = e.response.status_code if e.response is not None else None
             # The generic 404 translation says "Record not found", which is
-            # wrong here — a 404 means this server isn't a CNB server.
+            # wrong here — the spec's 404 means the endpoint does not exist on
+            # this server.
             if status == 404:
                 raise RuntimeError(_NON_CNB_MSG) from e
-            # Per the spec, 400 is the "invalid custom-field id" case.
             if status == 400:
-                _codes, joined = _cdesk_errors(_safe_json(e.response))
-                raise RuntimeError(_missing_fields_msg(joined)) from e
+                codes, joined = _cdesk_errors(_safe_json(e.response))
+                if _is_missing_fields_error(codes, joined):
+                    raise RuntimeError(_missing_fields_msg(joined)) from e
             raise to_llm_error(e, operation="export_cmdb_ci") from e
         except CdeskApiError as e:
-            # Live, CDESK delivers the invalid-fields case as HTTP 200 + a
-            # body-level error (code 14) rather than the spec's 400.
+            # Some servers deliver the invalid-fields case as HTTP 200 + a
+            # body-level error (code 14).
             codes, joined = _cdesk_errors(e.body)
             if _is_missing_fields_error(codes, joined):
                 raise RuntimeError(_missing_fields_msg(joined)) from e
@@ -143,16 +177,8 @@ def register_cnb_tools(
         except Exception as e:
             raise to_llm_error(e, operation="export_cmdb_ci") from e
 
-        # The endpoint returns a raw JSON array, NOT a {data, ...} envelope.
-        if isinstance(response, list):
-            rows = response
-        elif isinstance(response, dict) and isinstance(response.get("data"), list):
-            rows = response["data"]  # defensive: tolerate an unexpected envelope
-        else:
-            rows = []
-
         export_id = snapshot_store.put(rows)
-        return {
+        manifest: dict[str, Any] = {
             "export_id": export_id,
             "total_count": len(rows),
             "columns": _columns_of(rows),
@@ -165,6 +191,13 @@ def register_cnb_tools(
                 "a fresh export_cmdb_ci run yields a usable export_id."
             ),
         }
+        if truncated:
+            manifest["warnings"] = [
+                f"The export stopped after {_MAX_EXPORT_PAGES} pages of "
+                f"{_EXPORT_PAGE_SIZE} rows each, so it holds the first "
+                f"{len(rows)} rows and may not be the whole dataset."
+            ]
+        return manifest
 
     @mcp.tool(
         description=_PAGE_DESC,

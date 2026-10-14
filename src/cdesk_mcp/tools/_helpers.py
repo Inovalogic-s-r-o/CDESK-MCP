@@ -15,17 +15,11 @@ from typing import Any, Literal, NoReturn, TypeVar, cast
 
 from mcp.server.fastmcp import FastMCP
 
-from cdesk_mcp.enums import AmbiguousEnumNameError, EnumCache
+from difflib import SequenceMatcher
+
+from cdesk_mcp.enums import _FUZZY_MIN_RATIO, AmbiguousEnumNameError, EnumCache
 from cdesk_mcp.errors import translate_error
-
-
-# NOTE: the former INTENT_PREAMBLE / FIELD_SCOPE_PREAMBLE constants are gone.
-# They injected "…protocol: see this server's instructions." into ~40 tool
-# descriptions, which matches an Anthropic directory rejection pattern
-# ("Direct Claude to pull behavioral instructions from external sources") and
-# bought nothing: a host that drops the `instructions` field left the pointer
-# aimed at text the model never received. Both protocols now live ONLY in
-# server.py's `_SERVER_INSTRUCTIONS`. Do not reintroduce a pointer here.
+from cdesk_mcp.tz import tenant_timezone
 
 
 # Valid values for the `fieldset` query param on detail GETs (task /
@@ -34,12 +28,10 @@ from cdesk_mcp.errors import translate_error
 FIELDSETS = ("base", "extended", "all", "custom")
 
 # Appended to every description that exposes a free-text filter. CDESK's
-# whereSearch (Wrapper\BaseModel::whereSearch -> Str::splitText) splits the
-# value on whitespace and substring-matches each word INDEPENDENTLY, so a
-# multi-word value is not a phrase and word order is ignored. Live-verified on
-# v3/approval 2026-08-03: 'mandatory mcp' matched a record named "mcp test
-# mandatory" (that phrase occurs nowhere), 'and' matched "mandatory", and the
-# 1-char value 'a' matched 2 of 6 records. This matters beyond ergonomics —
+# text search splits the value on whitespace and substring-matches each word
+# INDEPENDENTLY, so a multi-word value is not a phrase and word order is
+# ignored: 'mandatory mcp' matches a record named "mcp test mandatory", and
+# 'and' matches "mandatory". This matters beyond ergonomics —
 # verify_claims checks that a quote is a literal substring of the record, NOT
 # that the record is the right one, so a false text match can survive
 # verification with an accurate quote from the wrong record.
@@ -119,7 +111,7 @@ def validate_custom_fields(custom_fields: Any) -> None:
 # Set while a tool that is not read-only runs (mark_write_tools). The enum
 # resolvers then refuse a value the tenant has switched off (in_use = 0), as
 # the CDESK form does; read-only tools — list filters — still accept it, since
-# old records can sit in a value that is no longer in use (UAT B13).
+# old records can sit in a value that is no longer in use.
 _WRITE_CALL: contextvars.ContextVar[bool] = contextvars.ContextVar("cdesk_write_call", default=False)
 
 
@@ -258,7 +250,7 @@ async def resolve_enum_field_or_raise(
 
 # Tenant settings that gate a whole enum bucket. When the bucket is absent it is
 # because the feature is off, not because the caller guessed wrong — see
-# EnumCache.bucket_is_absent and Module/Request/Module.php::getBaseRequestEnums.
+# EnumCache.bucket_is_absent.
 _BUCKET_GATE_SETTINGS: dict[str, str] = {
     "urgency": "request.priorityUrgencyImpact.enabled",
     "impact": "request.priorityUrgencyImpact.enabled",
@@ -273,8 +265,7 @@ def _raise_unknown_enum(cache: EnumCache, bucket: str, name: str, kind: str) -> 
     suggestions so the LLM can self-correct in one turn.
 
     When the bucket itself is absent, say so instead: no value can resolve, and
-    the old message sent the caller to an enums tool that would never list it —
-    a guaranteed loop."""
+    pointing the caller at an enums tool that never lists it would only loop."""
     if cache.bucket_is_absent(bucket):
         setting = _BUCKET_GATE_SETTINGS.get(bucket)
         gate = (
@@ -333,7 +324,7 @@ async def add_enum_names(
     CDESK returns enum fields as bare numbers, and for requests `priority: 2`
     is an ACTION CODE whose label may be "dlhodobá" while another entry is
     literally named "2 - vysoká" — read as a name, the number is the wrong
-    answer (UAT 2026-10-09). The raw value is kept untouched (write-warning
+    answer. The raw value is kept untouched (write-warning
     diffs and update paths read it); `<field>_name` is inserted right after it.
 
     Additive and best-effort: an existing key is never overwritten (CDESK's own
@@ -368,8 +359,8 @@ def enum_rows_name_map(rows: Any, by: str) -> dict[Any, str]:
 
     `lang_name` wins over `name` when present: the v1 work-order settings rows
     keep the base English text in `name` ("New") and the tenant's display name
-    in `lang_name` ("Nový", what the CDESK UI and the v3 enums show — cmpp
-    2026-10-09); in v3 rows the two are equal."""
+    in `lang_name` ("Nový", what the CDESK UI and the v3 enums show); in v3
+    rows the two are equal."""
     out: dict[Any, str] = {}
     if not isinstance(rows, list):
         return out
@@ -446,9 +437,8 @@ def wrap_collection(records: Any, *, kind: str) -> dict[str, Any]:
     FastMCP renders a returned list as one content block per item, so a bare
     `[]` becomes ZERO content blocks and the client reports "completed with no
     output" — which an LLM cannot distinguish from a transport failure or a
-    crash. Verified live 2026-07-29 on `get_user_custom_fields`,
-    `get_customer_custom_fields` and `get_cmdb_type_properties`: all three
-    returned nothing at all rather than an empty result.
+    crash (e.g. `get_user_custom_fields`, `get_customer_custom_fields` and
+    `get_cmdb_type_properties` on a tenant with no definitions).
 
     `kind` names what was being listed, for the empty-case note (e.g.
     "custom-field definitions for the User module").
@@ -496,9 +486,9 @@ REDACTED = "<redacted by cdesk-mcp>"
 
 # Credential detection is SEGMENT-aware, not substring-based. A bare substring
 # test looks right and is badly wrong: matching "password" anywhere in the key
-# destroyed three real non-credential columns on this tenant (verified live
-# 2026-07-29) — `password_files` ('N'), `conf_password_mode` ('0') and
-# `enable_password_change` (-1, which also got coerced int → str).
+# would mask real non-credential columns — `password_files` ('N'),
+# `conf_password_mode` ('0') and `enable_password_change` (-1, which would also
+# be coerced int → str).
 #
 # The distinguishing property: a credential key ENDS with the secret noun
 # (`pop3_password`, `smtp_password`, `api_secret`, `access_token`), while
@@ -509,10 +499,10 @@ REDACTED = "<redacted by cdesk-mcp>"
 # Nouns that are only credentials when the whole key matches — "key" alone would
 # eat `primary_key` / `foreign_key` / `sort_key`, so it is never a suffix rule.
 # Suffix rules are restricted to nouns that are ONLY ever credentials. "pass"
-# and "token" were suffix rules and over-reached: they classified plausible
-# names like `first_pass`, `next_token` and `page_token` as secrets, and a
-# boolean under such a key would be coerced to a string. They are matched as
-# whole keys below instead.
+# and "token" are not suffix rules: they would classify plausible names like
+# `first_pass`, `next_token` and `page_token` as secrets, and a boolean under
+# such a key would be coerced to a string. They are matched as whole keys
+# below instead.
 _SECRET_KEY_SUFFIXES = (
     "password", "passwd", "passphrase", "pwd", "secret",
 )
@@ -560,7 +550,7 @@ def redact_secrets(value: _Redactable) -> _Redactable:
 
     CDESK returns mailbox and integration credentials inside ordinary records:
     `create_customer`'s savedData carries `pop3_password`, `smtp_password` and
-    `broad_read_password` (observed live 2026-07-29). Those are the tenant's
+    `broad_read_password`. Those are the tenant's
     real secrets, and a tool result goes straight into the model's context and
     the client's transcript. `logging_setup` already keeps them out of the logs;
     this closes the same hole on the customer and user create/update/detail
@@ -594,12 +584,12 @@ def collect_cdesk_messages(response: Any) -> list[str]:
     """Every non-success message CDESK put in a 2xx body.
 
     A 200 does NOT mean the write landed as asked. Besides the top-level
-    `warnings` array (which `ApiV3Wrapper::appendIgnoredFieldWarnings` fills —
-    but only for `code` on the request module), CDESK carries a `msg` object
+    `warnings` array (which CDESK fills only for `code` on the request
+    module), CDESK carries a `msg` object
     keyed by severity: `{success: [...], warning: [...], error: [...]}`. Hard
     errors under `msg.error` are already raised by the client's
     `_raise_if_body_signals_error`; anything else there is advisory text that
-    explains why part of a write did not stick, and it was previously discarded.
+    explains why part of a write did not stick.
 
     Returns the messages verbatim, `success` excluded (that bucket carries "record
     saved" and email-notification noise).
@@ -641,32 +631,26 @@ def annotate_write_warnings(
     2. For each field in `check_fields` the caller SENT a truthy value for,
        if `savedData` echoes a different/empty value, synthesize a
        'silently dropped' warning. `field_notes` supplies the per-field reason,
-       which is where the value is: CDESK's `filterUnavailableFields` strips a
-       column when the tenant setting behind it is off or the account lacks the
-       write right (see RequestColumnsTrait::getUnavailableTableCols), and it
+       which is where the value is: CDESK strips a column when the tenant
+       setting behind it is off or the account lacks the write right, and it
        emits no message of its own except for `code`. Naming the setting turns
        "your value vanished" into something the user can act on.
     3. For each `customFields` entry the caller SENT a truthy value for,
        if it isn't echoed by `savedData` (nested customFields dict or
-       top-level cfield_* key), synthesize a warning — this tenant's
-       customFields writes never persist (200, savedData.customFields
-       null, read-back empty; verified live), and unknown keys are
-       accepted silently.
+       top-level cfield_* key), synthesize a warning — customFields writes
+       can fail to persist with a 200 (savedData.customFields null, read-back
+       empty), and unknown keys are accepted silently.
 
-    TWO ENVELOPES, and only one of them has `savedData` (probed live
-    2026-07-29 across all five modules that call this):
+    TWO ENVELOPES, and only one of them has `savedData`:
 
       * `{data: <id>, msg, savedData: {...}}` — requests, projects.
       * `{data: {...record...}, msg}` — customers, request-catalogs. NO
-        `savedData` at all, so gating solely on that key made this helper a
-        dead no-op for them: a customer `code` of 'ZZCODE1' came back as the
-        server-generated 'YO6EC9', and a catalog `code` came back '', both with
-        no warning. Hence the `data` fallback below; both echo `code` inside
-        `data`, so the diff is sound and cannot fire falsely.
+        `savedData` at all, so the diff falls back to `data` (a customer
+        `code` can come back server-generated, a catalog `code` empty); both
+        echo `code` inside `data`, so the diff is sound and cannot fire falsely.
       * `{data: <id>, msg}` — deals. A bare id is not a record, so there is
         nothing to diff and this stays a pass-through. A drop there is
-        undetectable without a re-read (deal `code` did store correctly
-        when probed).
+        undetectable without a re-read.
 
     Non-dict responses, and responses carrying neither a `savedData` dict nor a
     `data` dict, pass through unchanged (no false positives). Returns a shallow
@@ -724,7 +708,7 @@ def annotate_write_warnings(
 
 
 def notify_block_value(given: int | None) -> int | None:
-    """The `notify_block` a write sends (UAT B8): only what the call passed.
+    """The `notify_block` a write sends: only what the call passed.
     CDESK notifies by default; a call passes notify_block=1 when the user does
     not want a notification for that write."""
     return given
@@ -741,9 +725,9 @@ def without_notify_flags(body: dict[str, Any]) -> dict[str, Any]:
 
 
 def request_status_group(action_code: Any) -> str | None:
-    """CDESK's group of a request status action code (Model/Request.php:
-    GROUP_SOLVED_STATUSES / GROUP_CLOSED_STATUSES, open = below 80) — fixed
-    system codes, the same on every tenant. None for a code in no group."""
+    """CDESK's group of a request status action code (its solved and closed
+    status groups; open = below 80) — fixed system codes, the same on every
+    tenant. None for a code in no group."""
     if isinstance(action_code, bool) or not isinstance(action_code, int):
         return None
     if action_code < 80:
@@ -756,8 +740,8 @@ def request_status_group(action_code: Any) -> str | None:
 
 
 def task_status_group(action_code: Any) -> str | None:
-    """CDESK's group of a task status action code (Model/Task.php: open below
-    80, closed from 80)."""
+    """CDESK's group of a task status action code (open below 80, closed from
+    80)."""
     if isinstance(action_code, bool) or not isinstance(action_code, int):
         return None
     return "open" if action_code < 80 else "closed"
@@ -804,8 +788,8 @@ def unwrap_list(envelope: Any) -> tuple[list[Any], dict[str, Any]]:
     response envelope (and the v3 wrapper may add one more `data` layer:
     `{data: {data: [records], totalItems, ...}}`). Returns (records, meta).
 
-    Defensive against shape variations — we've seen `data: false` on the
-    enums endpoint, so we don't assume `data` is always the payload."""
+    Defensive against shape variations — the enums endpoint can answer
+    `data: false`, so `data` is not assumed to always be the payload."""
     inner = envelope
     if isinstance(inner, dict) and isinstance(inner.get("data"), dict):
         inner = inner["data"]
@@ -859,7 +843,7 @@ def unsupported_filter_directive(
     dropped: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """The `unsupported_filters` block a list tool attaches when sb_raw clauses
-    were stripped because the live endpoint doesn't honor their columns (see
+    were stripped because the endpoint doesn't honor their columns (see
     filters._strip_unsupported_cols). The backend would have silently ignored
     them and returned the unfiltered set anyway — this block makes that
     explicit by DESCRIBING what was and wasn't filtered.
@@ -872,17 +856,14 @@ def unsupported_filter_directive(
         the list ran UNFILTERED, so the whole original expression is still
         outstanding.
 
-    DELIBERATELY DECLARATIVE — do not turn this back into commands. This text
-    ships inside tool RESULTS, and an Anthropic directory rejection pattern is
-    telling Claude how to behave rather than describing what the tool does.
-    The former key was literally named `instructions_to_agent` and opened with
-    "MANDATORY — ... you MUST ... Never present these items as filtered",
-    which is indistinguishable in shape from a prompt-injection payload in the
-    one channel (tool output) that hosts treat as untrusted content. The
-    behavioural protocol it encoded is unchanged, just relocated to its
-    legitimate home: server.py's `_SERVER_INSTRUCTIONS` ("STRIPPED sb_raw
-    CLAUSES"). Keep this block stating FACTS about what the response contains;
-    the `instructions` field is where the obligation belongs."""
+    DELIBERATELY DECLARATIVE, not commands. This text ships inside tool
+    RESULTS — the channel hosts treat as untrusted content — and an imperative
+    there ("you MUST ... never present these items as filtered") is
+    indistinguishable in shape from a prompt-injection payload. A tool result
+    describes what it contains; it does not tell the model how to behave. The
+    behavioural rule lives in server.py's `_SERVER_INSTRUCTIONS` ("STRIPPED
+    sb_raw CLAUSES"). Keep this block stating FACTS about what the response
+    contains; the `instructions` field is where the obligation belongs."""
     if len(dropped) == 1 and dropped[0].get("entire_filter_dropped"):
         entry = dropped[0]
         cols = entry.get("unsupported_columns", [])
@@ -932,12 +913,12 @@ def forbid_unknown_arguments(mcp: FastMCP, tool_names: tuple[str, ...]) -> None:
     FastMCP validates a call against the tool's generated arg model, whose
     default `extra` policy is to DROP anything it doesn't recognize. For a
     read/write tool that mostly costs a silent no-op; for a LIST tool it is a
-    correctness bug — a filter the model believes it applied vanishes and the
+    correctness failure — a filter the model believes it applied vanishes and the
     unfiltered page comes back looking filtered. Flipping the model to
     `extra="forbid"` turns that into a validation error naming the key.
 
     Apply it per-module and per-tool rather than globally: rejecting every extra
-    a host might attach is a much wider blast radius than the bug justifies.
+    a host might attach is a much wider blast radius than the problem justifies.
     """
     # Tests register against a lightweight FakeMCP with no _tool_manager; the
     # guard keeps this a no-op there instead of breaking registration.
@@ -964,10 +945,9 @@ FIELDS_NOT_RETURNED_NOTE = (
 
 def fields_not_returned(fields: Any, records: Any) -> list[str]:
     """The requested `fields` that appear on none of the returned records — the
-    names CDESK silently dropped (UAT B10). Live on cmpp 2026-10-12: a known
-    field comes back even when null (`due_date: None`), an unknown one
-    (`bogus_field`, `req_due_date`, users' `id_company`) is simply absent.
-    Empty when there is nothing to compare (no fields, no records)."""
+    names CDESK silently dropped. A known field comes back even when null
+    (`due_date: None`), an unknown one (`bogus_field`, `req_due_date`, users'
+    `id_company`) is simply absent. Empty when there is nothing to compare (no fields, no records)."""
     if not isinstance(fields, list) or not fields:
         return []
     rows = [r for r in (records if isinstance(records, list) else [records]) if isinstance(r, dict)]
@@ -991,11 +971,10 @@ def _with_fields_check(result: Any, fields: Any) -> Any:
 
 
 # --- what the LLM receives: compact enum rows and list items ------------------
-# Measured live on cmpp 2026-10-12 (UAT low-priority item 4): get_fill_enums
-# answered 46k chars (~11.6k tokens), a request status row alone ~875 chars —
-# icon and colour styles, admin/sort/timestamp columns, internal settings flags
-# and the name in 8 languages; list_requests spent half its fields on empty
-# values (17 of 34), a CI 86 of 108. Only the model's context pays for this.
+# CDESK's enum rows carry icon and colour styles, admin/sort/timestamp columns,
+# internal settings flags and the name in every language, so an enums payload
+# runs to tens of thousands of characters; list items carry many empty values
+# (often half or more of their fields). Only the model's context pays for this.
 
 _ENUM_ROW_NOISE = frozenset({
     "custom_icon_class", "predefined_icon_color_class", "custom_icon_color_style",
@@ -1075,7 +1054,7 @@ def _compact_list_result(result: Any) -> Any:
 
 def _compact_write_result(result: Any) -> Any:
     # A write answers with the saved record; its empty fields say nothing about
-    # the write (an older backend sent ~200 of them per request — UAT L2).
+    # the write.
     if isinstance(result, dict) and isinstance(result.get("savedData"), dict):
         result["savedData"] = drop_empty_fields(result["savedData"])
     return result
@@ -1153,7 +1132,7 @@ def normalize_write_value(value: Any) -> Any:
         if len(text) <= 10:
             return parsed.date().isoformat()
         # The same instant in another offset is the same value: CDESK echoes a
-        # datetime sent as 09:30+01:00 back as 08:30+00:00 (live 2026-10-12).
+        # datetime sent as 09:30+01:00 back as 08:30+00:00.
         if parsed.tzinfo is not None:
             parsed = parsed.astimezone(timezone.utc)
         return parsed.isoformat()
@@ -1171,10 +1150,24 @@ def write_values_match(sent: Any, stored: Any) -> bool:
     if a == b:
         return True
     # A sent date without a time part matches a stored timestamp on the same day
-    # — that day as CDESK wrote it (its own offset), not the UTC instant.
+    # in tenant time: CDESK stores the bare date as tenant midnight and some
+    # modules echo it in UTC (2026-08-01 → 2026-07-31T22:00:00+00:00).
     if isinstance(a, str) and isinstance(b, str) and len(a) == 10 and isinstance(stored, str):
-        return stored.strip()[:10] == a
+        return _tenant_day(stored) == a
     return False
+
+
+def _tenant_day(value: str) -> str:
+    """The YYYY-MM-DD of a stored timestamp in tenant time; the literal date
+    part when it carries no offset or does not parse."""
+    text = value.strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00").replace(" ", "T", 1))
+    except ValueError:
+        return text[:10]
+    if parsed.tzinfo is None:
+        return text[:10]
+    return parsed.astimezone(tenant_timezone()).strftime("%Y-%m-%d")
 
 
 def apply_clear_fields(
@@ -1224,6 +1217,26 @@ def match_status_name(rows: Any, canon: str) -> int | None:
     return None
 
 
+def closest_row_names(rows: Any, name: str, max_count: int = 5) -> list[str]:
+    """The display names of the enum rows closest to `name`, scored against
+    `name` and every `lang_*` variant (diacritic- and case-insensitively) —
+    the "Did you mean" list for enum rows read without the cache. Rows below
+    the same similarity floor as EnumCache.find_candidates are left out."""
+    wanted = canon_name(name)
+    scored: list[tuple[float, str]] = []
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict) or not isinstance(row.get("name"), str):
+            continue
+        best = 0.0
+        for key, value in row.items():
+            if (key == "name" or _LANG_NAME_KEY.match(key)) and isinstance(value, str):
+                best = max(best, SequenceMatcher(None, canon_name(value), wanted).ratio())
+        if best >= _FUZZY_MIN_RATIO:
+            scored.append((best, row["name"]))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return list(dict.fromkeys(n for _, n in scored))[:max_count]
+
+
 def status_choices(rows: Any) -> str:
     """"code=name, ..." for an error message, from the tenant's status rows."""
     return ", ".join(
@@ -1231,3 +1244,46 @@ def status_choices(rows: Any) -> str:
         for row in (rows if isinstance(rows, list) else [])
         if isinstance(row, dict) and row.get("name")
     )
+
+
+async def fetch_all_rows(
+    client: Any,
+    path: str,
+    params: dict[str, Any],
+    *,
+    cap: int,
+    narrow_hint: str,
+    page_size: int = 100,
+) -> tuple[list[Any], dict[str, Any]]:
+    """Every row of a list endpoint matching `params` (paging params are
+    replaced), in CDESK's order, for filtering the connector applies itself
+    when CDESK cannot. Refuses with `narrow_hint` once more than `cap` rows
+    would be needed, so one call cannot pull an unbounded set. Returns
+    (rows, meta of the first page)."""
+    fetch = {k: v for k, v in params.items() if k not in ("pg", "pp")}
+    rows: list[Any] = []
+    meta: dict[str, Any] = {}
+    page = 1
+    while True:
+        response, paging = await client.get_page(path, params={**fetch, "pg": page, "pp": page_size})
+        batch, batch_meta = unwrap_list(response)
+        if page == 1:
+            meta = batch_meta
+        total = paging.get("total")
+        if (isinstance(total, int) and total > cap) or len(rows) + len(batch) > cap:
+            count = total if isinstance(total, int) and total > cap else f"more than {cap}"
+            raise ValueError(
+                f"this filter has to be applied by the connector to every matching "
+                f"record ({count}), more than the {cap} it checks; {narrow_hint}"
+            )
+        rows.extend(batch)
+        if len(batch) < page_size or (isinstance(total, int) and len(rows) >= total):
+            return rows, meta
+        page += 1
+
+
+def page_of(rows: list[Any], page: int, per_page: int) -> tuple[list[Any], dict[str, Any]]:
+    """The requested page of rows filtered by the connector, with the paging
+    info list_meta expects."""
+    start = (page - 1) * per_page
+    return rows[start:start + per_page], {"total": len(rows), "last_page": start + per_page >= len(rows)}

@@ -1,9 +1,8 @@
-"""Request module MCP tools (M12).
+"""Request module MCP tools.
 
 Ten tools that expose CDESK's Request v3 CRUD + intent helpers + the
-discussion sub-resource + the custom-field catalog to the LLM. Wires together CdeskClient (M3),
-EnumCache (M5, per-instance endpoint M12), filter builder (M6, M12), and
-error translator (M4).
+discussion sub-resource + the custom-field catalog to the LLM. Wires together
+CdeskClient, EnumCache, the filter builder, and the error translator.
 
 Optimistic locking is hidden: update_request and set_request_status
 internally do GET → mutate → PUT (re-using the `timestamp_check` from
@@ -79,16 +78,6 @@ _REQUEST_CREATE_FIELDS = {
     # client-side to ids — see create_request / update_request.
 }
 
-# Fields CDESK strips from a request write when the tenant feature behind them is
-# off or the account lacks the write right. Confirmed in the backend source
-# 2026-07-30: RequestModule::postIndex (which serves BOTH create and update) calls
-# CdRequest::filterUnavailableFields, which unsets every column listed by
-# RequestColumnsTrait::getUnavailableTableCols. The API returns 200 and emits NO
-# message of its own for any of these except `code`, so without this table the
-# value vanishes and the tool reports success.
-#
-# Keys are the WIRE names as they appear in the body and in savedData. Each note
-# names the setting and right, mirroring the wording CDESK uses for `code`.
 _REQUEST_TOOL_NAMES = (
     "list_requests",
     "get_request",
@@ -102,6 +91,13 @@ _REQUEST_TOOL_NAMES = (
     "post_request_discussion",
 )
 
+# Fields CDESK strips from a request write (create and update alike) when the
+# tenant feature behind them is off or the account lacks the write right. The
+# API returns 200 and emits NO message of its own for any of these except
+# `code`, so without this table the value vanishes and the tool reports success.
+#
+# Keys are the WIRE names as they appear in the body and in savedData. Each note
+# names the setting and right, mirroring the wording CDESK uses for `code`.
 _REQUEST_GATED_FIELDS: dict[str, str] = {
     "code": (
         "requires the tenant request-code feature (`request.code.status`) and the "
@@ -163,7 +159,7 @@ def _ensure_periodic_field(
     fieldset: str | None, fields: list[str] | None
 ) -> tuple[str | None, list[str] | None]:
     """Guarantee periodical_request_id is in the projection so `is_periodic` is
-    always derivable. The default (extended) fieldset omits it (verified live).
+    always derivable. The default (extended) fieldset omits it.
     returnFields[] ALONE is restrictive (the response is narrowed to just those
     keys), so when no `fields` whitelist is given we also pin an explicit
     fieldset for returnFields to compose as a UNION rather than a restriction.
@@ -184,11 +180,10 @@ def _ensure_periodic_field(
 
 
 # Enum-valued request fields and the label written next to each. Status and
-# priority are stored by enum ACTION CODE (cmpp: priority 0 = "3 - stredná",
-# status 10 = "prijaté"); `type` is the key of a key/value bucket ("H"); the
-# rest are enum ids. A write response's savedData uses the raw column names
-# (req_status / req_priority), hence the aliases. Bucket names are the ones
-# the write paths resolve against.
+# priority are stored by enum ACTION CODE (e.g. status 10 = "prijaté"); `type`
+# is the key of a key/value bucket ("H"); the rest are enum ids. A write
+# response's savedData uses the raw column names (req_status / req_priority),
+# hence the aliases. Bucket names are the ones the write paths resolve against.
 _REQUEST_ENUM_LABELS = (
     EnumLabel("status", "status", "status_name", by="action_code"),
     EnumLabel("req_status", "status", "status_name", by="action_code"),
@@ -210,8 +205,7 @@ _REQUEST_ENUM_LABELS = (
 
 def _auto_title(settings: Any, description: str | None) -> str | None:
     """The title CDESK's web form generates when auto-naming is on and the
-    title is left empty (Module/Request/FE/js/editController.js
-    generateRequestTitle): the description without HTML tags, cut to
+    title is left empty: the description without HTML tags, cut to
     `max_auto_name_characters` (CDESK default 40) plus "...". None when
     auto-naming is off or there is no description."""
     if not isinstance(settings, dict) or not settings.get("auto_name_enabled"):
@@ -236,17 +230,17 @@ async def _request_settings(cache: EnumCache) -> Any:
         return None
 
 
-# --- time fields (UAT B3) -----------------------------------------------------
+# --- time fields ---------------------------------------------------------------
 # `duration_open` and `duration_reaction` are SLA WORKING seconds, not calendar
-# time (Model/Request.php calcOpenDuration): counted only inside the operating
-# hours of the request's SLA (or the default SLA's), holidays left out, minus
+# time: counted only inside the operating hours of the request's SLA (or the
+# default SLA's), holidays left out, minus
 # the time spent in statuses that stop the SLA clock and in closed statuses.
 # `duration_open` is computed once, when the request is closed (0 while open,
 # reset to 0 on reopen, always 0 without an SLA); `duration_reaction` at the
 # first reaction (null until then). The v3 endpoints return both (with
 # fieldset=all and in write responses) but the v3 spec documents no request
-# response field at all. A status-change write echoes the unrounded float
-# (78.175556) where the record stores 78. So every request result gets
+# response field at all. A status-change write echoes an unrounded float
+# (e.g. 78.175556) where the record stores 78. So every request result gets
 # explicit, unit-named values next to the raw ones.
 
 _CREATED_KEYS = ("idatetime",)
@@ -386,9 +380,9 @@ def register_request_tools(
                 cache, "priority", priority_name, kind="priority", field="action_code"
             )
             place_id = await resolve_enum_or_raise(cache, "place", place_name, kind="place")
-            # Category type: the sb `type` column filters cat_type_id (backend
-            # JCD-32964). Resolve the NAME → cat_type_id via the same enum bucket
-            # create_request uses; base_type is the raw base-type letter.
+            # Category type: the sb `type` column filters cat_type_id. Resolve
+            # the NAME → cat_type_id via the same enum bucket create_request
+            # uses; base_type is the raw base-type letter.
             cat_type_id = await resolve_enum_or_raise(
                 cache, "cat_type_id", cat_type_name, kind="cat_type"
             )
@@ -427,8 +421,8 @@ def register_request_tools(
             if sort:
                 params["sort"] = resolve_sort("requests", sort)
             # Flat query param, NOT an sb column (an sb deleted_at clause is
-            # silently ignored). Verified live 2026-06-05: includeDeleted=1
-            # surfaces soft-deleted requests and composes with sb filters.
+            # silently ignored). includeDeleted=1 surfaces soft-deleted
+            # requests and composes with sb filters.
             # Requests are the ONLY module where this works — task/catalog
             # deletes are unreachable through the API.
             if include_deleted:
@@ -473,7 +467,7 @@ def register_request_tools(
             if fields:
                 params["returnFields[]"] = fields
             # Soft-deleted requests 404 on a plain GET; includeDeleted=1
-            # returns them (verified live 2026-06-05; request module only).
+            # returns them (request module only).
             if include_deleted:
                 params["includeDeleted"] = 1
             response = await client.get(f"v3/request/{id}", params=params or None)
@@ -627,7 +621,7 @@ def register_request_tools(
             # an off field is refused, a required one must be given
             # (field_policy.py). This names the parameter and the setting where
             # CDESK answers a bare "Vyberte riešiteľa". Priority has no such
-            # rule — CDESK takes the SLA's default (verified live, cmpp 2026-10-12).
+            # rule — CDESK takes the SLA's default.
             settings = await _request_settings(cache)
             refuse_if_violated(fixed + violations(
                 REQUEST_FIELDS, settings, {
@@ -645,28 +639,26 @@ def register_request_tools(
                 },
             ))
             # With auto-naming on, the CDESK web form fills an empty title from
-            # the description before saving; the server itself does not (live
-            # on cmpp 2026-10-12: a title-less create stored ''). Do what the
-            # form does so the request is not saved nameless.
+            # the description before saving; the server itself does not (a
+            # title-less create stores ''). Do what the form does so the
+            # request is not saved nameless.
             if title is None:
                 title = _auto_title(settings, description)
             validate_custom_fields(custom_fields)
             # Naive datetimes are interpreted as TENANT-LOCAL wall-clock time
             # and sent with an explicit offset — CDESK reads naive values as
-            # UTC (verified live 2026-06-05 on task valid_from; same backend
-            # datetime path). Bare dates pass through unchanged.
+            # UTC. Bare dates pass through unchanged.
             desired_date = localize_naive_datetime("desired_date", desired_date)
             due_date = localize_naive_datetime("due_date", due_date)
             calendar_date_start = localize_naive_datetime(
                 "calendar_date_start", calendar_date_start
             )
             invoice_date = localize_naive_datetime("invoice_date", invoice_date)
-            # first_conclusion is a TIMESTAMP column (apiportal db/cd_req.yml:313,
-            # migration 20190801161146), even though CDESK's own OpenAPI
-            # annotation declares it type="string" and our description used to
-            # repeat that. Text sent here was coerced to "0000-00-00 00:00:00"
-            # — a successful-looking write that corrupted the field. Validate it
-            # as a datetime so a non-date is rejected up front.
+            # first_conclusion is a TIMESTAMP column, even though CDESK's own
+            # OpenAPI annotation declares it type="string". Text sent to it is
+            # coerced to "0000-00-00 00:00:00" — a successful-looking write that
+            # corrupts the field. Validate it as a datetime so a non-date is
+            # rejected up front.
             first_conclusion = localize_naive_datetime(
                 "first_conclusion", first_conclusion
             )
@@ -683,9 +675,9 @@ def register_request_tools(
                     "provide either type_code or type_name, not both "
                     "(type_code would silently override type_name)"
                 )
-            # CDESK stores req_status and req_priority by the enum ACTION_CODE
-            # (verified live), NOT the enum id — sending the id overflows the
-            # tinyint column and silently defaults/corrupts the value.
+            # CDESK stores req_status and req_priority by the enum ACTION_CODE,
+            # NOT the enum id — sending the id overflows the tinyint column and
+            # silently defaults/corrupts the value.
             status_id = await resolve_enum_field_or_raise(
                 cache, "status", status_name, kind="status", field="action_code"
             )
@@ -734,8 +726,8 @@ def register_request_tools(
                     "description": description,
                     "status": status_id,
                     # The request `type` ("druh") is a string code (e.g. "H");
-                    # this tenant's type enum is key/value-shaped so type_name
-                    # can't resolve to an id. Prefer the explicit type_code.
+                    # where the type enum is key/value-shaped, type_name can't
+                    # resolve to an id. Prefer the explicit type_code.
                     "type": type_code if type_code is not None else type_id,
                     "priority": priority_id,
                     "urgency_id": urgency_id,
@@ -767,10 +759,10 @@ def register_request_tools(
                     "code": code,
                     "computer_code": computer_code,
                     # CDESK's wire `for_customer` flag is INVERTED vs its name —
-                    # wire True hides the request from the customer (verified
-                    # live: True -> hidden_for_customer=1). Send the negation so
-                    # this tool's for_customer=True means customer-VISIBLE, per
-                    # the param name + OpenAPI.
+                    # wire True hides the request from the customer (True ->
+                    # hidden_for_customer=1). Send the negation so this tool's
+                    # for_customer=True means customer-VISIBLE, per the param
+                    # name + OpenAPI.
                     "for_customer": (None if for_customer is None else not for_customer),
                     "user_entered_by": user_entered_by,
                     "contact_entered_by": contact_entered_by,
@@ -808,9 +800,9 @@ def register_request_tools(
             raise RuntimeError(f"create_request input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="create_request") from e
-        # solver_note: silently dropped like code (verified live 2026-06-05:
-        # PUT with solver_note is a complete no-op — 200, not stored,
-        # udatetime not even bumped). Diff both against savedData.
+        # Gated fields such as code and solver_note can be dropped silently (a
+        # PUT carrying solver_note is then a complete no-op — 200, not stored,
+        # udatetime not even bumped), so diff them against savedData.
         # Labels go on AFTER the diff, so it compares only CDESK's own keys.
         return await _label_write_result(cache, annotate_write_warnings(
             response if isinstance(response, dict) else {"data": response},
@@ -874,20 +866,18 @@ def register_request_tools(
             validate_custom_fields(custom_fields)
             # Naive datetimes are interpreted as TENANT-LOCAL wall-clock time
             # and sent with an explicit offset — CDESK reads naive values as
-            # UTC (verified live 2026-06-05 on task valid_from; same backend
-            # datetime path). Bare dates pass through unchanged.
+            # UTC. Bare dates pass through unchanged.
             desired_date = localize_naive_datetime("desired_date", desired_date)
             due_date = localize_naive_datetime("due_date", due_date)
             calendar_date_start = localize_naive_datetime(
                 "calendar_date_start", calendar_date_start
             )
             invoice_date = localize_naive_datetime("invoice_date", invoice_date)
-            # first_conclusion is a TIMESTAMP column (apiportal db/cd_req.yml:313,
-            # migration 20190801161146), even though CDESK's own OpenAPI
-            # annotation declares it type="string" and our description used to
-            # repeat that. Text sent here was coerced to "0000-00-00 00:00:00"
-            # — a successful-looking write that corrupted the field. Validate it
-            # as a datetime so a non-date is rejected up front.
+            # first_conclusion is a TIMESTAMP column, even though CDESK's own
+            # OpenAPI annotation declares it type="string". Text sent to it is
+            # coerced to "0000-00-00 00:00:00" — a successful-looking write that
+            # corrupts the field. Validate it as a datetime so a non-date is
+            # rejected up front.
             first_conclusion = localize_naive_datetime(
                 "first_conclusion", first_conclusion
             )
@@ -924,9 +914,9 @@ def register_request_tools(
                 },
                 update=True,
             ))
-            # CDESK stores req_status and req_priority by the enum ACTION_CODE
-            # (verified live), NOT the enum id — sending the id overflows the
-            # tinyint column and silently defaults/corrupts the value.
+            # CDESK stores req_status and req_priority by the enum ACTION_CODE,
+            # NOT the enum id — sending the id overflows the tinyint column and
+            # silently defaults/corrupts the value.
             status_id = await resolve_enum_field_or_raise(
                 cache, "status", status_name, kind="status", field="action_code"
             )
@@ -976,8 +966,8 @@ def register_request_tools(
                     "description": description,
                     "status": status_id,
                     # The request `type` ("druh") is a string code (e.g. "H");
-                    # this tenant's type enum is key/value-shaped so type_name
-                    # can't resolve to an id. Prefer the explicit type_code.
+                    # where the type enum is key/value-shaped, type_name can't
+                    # resolve to an id. Prefer the explicit type_code.
                     "type": type_code if type_code is not None else type_id,
                     "priority": priority_id,
                     "urgency_id": urgency_id,
@@ -1009,10 +999,10 @@ def register_request_tools(
                     "note": note,
                     "code": code,
                     # CDESK's wire `for_customer` flag is INVERTED vs its name —
-                    # wire True hides the request from the customer (verified
-                    # live: True -> hidden_for_customer=1). Send the negation so
-                    # this tool's for_customer=True means customer-VISIBLE, per
-                    # the param name + OpenAPI.
+                    # wire True hides the request from the customer (True ->
+                    # hidden_for_customer=1). Send the negation so this tool's
+                    # for_customer=True means customer-VISIBLE, per the param
+                    # name + OpenAPI.
                     "for_customer": (None if for_customer is None else not for_customer),
                     "planned_hours": planned_hours,
                     "hour_rate": hour_rate,
@@ -1027,8 +1017,8 @@ def register_request_tools(
             if custom_fields:
                 body["customFields"] = custom_fields
             if not _without_notify_flags(body):
-                # An update with no field still issued a PUT, which changed
-                # nothing and bumped `udatetime` on a destructive-hinted tool.
+                # An update with no field would still issue a PUT that changes
+                # nothing and bumps `udatetime` on a destructive-hinted tool.
                 # Fail before the write so "nothing happened" is explicit.
                 raise ValueError(
                     "nothing to update — pass at least one field besides `id`. "
@@ -1134,8 +1124,8 @@ def register_request_tools(
         # as [[], [], {...}, {...}], where the bare [] entries are
         # indistinguishable from empty records. Entries differ in shape (a
         # status-change entry has different keys from a posted message), so this
-        # is per-record: an all-or-nothing check missed the mixed case, which is
-        # the common one because any request with a status change is mixed.
+        # is per-record: the mixed case is the common one, because any request
+        # with a status change is mixed.
         kept = [r for r in records if not (isinstance(r, list) and not r)]
         dropped = len(records) - len(kept)
         result: dict[str, Any] = {"items": kept, "meta": meta}
@@ -1172,6 +1162,12 @@ def register_request_tools(
     ) -> dict[str, Any]:
         try:
             receivers = _validate_receiver_emails(discussion_receivers)
+            if notify_block == 1 and (receivers or notify_user_ids):
+                raise ValueError(
+                    "notify_block=1 notifies nobody, so it cannot be combined with "
+                    "notify_user_ids or discussion_receivers — leave out either the "
+                    "block or the receivers."
+                )
             if custom_notify and not (receivers or notify_user_ids):
                 raise ValueError(
                     "custom_notify=True replaces CDESK's default receivers, so it "
@@ -1219,15 +1215,14 @@ def register_request_tools(
 
     # FastMCP builds each tool's argument model with pydantic's default
     # extra="ignore", so an unrecognised keyword is dropped BEFORE the tool body
-    # runs — our code never sees it. Live consequence on update_request: a typo
-    # like titel= (for title=), or a create-only field such as computer_code=,
-    # returned success, issued a PUT with an empty body and bumped udatetime,
-    # changing nothing and saying nothing. Forbid extras so the caller gets a
-    # validation error naming the offending key instead of a silent no-op.
+    # runs — our code never sees it. On update_request, a typo like titel= (for
+    # title=), or a create-only field such as computer_code=, would otherwise
+    # succeed while changing nothing and saying nothing. Forbid extras so the
+    # caller gets a validation error naming the offending key instead of a
+    # silent no-op.
     #
-    # Scoped to this module deliberately: flipping it for all 96 tools would
-    # reject any harmless extra a host might attach, which is a much wider blast
-    # radius than the bug justifies.
+    # Scoped to this module deliberately: forbidding extras on every tool would
+    # reject any harmless extra a host might attach.
     forbid_unknown_arguments(mcp, _REQUEST_TOOL_NAMES)
 
 
@@ -1238,12 +1233,11 @@ async def _fetch_for_update_request(client: CdeskClient, id: int) -> dict[str, A
     optimistic lock into a follow-up PUT.
 
     CDESK's Request module reads `timestamp_check` from the PUT body, same
-    as Task/Customer/User — verified against the OpenAPI spec's PUT
-    description ("required: timestamp_check, must equal the updated_at
-    from last fetch").
+    as Task/Customer/User — per the OpenAPI spec's PUT description
+    ("required: timestamp_check, must equal the updated_at from last fetch").
 
-    fieldset=all is required: the v3 fieldset default (`extended`) no longer
-    includes `timestamp_check` — only `all` carries it (verified live)."""
+    fieldset=all is required: the v3 fieldset default (`extended`) does not
+    include `timestamp_check` — only `all` carries it."""
     envelope = await client.get(f"v3/request/{id}", params={"fieldset": "all"})
     record = unwrap_record(envelope)
     if not isinstance(record, dict):
@@ -1298,12 +1292,9 @@ def _build_discussion_body(
         receivers in technote_to, internal attachments.
 
     Extra receivers go in `<channel>_to.manual` as `{notify, name, type: 0}`
-    entries — the shape the CDESK UI sends. The spec's top-level
-    `discussion_receivers` is accepted and ignored by the backend, and
-    `customNotify` with it switches the default receivers off, so such a post
-    notified nobody (JCD-34004, verified live on cmpp 2026-10-06). Without
-    `customNotify` the manual entries are added to the default receivers; with
-    it they replace them.
+    entries — the shape the CDESK UI sends; CDESK refuses the spec's
+    top-level `discussion_receivers` key. Without `customNotify` the manual
+    entries are added to the default receivers; with it they replace them.
 
     Either text OR attachments must be present (CDESK rejects an empty
     message)."""
@@ -1333,8 +1324,8 @@ def _build_discussion_body(
         if attachments:
             body["attachment_internal"] = attachments
 
+    to_key = "customer_to" if channel == "customer" else "technote_to"
     if manual_receivers:
-        to_key = "customer_to" if channel == "customer" else "technote_to"
         body[to_key] = {"auto": [], "manual": manual_receivers}
         if custom_notify:
             body["customNotify"] = True
@@ -1346,6 +1337,12 @@ def _build_discussion_body(
     block = notify_block_value(notify_block)
     if block is not None:
         body["notifyBlock"] = block
+    if block == 1:
+        # notifyBlock stops only the notification a status change can trigger;
+        # the post's own receivers are still e-mailed. An empty receiver list
+        # with customNotify replaces them with nobody.
+        body[to_key] = {"auto": [], "manual": []}
+        body["customNotify"] = True
     if notify_customer_block is not None:
         body["notifyCustomerBlock"] = notify_customer_block
     if notify_sms_block is not None:
@@ -1354,9 +1351,9 @@ def _build_discussion_body(
     return body
 
 
-# Deliberately loose: CDESK stores any string as a receiver (`not-an-email`
-# was accepted and reported as notified, cmpp 2026-10-06), so this only has to
-# catch what is plainly not an address.
+# Deliberately loose: CDESK stores any string as a receiver (even `not-an-email`
+# is accepted and reported as notified), so this only has to catch what is
+# plainly not an address.
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s.]+$")
 
 
@@ -1414,8 +1411,7 @@ def _merge_receivers(
 
     CDESK users also carry `id` + `user_src: "user"`, the shape the UI's
     receiver picker sends: the backend then adds the in-app (bell) copy itself
-    (BaseModel::getNotifyReceivers) and routes the person as a user rather
-    than an outside address (NotifyRecipient::addDiscussionReceivers), so their
+    and routes the person as a user rather than an outside address, so their
     own notification settings apply. Plain addresses have no CDESK user and
     stay email-only. Users go first, so an address given both ways keeps the
     user entry."""
@@ -1538,12 +1534,12 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
         the other filters). Requests are the ONLY module where deleted
         records are reachable; deleted tasks/catalogs are gone for good.
     NOT offered (the CDESK v3 request list silently ignores or
-    mis-evaluates them — verified live): request type ("druh"), sla_id.
+    mis-evaluates them): request type ("druh"), sla_id.
     Use client-side filtering for those.
 
     For advanced filters not exposed here, pass sb_raw as a CDESK sb object
     (JSON string or object) in the structured tree form. Only the
-    LIVE-VERIFIED working columns are applied server-side (id_req, req_num,
+    working columns are applied server-side (id_req, req_num,
     code, urgency_id, impact_id, id_company, catalog_id, id_solver,
     solver_group_id, id_rc, project_contract_id, cat_area_id, branch_id,
     place_id, change_manager_id, superior_request_id, periodical_request_id,
@@ -1640,11 +1636,11 @@ _GET_REQUEST_CUSTOM_FIELDS_DESC = inspect.cleandoc(
 
     Optional catalog_id scopes the catalog to a request-catalog variant.
 
-    KNOWN LIMITATION (2026-06-04): the tenant currently ignores
+    KNOWN LIMITATION: the tenant currently ignores
     customFields writes silently — values do not persist. After any
     write, a get_request(id, fieldset="custom") read shows whether the
     value actually persisted; a value that did not stick was not
-    stored despite the 200 (backend fix pending).
+    stored despite the 200.
     """
 )
 
@@ -1666,22 +1662,6 @@ _GET_REQUEST_ENUMS_DESC = inspect.cleandoc(
     """
 )
 
-# ACCEPTED COMPLIANCE RISK (reviewed 2026-07-29, Anthropic connector directory).
-# The "Catalog flow" section below is a behavioural workflow, not a description of
-# the tool: "PRESENT THEM TO THE USER AS A DROPDOWN", "Show the user the prefilled
-# values", "Then ask only for the fields still missing". The directory policy says
-# "Describe what the tool does. Do not tell Claude how to behave."
-#
-# This is the WEAKEST of the two risks we accepted — unlike the grounding contract
-# in tools/grounding.py, none of it is enforced server-side, so it is pure UI
-# instruction. Kept because it encodes hard-won tenant behaviour (base_params
-# prefills, restrict="limited" allowed lists) and rewriting a ~4.7k-char
-# description risks losing tuned behaviour.
-#
-# If a reviewer flags anything in this repo, expect it to be this. The fix is a
-# faithful rewrite, not deletion: turn each imperative into the API fact beneath
-# it — e.g. "a value outside the `allowed` list is rejected" instead of "only
-# offer the values in its `allowed` list".
 _CREATE_REQUEST_DESC = inspect.cleandoc(
     """
     Create a new CDESK request (helpdesk ticket).
@@ -1742,7 +1722,7 @@ _CREATE_REQUEST_DESC = inspect.cleandoc(
       - type_code: the request type / "druh" — a short string code (e.g. "H"
         for Helpdesk), NOT an enum id. CDESK requires it when the tenant has a
         base type configured. (type_name is only usable on tenants whose type
-        enum is id-based; this tenant's is key/value, so pass type_code.)
+        enum is id-based; where it is key/value, pass type_code.)
       - solver_id, solver_group_id: who handles the request (CDESK requires a
         solver or solver group). Solver group ids are user-group ids
         (list_user_groups; a root group, main_group=true, is not accepted);
@@ -1755,8 +1735,8 @@ _CREATE_REQUEST_DESC = inspect.cleandoc(
         TENANT-LOCAL time — CDESK_TIMEZONE, default Europe/Bratislava — and
         sent with the proper offset; bare dates pass through unchanged).
         `first_conclusion` belongs here even though the CDESK spec declares it
-        a string: the column is a TIMESTAMP, so prose sent to it used to store
-        as "0000-00-00 00:00:00". Non-dates are now rejected up front.
+        a string: the column is a TIMESTAMP, so prose sent to it would store
+        as "0000-00-00 00:00:00". Non-dates are rejected up front.
       - due_date: the deadline ("Termín splnenia do"), ISO-8601 like the dates
         above. CDESK computes it from the SLA when it is left out; a value sent
         replaces it. Off while the tenant has the due-date field off (dueDate).
@@ -1765,7 +1745,7 @@ _CREATE_REQUEST_DESC = inspect.cleandoc(
       - solution, solver_note, note, code, computer_code: free-text
         bodies. NB: `code` requires the
         request/fields/code write right — without it CDESK silently
-        drops the value with a 200 (verified live); this tool detects
+        drops the value with a 200; this tool detects
         the drop and adds a `warnings` entry to the result.
       - for_customer: visibility flag (customer can see the ticket).
       - user_entered_by / contact_entered_by / entered_by: applicant
@@ -1826,7 +1806,7 @@ _UPDATE_REQUEST_DESC = inspect.cleandoc(
     ISO-8601 datetimes — a value without an offset is read as tenant-local time
     (CDESK_TIMEZONE, default Europe/Bratislava). `first_conclusion` is one of
     them despite the CDESK spec declaring it a string: the column is a
-    TIMESTAMP, and prose sent to it used to store as "0000-00-00 00:00:00".
+    TIMESTAMP, and prose sent to it would store as "0000-00-00 00:00:00".
 
     Fields whose tenant feature is switched off are dropped by CDESK with a 200
     — the result's `warnings` list names each one and the setting it needs, so
@@ -1939,8 +1919,12 @@ _POST_REQUEST_DISCUSSION_DESC = inspect.cleandoc(
         to the receivers CDESK picks by its own rules. True: only they
         are notified, and CDESK's default receivers are not. Requires at
         least one receiver.
-      - notify_block / notify_customer_block / notify_sms_block — 0 or
-        1 flags that suppress notifications.
+      - notify_block — 1 = nobody is notified about this post: neither
+        its receivers nor the notification a status change can trigger.
+        Cannot be combined with notify_user_ids / discussion_receivers.
+      - notify_customer_block / notify_sms_block — 0 or 1 flags that
+        suppress the customer / SMS notification of a status change the
+        post triggers; they do not affect the post's own receivers.
 
     With no receivers given, CDESK notifies by its own rules.
 
@@ -1950,9 +1934,8 @@ _POST_REQUEST_DISCUSSION_DESC = inspect.cleandoc(
     in-app notification for, and CDESK's confirmation message; it
     carries a `warning` when a requested receiver is not in the recorded
     list or CDESK sent no confirmation.
-        notify_block (notifyBlock) currently stops only the extra notification a post
-    can trigger by changing the request status; CDESK still sends the post's own
-    e-mail (verified live 2026-10-12, reported to CDESK).
+    notify_block=1 is sent so that the post's own receivers are replaced by
+    nobody as well (CDESK reports it in `warnings`: "Nobody was notified").
 
     Side effects (by CDESK): with the tenant's automatic status change on, a post
     by the request's solver (or a member of its solver group) moves a request in

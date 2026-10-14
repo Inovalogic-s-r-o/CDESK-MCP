@@ -113,9 +113,9 @@ _SERVER_INFO_DESC = inspect.cleandoc(
 
 # Surfaced to the client model on connect (MCP server `instructions`). It is the
 # one place a directive lands in the model's context every session regardless of
-# which tool it reaches for — so it's where we steer answers toward the
-# truth-gate. It cannot *force* a tool call (the client model decides), but it
-# flips the default from "model's discretion" to "ground it unless trivial".
+# which tool it reaches for — so it's where the grounded-answer path and the
+# write tools' properties are described. It cannot *force* a tool call (the
+# client model decides).
 _SERVER_INSTRUCTIONS = inspect.cleandoc(
     """
     This server exposes REAL data from a CDESK helpdesk/CRM tenant: requests
@@ -481,7 +481,7 @@ def build_server(
 
             NOT the base URL alone: one CDESK host holds many environments
             (``admin_id``), and enums are scoped per environment server-side, so
-            a host-only key served one environment's enum ids to another. Adding
+            a host-only key would serve one environment's enum ids to another. Adding
             the login can over-partition (same environment, two users → two
             caches) but never under-partition, which is the direction that
             leaks. \\x00 can't occur in either part, so the pair is unambiguous.
@@ -505,8 +505,8 @@ def build_server(
         effective_catalog_cache = _scoped_cache("v3/request-catalog/enums")
         effective_deal_cache = _scoped_cache("v3/contract/enums")
         # CNB export snapshots are bucketed per CALLER, same key as the enum
-        # caches — a host-only key let one environment's export overwrite
-        # another's on the same CDESK server.
+        # caches — a host-only key would let one environment's export
+        # overwrite another's on the same CDESK server.
         export_store = ExportSnapshotStore(resolve_cache_key=_current_cache_key)
         register_login_route(
             mcp, oauth_provider,
@@ -569,7 +569,7 @@ def build_server(
     register_user_tools(mcp, effective_client)
     register_request_tools(mcp, effective_client, effective_request_cache)
     register_request_catalog_tools(mcp, effective_client, effective_catalog_cache)
-    # CMDB is read-only and resolves no enum names client-side, so it takes
+    # CMDB resolves no enum names client-side, so it takes
     # no cache — the CI status enums are fetched directly by get_ci_enums.
     register_cmdb_tools(mcp, effective_client)
     # Fill (fulfillments) is full CRUD but, like CMDB, resolves no enum names
@@ -577,9 +577,10 @@ def build_server(
     register_fill_tools(mcp, effective_client)
     # Deal statuses/phases/types ARE tenant enum data — 4th cached module.
     register_deal_tools(mcp, effective_client, effective_deal_cache)
-    # CNB-only bulk CI export. stdio knows its one tenant at startup and leaves
-    # the tools out on a non-CNB tenant; http serves many tenants, so the tools
-    # stay and refuse a non-CNB caller themselves (UAT low-priority L5).
+    # CNB-only bulk CI export: it only works on a CNB tenant (elsewhere CDESK
+    # answers code 14). stdio knows its one tenant at startup and leaves the
+    # tools out there; http serves many tenants, so the tools stay and refuse a
+    # non-CNB caller themselves.
     if cnb_tools:
         register_cnb_tools(mcp, effective_client, export_store)
 
@@ -597,10 +598,10 @@ def build_server(
     forbid_unknown_arguments(mcp, _FILTERABLE_LIST_TOOLS)
 
     # Every tool with a `fields` whitelist names the requested fields CDESK
-    # silently dropped (UAT B10) — applied after all modules registered.
+    # silently dropped — applied after all modules registered.
     annotate_unreturned_fields(mcp)
     # Trim what the LLM receives: enum-row noise, empty list fields.
     compact_llm_payloads(mcp)
-    # Writes refuse enum values the tenant switched off (UAT B13).
+    # Writes refuse enum values the tenant switched off.
     mark_write_tools(mcp)
     return mcp

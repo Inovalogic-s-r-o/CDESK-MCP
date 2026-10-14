@@ -1,26 +1,24 @@
-"""User module MCP tools (M9).
+"""User module MCP tools.
 
-Seven tools that expose CDESK's User v3 CRUD + an intent helper + the
-custom-field catalog, following
-the M7 (Task) / M8 (Customer) pattern: CdeskClient + filter builder +
-error translator, no enum cache.
+Tools that expose CDESK's User v3 CRUD, user groups, whoami, an intent helper
+and the custom-field catalog, following the same pattern as the Task and
+Customer modules: CdeskClient + filter builder + error translator, no enum
+cache.
 
 Special handling:
   - Password: `password` (plain text) OR `send_password_email=True`. Exactly
-    one must be provided at create time (we check client-side and fail fast
+    one must be provided at create time (checked client-side to fail fast
     rather than round-trip a 4xx).
     CDESK rejects passwords that match the previous value on update with
-    HTTP 412; M4 maps that to a clear "password must differ" message.
+    HTTP 412; errors.translate_error maps that to a clear "password must
+    differ" message.
   - cm_access: CDESK's 2-char Y/N feature flag. **The OpenAPI spec
     mis-documents the positions** (says pos 1 = CMonitor, pos 2 = CDESK);
-    the actual source (`Wrapper/Customer.php:2124`,
-    `Model/User.php:7197`, `Helper/SvcMirror/CmEnabledAdminAllowlist.php:12`)
-    consistently reads `cm_access[1]` ('the 2nd character') as the
-    CMonitor flag. So:
+    CDESK reads `cm_access[1]` ('the 2nd character') as the CMonitor flag.
+    So:
         position 1 (index 0) = CDESK
         position 2 (index 1) = CMonitor
-    Live confirmation: admin_api_v3 has `cm_access='YN'` and is a
-    CDESK-only API user (no CMonitor surface).
+    A CDESK-only API user (no CMonitor surface) carries `cm_access='YN'`.
     Exposed as two booleans (`cdesk_access`, `cmonitor_access`) for
     LLM ergonomics; combined into the 2-char string before sending.
     Defaults are None on both — CDESK applies its tenant default if
@@ -29,12 +27,13 @@ Special handling:
   - help/email/guest/test account flags: bools mapped to 'Y' or omitted
     via tools._helpers.yn (same convention as Customer.cdesk_allowed).
 
-Skipped per plan:
+Not exposed:
   - `encrypted_password` (SSO/migration niche)
-  - notification fields requiring `acl/user/fields/email_settings` ACL
-    (silent-ignore concern; not surfaced in v1)
+  - notification fields requiring the `acl/user/fields/email_settings` ACL
+    (CDESK silently ignores them without it)
 
-Optimistic locking is hidden via timestamp_check — same M7 finding.
+Optimistic locking is handled internally via timestamp_check (see
+_fetch_for_update).
 """
 
 from __future__ import annotations
@@ -47,10 +46,9 @@ from mcp.types import ToolAnnotations
 
 from cdesk_mcp import base_config
 from cdesk_mcp.cdesk_client import CdeskApiError, CdeskAuthError, CdeskClient
-from cdesk_mcp.filters import USER_TYPE_LABELS, build_user_filter, encode_sb
+from cdesk_mcp.filters import build_user_filter, encode_sb, user_type_label
 from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
-    annotate_write_warnings,
     forbid_unknown_arguments,
     list_meta,
     TEXT_MATCH_NOTE,
@@ -70,20 +68,20 @@ from cdesk_mcp.tools._helpers import (
 # LLM-friendly name → CDESK field name. Centralised in one place so quirks
 # don't leak into the tool signatures.
 _USER_CREATE_FIELDS = {
-    # The live POST/PUT read the username from `user`, NOT `login` (the
-    # OpenAPI doc says `login`, but a body with `login` 400s with the
-    # username-charset error while the same value under `user` succeeds —
-    # verified live 2026-06-04). The LLM-facing param stays `login`.
+    # The POST/PUT read the username from `user`, NOT `login` (the OpenAPI
+    # doc says `login`, but a body with `login` 400s with the username-charset
+    # error while the same value under `user` succeeds). The LLM-facing param
+    # stays `login`.
     "login": "user",
-    # The v3 spec documents `sendPassword`, but the backend reads only
-    # `password_action` (User/Module.php:1085, :1560 sends the e-mail) and
-    # nothing maps one to the other: with `sendPassword` the user was created
-    # with no password and no e-mail (verified live on cmpp 2026-10-12;
-    # `password_action` answered "E-mail pre zmenu hesla bol úspešne odoslaný").
+    # The v3 spec documents `sendPassword`, but CDESK reads only
+    # `password_action` (which sends the e-mail) and nothing maps one to the
+    # other: with `sendPassword` the user is created with no password and no
+    # e-mail.
     "send_password_email": "password_action",
     "company_id": "id_company",              # CDESK uses older naming
-    "primary_group_id": "group_primary",     # clearer LLM name
-    "group_ids": "groups",                   # consistent with tag_ids pattern
+    # `group_id` replaces the whole membership; the API also accepts `groups`
+    # and `group_ids` as aliases (all three are stored).
+    "group_ids": "group_id",
     "language": "cm_language",               # shorter LLM-facing name
     "mobile_phone": "mobil",                 # CDESK uses cz spelling
     "user_type": "type",                     # avoid shadowing Python builtin
@@ -91,52 +89,18 @@ _USER_CREATE_FIELDS = {
 
 _MAX_PER_PAGE = 100
 
-# Fields this tenant accepts with a 200 and then discards, verified live
-# 2026-07-31 and recorded in docs/bugs.md. Listed here so the write tools can
-# tell the model the value did not stick instead of reporting a clean success.
-# ONLY fields whose request-body key matches the savedData key belong here: the
-# diff compares by key name, so `company_id` (echoed as `id_company`) would
-# raise a false alarm and is deliberately absent.
-_USER_DISCARDED_FIELDS: tuple[str, ...] = (
-    "name",
-    "position",
-    "test_account",
-    "cm_access",
-)
-
-_USER_DISCARDED_NOTES: dict[str, str] = {
-    "name": (
-        "CDESK derives the display name from first_name + last_name, so a `name` "
-        "sent on its own is ignored — send first_name/last_name to rename a user"
-    ),
-    "position": (
-        "the position columns are per-language (position_sk/_en/...) and the "
-        "plain `position` field is not persisted by the v3 user endpoint"
-    ),
-    "test_account": (
-        "special-purpose account markers are not settable through the v3 API — "
-        "set them in the CDESK UI"
-    ),
-    "cm_access": (
-        "the CDESK/CMonitor access pair is not settable through the v3 API — "
-        "set it in the CDESK UI"
-    ),
-}
-
 # Keys CDESK returns on the user detail that are far too large to hand an LLM
 # and are not user data. `grouped_notifications` is the per-user notification
 # CONFIGURATION matrix: 22 module groups, each with nested notification rows
-# (receiver lists, per-channel hidden flags). Measured live 2026-07-29 on this
-# tenant: 353,498 chars — 99.3% of a 355,859-char `fieldset="all"` response,
-# which rendered as ~1.1 MB through the tool layer and blew the MCP
-# tool-result token cap outright. So `fieldset="all"` and `"custom"` both
-# failed with "result exceeds maximum allowed tokens" and returned NOTHING —
-# including `customFields`, which was `{}` (2 chars) and is the whole reason
-# the custom-field docs tell you to call `fieldset="all"` in the first place.
+# (receiver lists, per-channel hidden flags). It runs to ~350 KB — nearly all
+# of a `fieldset="all"` response — which exceeds the MCP tool-result token cap,
+# so without this `fieldset="all"` and `"custom"` would fail with "result
+# exceeds maximum allowed tokens" and return NOTHING, including `customFields`,
+# which is what the custom-field docs read `fieldset="all"` for.
 #
-# `returnFields[]` does NOT exclude it (verified: fieldset="all" +
-# returnFields[id,name,customFields] still returned it, 448,969 chars), so
-# dropping it here is the only way to make the documented path executable.
+# `returnFields[]` does NOT exclude it (fieldset="all" +
+# returnFields[id,name,customFields] still returns it), so dropping it here is
+# the only way to make the documented path executable.
 # Notification settings are managed in the CDESK UI; nothing in this server
 # reads them.
 _OVERSIZED_USER_KEYS = ("grouped_notifications",)
@@ -164,24 +128,24 @@ def _drop_oversized_user_keys(record: dict[str, Any]) -> dict[str, Any]:
     return record
 
 
-# User groups (UAT B7). The v3 spec: user groups "are also solver groups and
+# User groups. The v3 spec: user groups "are also solver groups and
 # approver groups", and `solver_group_id` is "FK to a user group id". The list
 # is trimmed to the identifying fields by default — a group record also carries
 # its rights and user settings. `main_group` marks a ROOT group (Administrators,
 # Operators, Customer accounts, …), which CDESK never offers as a request's
-# solver group (UserGroup::getSolverGroupList, withoutRootGroups).
+# solver group.
 _MAX_GROUPS_PER_PAGE = 100
 _GROUP_LIST_FIELDS = (
     "id", "name", "description", "enabled", "main_group", "parent_id",
     "assigned_company_count",
 )
-# `id_parent` on a group is NOT its parent group (live: the PROBE group under
-# Operators read id_parent = the creating user's id); the parents are
+# `id_parent` on a group is NOT its parent group (it holds the id of the user
+# who created the group); the parents are
 # `group_id`, which v3 documents as "Parent group ids".
 _GROUP_DETAIL_FIELDS = ("id", "name", "nick", "description", "enabled", "main_group")
 
 
-# whoami (UAT B6). The v3 API has no "current user" endpoint and its login
+# whoami. The v3 API has no "current user" endpoint and its login
 # answer carries only tokens; core/base-config — the payload the CDESK web app
 # loads for every logged-in user, already used for the form rules — holds the
 # caller's own record in its `user` block. That block ALSO holds the session's
@@ -222,8 +186,8 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
     """Register all User-module tools on the given FastMCP instance.
 
     Note: no EnumCache parameter. CDESK has no /v3/user/enums endpoint;
-    user-type filter values (admin/operator/customer/user/easyclick/solver/
-    authorizing_officer/guest) are documented in tool descriptions."""
+    user-type filter values (filters.USER_TYPE_LABELS) are documented in the
+    list_users description."""
 
     @mcp.tool(
         description=_WHOAMI_DESC,
@@ -272,7 +236,7 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
         records, meta = unwrap_list(response)
         for row in records:
             # CDESK sends main_group only for a root group and leaves the key
-            # out otherwise (live on cmpp 2026-10-12) — make it always a bool.
+            # out otherwise — make it always a bool.
             if isinstance(row, dict) and (fields is None or "main_group" in fields):
                 row["main_group"] = row.get("main_group") is True
         return {"items": records, "meta": list_meta(meta, paging),
@@ -326,12 +290,8 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                 )
             if page < 1:
                 raise ValueError(f"page must be 1 or greater (got {page})")
-            if user_type is not None and user_type not in USER_TYPE_LABELS:
-                raise ValueError(
-                    f"user_type={user_type!r} is not a valid CDESK user type. "
-                    f"Allowed values: {', '.join(USER_TYPE_LABELS)}. "
-                    f"(See list_users description for what each label means.)"
-                )
+            if user_type is not None:
+                user_type = user_type_label(user_type)
             # Unsupported sb_raw columns are stripped and reported via
             # `unsupported_filters` — the agent must filter the items itself.
             dropped_clauses: list[dict[str, Any]] = []
@@ -346,7 +306,7 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
             params: dict[str, Any] = {"pg": page, "pp": per_page}
             apply_field_scope(params, fieldset, fields)
             # onlyDeleted only works as a FLAT query param — the endpoint
-            # silently ignores it as an sb clause (verified live 2026-06-04).
+            # silently ignores it as an sb clause.
             if only_deleted:
                 params["onlyDeleted"] = "1"
             if sort:
@@ -410,14 +370,13 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
         )
 
     @mcp.tool(
-        description=_FIND_USER_DESC,
+        description=_FIND_USER_DESC + "\n\n" + TEXT_MATCH_NOTE,
         annotations=ToolAnnotations(title="Find user", readOnlyHint=True),
     )
     async def find_user(text: str, max_results: int = 10) -> dict[str, Any]:
         """Intent helper — full-text search across CDESK's documented user
         q-search columns: id, name, nick, user (login), email, mobil, phone,
-        description, personal_number. (Source: Model/User.php::whereFilter
-        q-branch.)"""
+        description, personal_number."""
         if max_results < 1 or max_results > _MAX_PER_PAGE:
             raise RuntimeError(
                 f"find_user input error: max_results must be 1..{_MAX_PER_PAGE}"
@@ -472,8 +431,8 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
         cdesk_access: bool | None = None,
         cmonitor_access: bool | None = None,
         role: str | None = None,
-        primary_group_id: int | None = None,
         group_ids: list[int] | None = None,
+        job_title_id: int | None = None,
         language: str | None = None,
         timezone: str | None = None,
         personal_number: str | None = None,
@@ -489,10 +448,10 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                 validate_custom_fields(custom_fields)
             except ValueError as e:
                 raise RuntimeError(f"create_user input error: {e}") from e
-            # The live API requires `name` AND `nick` on create (it rejects
-            # the body with "Neplatné meno" / "Neplatná skratka pre výpis"
-            # otherwise; first_name+last_name do NOT substitute for name —
-            # verified live 2026-06-04). Fail fast with a clear message.
+            # The API requires `name` AND `nick` on create (it rejects the body
+            # with "Neplatné meno" / "Neplatná skratka pre výpis" otherwise;
+            # first_name+last_name do NOT substitute for name). Fail fast with
+            # a clear message.
             if not name or not name.strip():
                 raise RuntimeError(
                     "create_user input error: `name` (display name) is "
@@ -504,7 +463,7 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                     "create_user input error: `nick` (short list label, "
                     "e.g. initials or a short handle) is required by CDESK."
                 )
-            # M9.2: require EXACTLY ONE password mechanism client-side. CDESK
+            # Require EXACTLY ONE password mechanism client-side. CDESK
             # would 4xx without one; supplying both is undefined (it may email a
             # generated password the operator didn't expect). Failing fast saves
             # a round-trip and gives a clearer message.
@@ -514,7 +473,7 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                     "(plain text) or `send_password_email=True` (CDESK auto-"
                     "generates and emails the password), not both or neither."
                 )
-            # M12: auto_logout and ips are validated server-side on every
+            # auto_logout and ips are validated server-side on every
             # create even when CMonitor access is off. Reject obviously
             # invalid values up-front so the user gets a clear message
             # instead of a CDESK 400.
@@ -522,7 +481,7 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
             # On create there is no stored record to preserve, so an unspecified
             # access position must NOT default to grant. Pass current="NN" so
             # setting one access flag doesn't silently grant the other (the
-            # "YY" default is only safe on update, where the live value is read).
+            # "YY" default is only safe on update, where the stored value is read).
             cm_access = _combine_cm_access(cdesk_access, cmonitor_access, current="NN")
             body = _build_user_body(
                 {
@@ -531,7 +490,7 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                     "auto_logout": auto_logout,
                     "ips": ips,
                     "password": password,
-                    # M9.3: pass send_password_email through unchanged so an
+                    # Pass send_password_email through unchanged so an
                     # explicit False reaches CDESK as `password_action: false`.
                     "send_password_email": send_password_email,
                     "first_name": first_name,
@@ -545,8 +504,8 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                     "user_type": user_type,
                     "cm_access": cm_access,
                     "role": role,
-                    "primary_group_id": primary_group_id,
                     "group_ids": group_ids,
+                    "job_title_id": job_title_id,
                     "language": language,
                     "timezone": timezone,
                     "personal_number": personal_number,
@@ -562,6 +521,8 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
             if custom_fields:
                 body["customFields"] = custom_fields
             response = await client.post("v3/user", json=body)
+            result = response if isinstance(response, dict) else {"data": response}
+            result = _with_test_account_warning(body, result)
         except (CdeskApiError, CdeskAuthError) as e:
             # CDESK-signaled errors (both RuntimeError subclasses) need
             # translation — must be caught before the plain-RuntimeError
@@ -571,12 +532,7 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
             raise  # client-side validators already emit a friendly message
         except Exception as e:
             raise to_llm_error(e, operation="create_user") from e
-        return redact_secrets(annotate_write_warnings(
-            response if isinstance(response, dict) else {"data": response},
-            sent_body=body,
-            check_fields=_USER_DISCARDED_FIELDS,
-            field_notes=_USER_DISCARDED_NOTES,
-        ))
+        return redact_secrets(result)
 
     @mcp.tool(
         description=_UPDATE_USER_DESC,
@@ -602,8 +558,8 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
         cdesk_access: bool | None = None,
         cmonitor_access: bool | None = None,
         role: str | None = None,
-        primary_group_id: int | None = None,
         group_ids: list[int] | None = None,
+        job_title_id: int | None = None,
         language: str | None = None,
         timezone: str | None = None,
         personal_number: str | None = None,
@@ -619,7 +575,7 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                 validate_custom_fields(custom_fields)
             except ValueError as e:
                 raise RuntimeError(f"update_user input error: {e}") from e
-            # M12: when present, auto_logout and ips have the same constraints
+            # When present, auto_logout and ips have the same constraints
             # on update as on create.
             if auto_logout is not None or ips is not None:
                 _validate_auto_logout_and_ips(
@@ -628,8 +584,8 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                 )
             current = await _fetch_for_update(client, id)
             # cm_access: preserve any position the caller didn't specify.
-            # M9.6: if the GET response has no usable cm_access we omit the
-            # field entirely (don't fabricate a 'YY' fallback — that would
+            # If the GET response has no usable cm_access the field is omitted
+            # entirely (don't fabricate a 'YY' fallback — that would
             # silently grant access positions we can't observe).
             cm_access: str | None = None
             if cdesk_access is not None or cmonitor_access is not None:
@@ -667,8 +623,8 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                     "user_type": user_type,
                     "cm_access": cm_access,
                     "role": role,
-                    "primary_group_id": primary_group_id,
                     "group_ids": group_ids,
+                    "job_title_id": job_title_id,
                     "language": language,
                     "timezone": timezone,
                     "personal_number": personal_number,
@@ -685,6 +641,8 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                 body["customFields"] = custom_fields
             body["timestamp_check"] = current["timestamp_check"]
             response = await client.put(f"v3/user/{id}", json=body)
+            result = response if isinstance(response, dict) else {"data": response}
+            result = _with_test_account_warning(body, result)
         except (CdeskApiError, CdeskAuthError) as e:
             # CDESK-signaled errors (both RuntimeError subclasses) need
             # translation — must be caught before the plain-RuntimeError
@@ -694,12 +652,7 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
             raise  # client-side validators already emit a friendly message
         except Exception as e:
             raise to_llm_error(e, operation="update_user", record_id=id) from e
-        return redact_secrets(annotate_write_warnings(
-            response if isinstance(response, dict) else {"data": response},
-            sent_body=body,
-            check_fields=_USER_DISCARDED_FIELDS,
-            field_notes=_USER_DISCARDED_NOTES,
-        ))
+        return redact_secrets(result)
 
     @mcp.tool(
         description=_DELETE_USER_DESC,
@@ -714,6 +667,40 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
 
 
 # ---------- helpers (module-private) -------------------------------------
+
+
+# Group membership (`group_id`), `job_title_id` and `position` (a job-title
+# name) are stored and validated by the API — an unknown group, job title or
+# position name is a 400 — so they need no read-back.
+# `test_account` is the one field still answered with a 200 without storing:
+# GET never carries it, so it is checked only through the row a write echoes.
+
+
+def _with_test_account_warning(
+    body: dict[str, Any], result: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach a warning when a sent `test_account` flag is not confirmed by the
+    row the write echoed. The PUT echoes the stored row, the POST sometimes the
+    row and sometimes a bare id."""
+    if not body.get("test_account"):
+        return result
+    echoed = result.get("data")
+    stored_flag = echoed.get("test_account") if isinstance(echoed, dict) else None
+    if stored_flag is None:
+        warning = (
+            "is_test_account was sent, but this response does not echo the "
+            "flag and CDESK never returns it on read, so whether it stored "
+            "cannot be checked here — it has been observed NOT to store; "
+            "check it in the CDESK UI."
+        )
+    elif stored_flag != body["test_account"]:
+        warning = (
+            f"is_test_account was sent but the stored flag is "
+            f"{stored_flag!r} — it was NOT stored."
+        )
+    else:
+        return result
+    return {**result, "warnings": [*(result.get("warnings") or []), warning]}
 
 
 def _validate_auto_logout_and_ips(auto_logout: int, ips: str) -> None:
@@ -755,15 +742,10 @@ def _combine_cm_access(
     """Combine two LLM-facing booleans into CDESK's 2-char `cm_access`
     string.
 
-    **Position semantics** (verified against CDESK source — the OpenAPI
-    spec gets this BACKWARDS):
+    **Position semantics** (CDESK reads `cm_access[1]` as the CMonitor
+    flag — the OpenAPI spec gets this BACKWARDS):
         position 1 (index 0) = CDESK    (this function's first arg)
         position 2 (index 1) = CMonitor (this function's second arg)
-
-    Sources:
-        Wrapper/Customer.php:2124       — substr(cm_access, 1, 1)==='Y' → CM
-        Model/User.php:7197             — substr(cm_access, 1, 1)!=='Y' → CM off
-        Helper/SvcMirror/CmEnabledAdminAllowlist.php:12-13 — "cm_access[1]==='Y'"
 
     Returns None when both inputs are None so the field is omitted from
     the request body (preserves the current stored value on update; lets
@@ -783,12 +765,11 @@ def _combine_cm_access(
 async def _fetch_for_update(client: CdeskClient, id: int) -> dict[str, Any]:
     """Fetch a user and unwrap to the record dict; require timestamp_check.
 
-    Same M7 finding as in tools/tasks.py and tools/customers.py: CDESK
-    reads `timestamp_check` from the PUT body for the optimistic-lock
+    As in tools/tasks.py and tools/customers.py: CDESK reads `timestamp_check` from the PUT body for the optimistic-lock
     check, not `updated_at`.
 
-    fieldset=all is required: the v3 fieldset default (`extended`) no longer
-    includes `timestamp_check` — only `all` carries it (verified live). It also
+    fieldset=all is required: the v3 fieldset default (`extended`) does not
+    include `timestamp_check` — only `all` carries it. It also
     guarantees `cm_access` is present for the preserve-position logic."""
     envelope = await client.get(f"v3/user/{id}", params={"fieldset": "all"})
     record = unwrap_record(envelope)
@@ -812,38 +793,35 @@ _LIST_USERS_DESC = inspect.cleandoc(
     List CDESK users visible to your account. Returns a paginated list.
 
     Filters:
-    - text_search: full-text across the columns CDESK's whereFilter scans —
+    - text_search: full-text across the columns CDESK's text search scans —
       id, name, nick, user (login), email, mobil, phone, description,
-      personal_number. (Verified against Model/User.php q-branch.)
+      personal_number.
     - company_id: filter to users belonging to a specific customer
       (id_company column).
-    - user_type: one of "admin", "operator", "customer", "user",
-      "easyclick", "solver", "authorizing_officer", "guest", "cm".
-      Invalid values are rejected client-side with the full list.
+    - user_type: one of "admin", "operator", "customer", "easyclick",
+      "solver", "authorizing-officer", "cm", "guest" ("authorizing_officer" is
+      accepted too). There is no label for a plain user. Invalid values are
+      rejected with the full list.
       CDESK derives the type from the user's ROOT GROUP; this filter applies
-      that derivation. Two consequences, both verified live 2026-07-31:
-      (a) a user with NO group membership matches NO user_type value at all,
-      and the API cannot assign groups (it accepts `groups`/`group_primary`
-      with a 200 and stores nothing), so every user created
-      through this connector is unreachable by this filter until a group is
-      assigned in the CDESK UI; (b) the record field `type` ("M"/"C"/...) is
+      that derivation. Two consequences:
+      (a) a user with NO group membership matches NO user_type value at all
+      (membership is set with create_user / update_user `group_ids`);
+      (b) the record field `type` ("M"/"C"/...) is
       NOT this derived user_type — a user whose `type` is "C" is matched by
       `solver` when its group is a solver-root group, and is NOT matched by
       `customer`. Do not read one as the other.
     - only_deleted: when true, returns only soft-deleted users.
     - sb_raw: an sb filter object for the CDESK API v3 user list (JSON string
       or object, structured tree form; see docs/cdesk-api-v3.json). Advanced;
-      mutually exclusive with the typed filters. Only the LIVE-VERIFIED working
-      columns are applied server-side — id, name, email, personal_number,
+      mutually exclusive with the typed filters. Only the columns known to work
+      are applied server-side — id, name, email, personal_number,
       id_company, status, type, uname (the login), mobil, id_external, plus
       last_login_date and created_at (strict W3C datetime values), plus the
       no-col text leaf. Clauses on any other column (e.g. `work_position`,
       which is stored as a job_title_id FK) are STRIPPED, and the response
       carries an `unsupported_filters` block naming them.
-      NB: the typed `user_type` param is the safe route for type
-      filtering — an unknown `type` value in sb_raw is silently ignored
-      by CDESK and returns ALL users (a false "match"), whereas
-      `user_type` is validated against the allowed labels here.
+      NB: an sb_raw `type` leaf takes the same labels as `user_type`;
+      CDESK answers any other value with 400 listing them.
 
     Pagination: page (1-based), per_page (default 20, max 100).
 
@@ -897,11 +875,10 @@ _GET_USER_CUSTOM_FIELDS_DESC = inspect.cleandoc(
     (scalar for single-value fields; for select/relation fields send the
     option id); (4) read stored values via get_user(id, fieldset="all").
 
-    KNOWN LIMITATION (2026-06-04): the tenant currently ignores
-    customFields writes silently — values do not persist. After any
-    write, a get_user(id, fieldset="custom") read shows whether the
-    value actually persisted; a value that did not stick was not
-    stored despite the 200 (backend fix pending).
+    KNOWN LIMITATION: the tenant currently ignores customFields writes
+    silently — values do not persist. After any write, a
+    get_user(id, fieldset="custom") read shows whether the value actually
+    persisted; a value that did not stick was not stored despite the 200.
     """
 )
 
@@ -909,7 +886,7 @@ _FIND_USER_DESC = inspect.cleandoc(
     """
     Intent helper for "find a user by name / login / email / mobil /
     description / personal_number". Runs a full-text search across the
-    columns CDESK's whereFilter scans (id, name, nick, user (login),
+    columns CDESK's text search scans (id, name, nick, user (login),
     email, mobil, phone, description, personal_number) and returns a
     compact list of matches with id, login, email, name, nick, and
     type — enough for the LLM to disambiguate without burning context
@@ -963,8 +940,19 @@ _CREATE_USER_DESC = inspect.cleandoc(
 
     Grouping:
     - company_id: the customer/company this user belongs to.
-    - primary_group_id + group_ids: ACL groups (group_primary + groups
-      in CDESK terms).
+    - group_ids: the user's group membership (`group_id` in CDESK terms).
+      CDESK has no primary group. A group id outside the caller's scope is
+      rejected with a 400. A user with no group has no derived user type
+      (see list_users).
+    - job_title_id: the job title (it drives e.g. which request-catalog
+      tiles the user sees); when omitted, the tenant default job title is
+      set. An id that is not a job title of the tenant is rejected with a 400.
+    - position: the job title by NAME instead of id, matched
+      case-insensitively; an unknown name is rejected with a 400. Ignored
+      when job_title_id is also sent.
+    - is_test_account: checked against the stored row when the response
+      echoes it; CDESK never returns the flag on read, so otherwise it cannot
+      be confirmed (it has been observed not to store) and a warning says so.
     - user_type: tenant-specific user type code; for the standard
       taxonomy see list_users' description.
 
@@ -975,7 +963,8 @@ _CREATE_USER_DESC = inspect.cleandoc(
     keys → values (discover keys via get_user_custom_fields;
     select/relation fields take the option id). Unknown keys → 400.
 
-    Returns: {data: <new id>, savedData: {...full record...}}.
+    Returns: {data: <new id> or {...stored user row...}, msg} — both shapes
+    occur.
     """
 )
 
@@ -1002,7 +991,17 @@ _UPDATE_USER_DESC = inspect.cleandoc(
     keys → values (discover keys via get_user_custom_fields; read
     stored values via get_user(id, fieldset="all")).
 
-    Returns: {data: <id>, savedData: {...full record...}}.
+    group_ids REPLACES the whole group membership: groups not listed are
+    left, and an empty list removes the user from every group; omit it to
+    keep the membership. job_title_id / position set the job title as on
+    create. `is_test_account` is checked against the stored row the update
+    echoes; a drop is named in `warnings`.
+
+    The display name follows first_name + last_name on update: a `name` sent
+    on its own is not stored, and CDESK says so in `warnings`. Send
+    first_name / last_name to rename a user.
+
+    Returns: {data: {...stored user row...}, msg}.
     """
 )
 
@@ -1032,8 +1031,8 @@ _WHOAMI_DESC = inspect.cleandoc(
 _LIST_USER_GROUPS_DESC = inspect.cleandoc(
     """
     List CDESK user groups — the groups users belong to, which are ALSO the
-    solver groups (`solver_group_id` on requests and in catalog prefills) and
-    approver groups. Returns id, name, description, enabled,
+    solver groups (`solver_group_id` on requests, work orders and catalog
+    prefills) and approver groups. Returns id, name, description, enabled,
     main_group, parent_id and assigned_company_count per group (fields: pick
     other top-level fields instead), plus meta.total.
 

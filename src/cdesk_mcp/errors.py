@@ -3,7 +3,7 @@
 Pure functions, no I/O. Tools wrap their CDESK calls in try/except and pass
 the exception here to get a string suitable for an MCP tool error result.
 
-CDESK error body shape (verified live against cmpp.seal.sk):
+CDESK error body shape:
     {
       "data": null,
       "msg": {
@@ -49,8 +49,8 @@ _PASSWORD_KEY_PATTERN = re.compile(
 _BODY_PREVIEW_MAX = 200
 
 # CDESK message codes that mean "missing / not reachable / the operation
-# failed" with no further reason — backend constants from apiportal
-# Wrapper/Response.php, the same on every tenant: ACCESS_DENIED 2, NOT_EXISTS
+# failed" with no further reason — CDESK's fixed message constants, the same
+# on every tenant: ACCESS_DENIED 2, NOT_EXISTS
 # 4, LOAD_ERROR 112, SAVE_ERROR 114, CREATE_ERROR 116, DELETE_ERROR 118. A 404
 # whose body carries ANY other code is a refusal with a reason, not a missing
 # record (see the 404 branch of _translate_status).
@@ -102,10 +102,10 @@ def _translate_cdesk_api_error(
     codes, _messages = _extract_cdesk_messages(body)
     # Match the optimistic-lock conflict TIGHTLY: its real signatures are the
     # 409 code, CDESK's Slovak phrase "...medzičasom aktualizovaný", or the
-    # framework's `recordUpdated` key. The old loose "record"+"updat" pair also
-    # caught validation/ACL messages ("record cannot be updated: ...", "you may
-    # not update this record") and wrongly told the LLM to re-fetch and retry an
-    # operation that fails identically every time.
+    # framework's `recordUpdated` key. A looser match (e.g. "record"+"updat")
+    # would also catch validation/ACL messages ("record cannot be updated: ...")
+    # and tell the LLM to re-fetch and retry an operation that fails
+    # identically every time.
     is_lock_conflict = (
         409 in codes
         or "konflikt" in lower
@@ -163,11 +163,10 @@ def _translate_status(
         codes, _messages = _extract_cdesk_messages(body)
         if any(code not in _NOT_FOUND_CODES for code in codes):
             # A refusal, not a missing record: v1 handlers end EVERY failure
-            # path in a 404 (e.g. Customer::deleteIndex returns
-            # jsonError_deleteRecord + 404 when isDisposable() blocks the
-            # delete), and the body then carries the real reason next to the
-            # generic "Záznam sa nepodarilo zmazať" (cmpp 2026-10-09: codes
-            # [8, 118], "…ukončite jeho otvorené Úlohy").
+            # path in a 404 (e.g. a customer delete blocked by its open
+            # tasks), and the body then carries the real reason next to the
+            # generic "Záznam sa nepodarilo zmazať" (e.g. codes [8, 118],
+            # "…ukončite jeho otvorené Úlohy").
             base = (
                 f"CDESK refused '{operation}'{rid_suffix}. It answered HTTP 404, "
                 f"but the reason it gave is not that the record is missing — the "
@@ -196,12 +195,24 @@ def _translate_status(
         )
         return _append_cdesk(base, cdesk) + "."
     if 500 <= status < 600:
+        # When the body names a cause, do NOT call the service unavailable or
+        # advise a retry: CDESK 500s on plain misconfiguration too (e.g. the
+        # Schedule module's "Default filter not found"), where the service is
+        # healthy and retrying can never succeed. Only the reason-less case
+        # looks like a genuine outage.
+        if cdesk:
+            base = (
+                f"CDESK returned HTTP {status} during '{operation}'{rid_suffix}. "
+                f"The server named a cause, so this is unlikely to be a transient "
+                f"outage — retrying will probably not help; address the cause"
+            )
+            return _append_cdesk(base, cdesk) + "."
         base = (
             f"CDESK returned HTTP {status} after the client retried with "
             f"exponential backoff. The upstream service appears unavailable — "
             f"wait at least 30 seconds before retrying"
         )
-        return _append_cdesk(base, cdesk) + "."
+        return base + "."
     return (
         f"CDESK returned HTTP {status} during '{operation}': "
         f"{cdesk or _body_preview(body) or '<no body>'}"
@@ -213,11 +224,12 @@ def _translate_409(
 ) -> str:
     # Keyword search runs on raw body text (not the truncated preview) so a
     # discriminator past char 200 still classifies correctly.
-    # TODO(open-questions Q3): validate the recordUpdated / linked keywords
-    # against captured 409 bodies once the materials/ docs are accessible.
     raw_text = _body_to_text(body)
     lower = raw_text.lower()
-    if "recordupdated" in lower or "updated_at" in lower:
+    # "timestamp_check": the v3 lock refusal ("Conflict: the
+    # record was changed since you read it (stale or missing
+    # `timestamp_check`)", HTTP 409 on CI / maingroup / type PUTs).
+    if "recordupdated" in lower or "updated_at" in lower or "timestamp_check" in lower:
         base = (
             f"Optimistic-lock conflict{rid_suffix}: the record was modified by "
             f"someone else since it was last fetched. Re-fetch the record with "
@@ -254,7 +266,7 @@ def _append_cdesk(base: str, cdesk_reason: str) -> str:
 def _extract_cdesk_messages(body: Any) -> tuple[list[int], list[str]]:
     """Pull (codes, messages) lists from CDESK's response body.
 
-    Primary shape (v3 endpoints, verified live):
+    Primary shape (v3 endpoints):
         {"data": ..., "msg": {"error": [{"code": <int>, "message": <str>}, ...]}}
 
     Fallback shapes:
@@ -263,12 +275,10 @@ def _extract_cdesk_messages(body: Any) -> tuple[list[int], list[str]]:
         - The API-v3 gatekeeper returns a top-level `error` OBJECT, not a
           string: {"error": {"message": "Prístup k API v3 vyžaduje licenciu
           GOLD …", "code": 1}}. This is the shape every 403 from the v3
-          licence/ACL guard takes (verified live 2026-07-31 on two accounts,
-          across v3/user and v3/contract). Missing it made translate_error
-          fall through to "No additional detail in the response — likely an
-          ACL denial or a disabled module", which is actively WRONG here: the
-          cause is the account's licence tier, so the admin was sent to the
-          ACL and module-enabled screens instead of the licence assignment.
+          licence/ACL guard takes. Reading it keeps translate_error from
+          falling through to "likely an ACL denial or a disabled module",
+          which would point the admin at the ACL and module screens when the
+          cause is the account's licence tier.
     """
     codes: list[int] = []
     messages: list[str] = []
@@ -317,6 +327,37 @@ def _extract_cdesk_messages(body: Any) -> tuple[list[int], list[str]]:
                     ):
                         codes.append(code)
                     break
+
+    # Fallback: the reason nested INSIDE `data`, which is how the Schedule
+    # module reports a 500 — {"data": {"error": "Default filter not found"}}.
+    # Without it the 5xx branch would call the service unavailable and advise
+    # a retry, when the service is healthy and the condition is permanent.
+    # A plain-string `data` is the whole reason on some refusals, e.g. the CI
+    # save's duplicate inventory number: HTTP 403 with
+    # {"data": "Inventúrne číslo musí byť unikátne. Zmeny neboli uložené."}.
+    # Without it a validation refusal reads as an ACL denial.
+    if not messages:
+        data = body.get("data")
+        if isinstance(data, str) and data.strip():
+            messages.append(data.strip())
+        elif isinstance(data, dict):
+            for key in ("error", "message"):
+                value = data.get(key)
+                if isinstance(value, str) and value:
+                    messages.append(value)
+                    break
+                if isinstance(value, dict):
+                    text = value.get("message")
+                    if isinstance(text, str) and text:
+                        messages.append(text)
+                        code = value.get("code")
+                        if (
+                            not codes
+                            and isinstance(code, int)
+                            and not isinstance(code, bool)
+                        ):
+                            codes.append(code)
+                        break
 
     return codes, messages
 

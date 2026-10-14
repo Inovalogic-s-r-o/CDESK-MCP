@@ -4,42 +4,37 @@ cd_real_contracts).
 Six tools exposing the Deal v3 CRUD surface: list / get / get_enums /
 create / update / delete. Deal statuses, phases and category types are
 TENANT enum-table rows (with action codes and lang variants), so this module
-takes an EnumCache on `v3/contract/enums` — the 4th cached module after
-tasks/requests/catalogs.
+takes an EnumCache on `v3/contract/enums`.
 
-Status model (apiportal Model/Contract.php): `rc_status` carries the standard
+Status model: `rc_status` carries the standard
 ACTION CODE (10 received, 20 in progress, 25 delivered, 30 refused,
 80 completed), `rc_status_id` the tenant enum id; the server derives one from
-the other on writes. "Open" means action_code < 30. The sb `status` filter key
-additionally accepts the literal keywords 'open' / 'closed'.
+the other on writes. "Open" means action_code < 30. The `status` filter
+additionally accepts the keywords 'open' / 'closed' / 'completed' (the last is
+sent as action code 80, the COMPLETED code).
 
 Writes use RAW column names (`rc_title`, `id_company`, `rc_note`, …); the v1
 save whitelist silently drops anything else with a 200.
 
 READS return raw columns too. The Deal model declares an `id_rc`→`id` /
-`rc_title`→`name` keymap, but the v1 list path never applies it (it selects
-the columns unaliased and neither `getStdList` nor `getStdMany` remaps), so
-BOTH the list and the detail endpoint return `id_rc`/`rc_title` — verified
-live 2026-07-31. Read the id defensively (`id_rc` first, `id` as fallback) so
-this stays correct if the keymap is ever wired up. NOTE `docs/cdesk-api-v3.json`
-is stale here: its `/v3/contract` GET description still advertises the remap,
-while the backend's current annotation (ContractV3Controller class docblock,
-apiportal) explicitly says raw columns.
+`rc_title`→`name` keymap, but the API does not apply it, so BOTH the list
+and the detail endpoint return `id_rc`/`rc_title`. Read the id defensively
+(`id_rc` first, `id` as fallback) so this stays correct if the keymap is ever
+applied. `docs/cdesk-api-v3.json` describes the remap for the `/v3/contract`
+GET; the live API returns raw columns.
 
 Optimistic locking is
 hidden like the fill/task modules (GET fieldset=all → mutate → PUT echoing
 `timestamp_check`) — for deals the token is REQUIRED on update (a missing
 or stale one is a 409 recordUpdated conflict).
 
-Source-verified against the apiportal v1 handlers 2026-07-20; the live v3
-layer exists on the deployed backend only (no local checkout). Live E2E is
-gated on the `deal` ACL for the API user — see .ai/scripts/e2e_test_deal.py.
+The deal endpoints need the `deal` ACL for the API user.
 """
 
 from __future__ import annotations
 
 import inspect
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -53,7 +48,7 @@ from cdesk_mcp.field_policy import (
     refuse_if_violated,
     violations,
 )
-from cdesk_mcp.filters import build_deal_filter, encode_sb
+from cdesk_mcp.filters import adapt_sb_for_cdesk, build_deal_filter, encode_sb, w3c_datetime
 from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
     list_meta,
@@ -71,6 +66,15 @@ from cdesk_mcp.tools._helpers import (
     validate_fieldset,
     write_values_match,
 )
+from cdesk_mcp.tools._local_filter import (
+    NOT_EQUAL_CMP,
+    RANGE_CMPS,
+    ColumnRule,
+    LocalCondition,
+    filtered_page,
+    numeric_picker,
+    split_conditions,
+)
 from cdesk_mcp.tz import localize_naive_datetime, tenant_timezone
 
 # Enum labels written next to the raw values (see the module docstring's status
@@ -87,9 +91,11 @@ _DEAL_ENUM_LABELS = (
 # Pagination upper bound — mirrors the other modules' 100 cap.
 _MAX_PER_PAGE = 100
 
-# The backend's `status` filter keywords (Model/Contract.php
-# STATUS_GROUP_OPEN/CLOSED): open = action_code < 30, closed = >= 30.
+# CDESK's `status` filter keywords: open = action_code < 30, closed = >= 30.
 _STATUS_KEYWORDS = ("open", "closed")
+# CDESK matches the keyword `completed` to nothing; it names action code 80.
+_COMPLETED_KEYWORD = "completed"
+_COMPLETED_CODE = 80
 
 # Compact per-entry projection for get_deal_enums — the raw rows carry
 # ~30 presentation fields (icons, colors, per-locale names) that just burn
@@ -166,7 +172,6 @@ def register_deal_tools(
                 responsible_person_id=responsible_person_id,
                 for_invoicing=for_invoicing,
                 due_after=due_after,
-                due_before=due_before,
                 created_after=created_after,
                 created_before=created_before,
                 updated_after=updated_after,
@@ -178,9 +183,24 @@ def register_deal_tools(
             apply_field_scope(params, fieldset, fields)
             if sort:
                 params["sort"] = resolve_sort("deals", sort)
+            sb, local = split_conditions(adapt_sb_for_cdesk(sb, "deals"), _deal_condition)
+            if due_before is not None:
+                local.append(_due_before_condition(due_before))
             if sb is not None:
                 params["sb"] = encode_sb(sb)
-            response, paging = await client.get_page("v3/contract", params=params)
+            local_info: dict[str, Any] | None = None
+            if not local:
+                response, paging = await client.get_page("v3/contract", params=params)
+                records, meta = unwrap_list(response)
+            else:
+                records, meta, paging, local_info = await filtered_page(
+                    client, "v3/contract", params, local, page=page, per_page=per_page,
+                    fields=fields, cap=_LOCAL_FILTER_CAP, id_col="id_rc",
+                    narrow_hint="narrow the list first (customer, status, title or due_after)",
+                    note="CDESK cannot apply these conditions correctly; the connector "
+                         "fetched every deal matching the rest of the filter and "
+                         "applied them itself.",
+                )
         except RuntimeError:
             raise
         except ValueError as e:
@@ -188,10 +208,11 @@ def register_deal_tools(
         except Exception as e:
             raise to_llm_error(e, operation="list_deals") from e
 
-        records, meta = unwrap_list(response)
         meta.pop("enums", None)
         await add_enum_names(cache, records, _DEAL_ENUM_LABELS)
         result = {"items": records, "meta": list_meta(meta, paging, dropped=dropped_clauses), "page": page, "per_page": per_page}
+        if local_info is not None:
+            result["filtered_by_connector"] = local_info
         if dropped_clauses:
             result["unsupported_filters"] = unsupported_filter_directive(dropped_clauses)
         return result
@@ -261,20 +282,6 @@ def register_deal_tools(
                 "be cleared on update)."
             ),
         }
-        # This endpoint is NOT gated by `contract.enabled`, so it answers 200
-        # with the full enum lists even when the module is off — the only
-        # signal is settings.enabled, which is easy to miss among ~17 keys.
-        # Say it outright, or the enum lists read as "module is usable".
-        settings = result.get("settings")
-        if isinstance(settings, dict) and settings.get("enabled") is False:
-            result["module_disabled"] = (
-                "The Zákazky (deal) module is DISABLED for this tenant "
-                "(settings.enabled=false). The status/phase/type lists below "
-                "are returned anyway because this endpoint is not gated, but "
-                "list_deals / get_deal / update_deal fail with 'Modul vypnutý' "
-                "and the write tools refuse. Do not present the module as "
-                "available; an administrator must enable it first."
-            )
         return result
 
     @mcp.tool(
@@ -304,9 +311,9 @@ def register_deal_tools(
         tag_ids: list[int] | None = None,
     ) -> dict[str, Any]:
         try:
-            await _require_module_enabled(cache, "create_deal")
+            await cache.load()
             # Beyond title/customer/status, every configurable field follows the
-            # TENANT's deal form, read live (the guard above loaded the settings):
+            # TENANT's deal form, read live (loaded just above):
             # an off field is refused, a required one must be given
             # (field_policy.py) — CDESK's own errors name neither the parameter
             # nor the setting.
@@ -384,7 +391,7 @@ def register_deal_tools(
         tag_ids: list[int] | None = None,
     ) -> dict[str, Any]:
         try:
-            await _require_module_enabled(cache, "update_deal")
+            await cache.load()
             # Same form rules as create: an off field may not be set, a required
             # one not cleared (left out = unchanged).
             refuse_if_violated(violations(_DEAL_FIELDS, getattr(cache, "settings", None), {
@@ -450,10 +457,6 @@ def register_deal_tools(
     )
     async def delete_deal(id: int) -> dict[str, Any]:
         try:
-            await _require_module_enabled(cache, "delete_deal")
-        except RuntimeError:
-            raise
-        try:
             await client.delete(f"v3/contract/{id}")
         except Exception as e:
             raise to_llm_error(e, operation="delete_deal", record_id=id) from e
@@ -462,10 +465,10 @@ def register_deal_tools(
 
 # --- internals ----------------------------------------------------------
 
-# Body column -> stored column for the write read-back. Every pair here has
-# been round-tripped live (2026-07-31) so the normalizers below know the exact
-# stored shape; anything unverified is deliberately absent rather than guessed,
-# because a FALSE "not stored" warning is worse than a missing one.
+# Body columns checked by the write read-back. Only columns whose stored shape
+# is known are listed, so the normalizers compare like with like; anything else
+# is deliberately absent rather than guessed, because a FALSE "not stored"
+# warning is worse than a missing one.
 _READ_BACK_FIELDS: tuple[str, ...] = (
     "rc_title", "rc_code", "id_company", "rc_status_id", "cat_type_id",
     "rc_phase_id", "order_number", "rc_note",
@@ -495,11 +498,8 @@ async def _verify_write(
 ) -> dict[str, Any]:
     """Re-read the record and warn about anything sent but not stored.
 
-    Deal writes answer `{data: <id>}` with NO `savedData`, so
-    annotate_write_warnings has nothing to diff and a silent drop would be
-    invisible — the tool would report success for a value CDESK discarded. A
-    read-back is the only way to honour "never claim a value was stored when it
-    wasn't", so it costs one extra GET per write.
+    The write response is not a reliable record of what was stored, so the
+    check reads the deal back; it costs one extra GET per write.
     """
     if not isinstance(deal_id, int):
         return response
@@ -543,55 +543,52 @@ async def _verify_write(
     return {**response, "warnings": warnings}
 
 
-async def _require_module_enabled(cache: EnumCache, operation: str) -> None:
-    """Refuse a WRITE when the tenant has the Zákazky module switched off.
+# Conditions CDESK cannot apply correctly on the deal list, applied by the
+# connector (tools/_local_filter.py): a range on the deal number `rc_num`
+# answers HTTP 500 (BETWEEN matches nothing), a range or `!=` on `id` or
+# `id_customer` is read as equality, and the due-date upper bound also matches
+# deals that have no due date. On a deal row the id is `id_rc` and the
+# customer `id_company`.
+_LOCAL_FILTER_CAP = 2000
+_deal_condition = numeric_picker({
+    "rc_num": ColumnRule(RANGE_CMPS),
+    "id": ColumnRule(RANGE_CMPS | {NOT_EQUAL_CMP}, "id_rc"),
+    "id_customer": ColumnRule(RANGE_CMPS | {NOT_EQUAL_CMP}, "id_company"),
+})
 
-    CDESK gates the module inconsistently: with `contract.enabled` false the
-    GET list/detail and the PUT return 403 'Modul vypnutý', but **POST and
-    DELETE return 200 and really do mutate** (verified live 2026-07-31 —
-    created CDD-1 twice on a disabled tenant, then deleted it, all reported as
-    success while GET on the same id answered 'Modul vypnutý'). So a user was
-    told "Zákazka … uložená" for a record they then could not read back.
 
-    The state is knowable client-side: `v3/contract/enums` is itself ungated
-    and reports `settings.enabled`. This guard is a MITIGATION, not the fix —
-    the backend should gate its own writes, since any other API client bypasses
-    us. See docs/bugs/deals.md.
-    """
-    # The enums are fetched per tool call, and the guard runs before anything
-    # else in the call has read them — so load them here, or `settings` is
-    # empty and the guard silently waves every write through. Unreadable
-    # settings mean "unknown": never block on a guess.
+
+def _as_instant(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
     try:
-        await cache.load()
-    except Exception:  # noqa: BLE001
-        return
-    if _module_disabled(cache):
-        raise RuntimeError(
-            f"{operation} refused: the CDESK Zákazky (deal) module is DISABLED "
-            f"for this tenant (`contract.enabled` is off, reported as "
-            f"settings.enabled=false by get_deal_enums). Reads already fail "
-            f"with 'Modul vypnutý', but this write would be ACCEPTED by CDESK "
-            f"and create a record nobody can read back, so it was not sent. "
-            f"An administrator enables the module under the tenant's global "
-            f"settings ('Zapnúť modul Zákazky')."
-        )
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00").replace(" ", "T", 1))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _module_disabled(cache: EnumCache) -> bool:
-    """True only when the tenant explicitly reports the module off. Absent or
-    unreadable settings mean "unknown" — never block on a guess."""
-    settings = getattr(cache, "settings", None)
-    if not isinstance(settings, dict):
-        return False
-    return settings.get("enabled") is False
+def _due_before_condition(due_before: str) -> LocalCondition:
+    """Due on or before the bound (a bare date means the end of that day,
+    tenant-local); a deal with no due date does not match."""
+    bound_text = w3c_datetime("due_before", due_before, end_of_day=True)
+    bound = _as_instant(bound_text)
+    if bound is None:
+        raise ValueError(f"due_before={due_before!r} is not a usable date")
+
+    def test(raw: Any) -> bool:
+        due = _as_instant(raw)
+        return due is not None and due <= bound
+
+    return LocalCondition("due_date", f"due_date <= {bound_text}", test)
 
 
 async def _resolve_status_filter(
     cache: EnumCache, status: str | int | None
 ) -> int | str | None:
     """List-filter status: pass ints (enum id or action code) through, accept
-    the backend keywords 'open'/'closed', resolve any other string as a tenant
+    the keywords 'open'/'closed' (and 'completed' as its action code), resolve
+    any other string as a tenant
     status NAME → enum id (tenant enum ids are always > 80, so the backend's
     id-vs-action-code dispatch picks rc_status_id matching)."""
     if status is None or isinstance(status, int):
@@ -599,6 +596,8 @@ async def _resolve_status_filter(
     lowered = status.strip().lower()
     if lowered in _STATUS_KEYWORDS:
         return lowered
+    if lowered == _COMPLETED_KEYWORD:
+        return _COMPLETED_CODE
     if lowered.isdigit():
         return int(lowered)
     return await resolve_enum_or_raise(cache, "status", status, kind="deal status")
@@ -745,8 +744,7 @@ async def _fetch_for_update(client: CdeskClient, id: int) -> dict[str, Any]:
 
 def _apply_lock_token(body: dict[str, Any], current: dict[str, Any]) -> None:
     """Echo timestamp_check when the record carries one. A never-updated
-    deal has update_date null — then the backend's hasBeenUpdated()
-    reports no conflict and the token can be safely omitted."""
+    deal has update_date null — then CDESK reports no conflict and the token can be safely omitted."""
     token = current.get("timestamp_check")
     if token:
         body["timestamp_check"] = token
@@ -760,9 +758,8 @@ _LIST_DEALS_DESC = inspect.cleandoc(
     keys are the RAW DB columns: the deal id arrives as `id_rc` and the
     title as `rc_title` — there are NO `id`/`name` keys on a deal row
     (unlike most other modules). Other keys are likewise raw (rc_num, rc_code,
-    rc_status, rc_status_id, due_date, ...). In list rows `rc_title` is
-    prefixed with the deal number ("CDD-1: Alpha"); get_deal returns
-    it unprefixed.
+    rc_status, rc_status_id, due_date, ...). `rc_title` is the bare title;
+    `display_name` carries the numbered label ("CDD-1: Alpha").
 
     NOTE: unless the account has the 'deal/from-others' right, the server
     silently narrows the list to deals where the caller is responsible,
@@ -771,26 +768,51 @@ _LIST_DEALS_DESC = inspect.cleandoc(
 
     Common filters:
       - status: a tenant status NAME (see get_deal_enums), a status id,
-        or the literal keywords 'open' (not yet refused/completed) / 'closed'.
+        or the keywords 'open' (not yet refused/completed) / 'closed' /
+        'completed'.
       - customer_id / customer_name: owning customer (id or name search).
       - title / code / text_search: text matching (text_search also spans
         rc_num and the customer name).
       - phase_name / cat_type_name: resolved against the tenant enums.
       - responsible_person_id, for_invoicing (has amounts ready to invoice),
       - due_after / due_before, created_*/updated_* windows (ISO-8601).
+        due_after / due_before filter the deal's `due_date` (its closing
+        date), not `est_due_date`. due_before is applied by this tool (CDESK's own upper bound also
+        matches deals with no due date): it reads every deal matching the
+        other filters (up to 2000) and keeps those due on or before the
+        bound; the result carries a `filtered_by_connector` block.
 
     For advanced filters pass sb_raw as an sb filter object for the CDESK API v3
     deal list (JSON string or object, structured tree form; see
     docs/cdesk-api-v3.json). Allowed columns
-    (source-verified 2026-07-20; NOTE the FILTER keys are named differently
+    (NOTE the FILTER keys are named differently
     from the response keys above — to filter, the id key is `id` (not
     `id_rc`), title is `title` (not `rc_title`), customer is `id_customer`
     (not `id_company`)): id, title, code, rc_num,
     id_customer, company.name, status, rc_status (strictly-less-than action
     code), type, phase, responsible_person_id, tag, subtree, for_invoicing,
     dateFrom/dateTo (due-date bounds), due_date, created_at, updated_at,
-    last_invoice_issue_date, updated_by, plus the no-col text leaf. Clauses on
+    last_invoice_issue_date, updated_by (user id, `=` only — a name does not
+    match), plus the no-col text leaf. Clauses on
     other columns are stripped and reported in `unsupported_filters`.
+    A range on rc_num (>, >=, <, <=, BETWEEN), and a range or a single-value
+    '!=' on id or id_customer, are applied by this tool, because CDESK cannot
+    compare them that way: it fetches every
+    deal matching the rest of the filter (up to 2000) and keeps the matching
+    ones, reported in `filtered_by_connector`; such a condition must be
+    joined to the rest by AND. status takes the keywords open / closed /
+    completed, action codes or status ids. rc_status is always compared as
+    "strictly less than the value", whatever the comparator; '>', '>=', '<=',
+    '!=' and BETWEEN on it are refused — for an exact status use `status`.
+    for_invoicing takes '=' 1 /
+    '=' 0 ('> 0' is read as '=' 1). subtree works on codes shaped
+    "<PREFIX> <number>/<suffix>" and needs '*' or '@': 'ZML*' (codes starting
+    'ZML '), 'ZML*2026' ('ZML <n>/2026'), 'ZML@' (starting 'ZML ' without
+    '<n>/<n>'), '@' (not starting with a word and a space). Date presets (TODAY, THIS_WEEK, …) on the
+    date columns are sent as the BETWEEN window they name, in tenant time;
+    due_date is the deal's actual closing date, not est_due_date. A list of
+    values in '=' or '!=' matches any / none of them. '!=' leaves out deals
+    with an empty value in that column.
     """
 )
 

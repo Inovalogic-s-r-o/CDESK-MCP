@@ -146,11 +146,11 @@ _MS_LOGO_SVG = (
 
 # Turns the one-page form into the two-step flow, and drives the Microsoft button.
 #
-# PROGRESSIVE ENHANCEMENT, deliberately. The HTML ships as the old single-step form
+# PROGRESSIVE ENHANCEMENT, deliberately. The HTML ships as a single-step form
 # with everything visible and enabled; this script is what hides step 2 and shows
-# the Verify button. So a browser with JS off gets exactly the page that worked
-# before, and no <noscript> stylesheet is needed. Two consequences that are easy to
-# get wrong if this is ever inverted:
+# the Verify button. So a browser with JS off gets a working single-step form, and
+# no <noscript> stylesheet is needed. Two consequences that are easy to get wrong
+# if this is ever inverted:
 #   * step 2's inputs are `required`; a hidden required field makes Chrome refuse to
 #     submit with "An invalid form control is not focusable" and NO visible error.
 #     They are therefore `disabled` while hidden (which removes them from validation
@@ -236,7 +236,7 @@ _TWO_STEP_JS = """<script>
       if(inFlight){inFlight.abort();}
       var ctrl=new AbortController();
       inFlight=ctrl;
-      // Our own server, not the customer's — but the tunnel can drop, so bound it.
+      // Our own server, not the customer's — but the connection can drop, so bound it.
       var timer=setTimeout(function(){ctrl.abort();},8000);
       verifyBtn.disabled=true;
       verifyBtn.textContent='Checking\\u2026';
@@ -339,11 +339,10 @@ def _signin_error_text(e: CdeskAuthError) -> str:
 # What a probe outcome means to the person typing the address, and — the load-
 # bearing half — whether it may stop them.
 #
-# BLOCKING IS ONLY EVER FOR A CONFIDENT NEGATIVE. See the "don't add a pre-flight
-# probe back" comment on the authenticate() call below: a /auth/me probe once made
-# every login depend on one endpoint's health, and when it 500'd on an otherwise
-# healthy tenant nobody could sign in. /api/auth/connector is public and
-# documented, which makes it a better probe, not a safe gate. So an answer that
+# BLOCKING IS ONLY EVER FOR A CONFIDENT NEGATIVE. Gating sign-in on a probe would
+# make every login depend on one endpoint's health (see the authenticate() call
+# below). /api/auth/connector is public and documented, which makes it a good
+# probe, not a safe gate. So an answer that
 # merely fails to confirm — a timeout, a 401 from a Basic-auth proxy, a 404, a 5xx
 # — warns and lets the sign-in proceed. Only "we know this is wrong" stops it.
 #
@@ -455,7 +454,7 @@ def _server_url_field_html(value: str) -> str:
 
     Deliberately ``type="text"`` rather than ``type="url"``: a url input's browser
     validation rejects a scheme-less address outright, with a popup we can't word,
-    before the server ever sees it. Since we now accept ``cdesk.example.com`` and
+    before the server ever sees it. Since we accept ``cdesk.example.com`` and
     add the ``https://`` ourselves, that check would block the most natural input.
     ``inputmode=url`` still gets the right mobile keyboard, and the address is
     validated (and canonicalized) server-side by ``normalize_base_url``."""
@@ -730,13 +729,10 @@ def register_login_route(
         # documented POST /auth/login — which both proves the credentials and
         # captures the apitoken + refresh token we carry onward.
         #
-        # It deliberately does NOT probe a second endpoint afterwards. This used to
-        # trigger the same lazy login via a GET /auth/me probe; that made every
-        # connector login depend on one undocumented endpoint, and when it started
-        # returning 500 on a tenant whose data endpoints were all fine, nobody
-        # could sign in. /auth/login already distinguishes 200 / 401 / 302 (2FA),
-        # so the extra round trip added a failure mode and no information. The
-        # probe helper has been deleted — don't add one back.
+        # It deliberately does NOT probe a second endpoint afterwards: that would
+        # make every connector login depend on that endpoint's health, and
+        # /auth/login already distinguishes 200 / 401 / 302 (2FA), so an extra
+        # round trip would add a failure mode and no information.
         validation_client = provider.build_cdesk_client(login_name, password, base_url)
         try:
             await validation_client.authenticate()  # POST /auth/login

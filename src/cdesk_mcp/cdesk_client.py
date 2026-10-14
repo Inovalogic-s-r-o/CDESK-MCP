@@ -21,7 +21,7 @@ Every login and renew sends ``accessType: 3`` (MCP / AI connector). With it
 CDESK gives the refresh token a 30-day lifetime, independent of ``auto_logout``,
 and each renew pushes it out another 30 days (it is not rotated). The flag is not
 remembered server-side: a renew without it shrinks the token back to
-``auto_logout``. See docs/v3-zmeny-pre-mcp.md §1.
+``auto_logout``.
 
 The password lives only in this process's memory; it is never logged or written.
 Logs include the request method, path, status, and duration — never headers,
@@ -50,7 +50,7 @@ _JWTTOKEN_PATH = "auth/jwttoken"
 _RENEW_PATH = "auth/renewtokens"
 _LOGOUT_PATH = "logout"
 _HEALTH_PATH = "v3/task/enums"
-# CDESK's `accessType` for an MCP / AI connector (apiportal `Token::MCP_APP`).
+# CDESK's `accessType` for an MCP / AI connector.
 # Must be sent on EVERY login and renew: CDESK keeps it only for the one request,
 # so a renew without it cuts the refresh token back to the user's auto_logout.
 _MCP_ACCESS_TYPE = 3
@@ -78,14 +78,13 @@ def normalize_api_base(base_url: str) -> str:
 
     Accept the tenant root with or without an ``/api`` suffix; callers always talk
     to ``<tenant>/api/``. Strip a trailing ``/api`` so it can be re-added
-    canonically — that way `.env` only carries the bare URL
-    (https://cmpp.seal.sk) while older configs that still include /api keep
-    working.
+    canonically — that way `.env` carries the bare URL
+    (https://cdesk.example.com) and a URL that already includes /api works too.
 
     Module-level (not just a CdeskClient method) because ``oauth/_connector.py``
     builds ``/api/auth/connector`` from a user-typed address and must apply exactly
-    the same rule: concatenating blindly produced ``/api/api/auth/connector`` for
-    an address that signs in fine."""
+    the same rule: concatenating blindly would produce ``/api/api/auth/connector``
+    for an address that signs in fine."""
     normalized_base = base_url.rstrip("/")
     if normalized_base.endswith("/api"):
         normalized_base = normalized_base[: -len("/api")]
@@ -239,8 +238,8 @@ class CdeskClient:
         """The underlying httpx client, with a cookie jar that accepts nothing.
 
         CDESK auth travels entirely in the ``Authorization`` header. But
-        /auth/login also sets a ``refreshToken`` cookie, and apiportal's
-        ``User::byToken`` extends the refresh token to the user's *auto_logout*
+        /auth/login also sets a ``refreshToken`` cookie, and CDESK
+        resets the refresh token's expiry to the user's *auto_logout*
         on every request that carries that cookie — so a client that echoed it
         back would quietly undo the 30-day MCP lifetime on ordinary traffic.
         ``transport`` is a test seam."""
@@ -370,12 +369,9 @@ class CdeskClient:
         all three are classified by `_login_now`). Nothing else is requested, so
         no module ACL is involved and no other endpoint can make it fail.
 
-        Prefer this over calling some arbitrary GET just to trigger the login.
-        Doing that couples credential validation to an unrelated endpoint's
-        availability: `oauth/login.py` once used a `GET /auth/me` probe that way,
-        and a 500 on that one undocumented endpoint took down connector login on
-        a tenant whose data endpoints were all healthy. That helper has since
-        been removed — do not reintroduce it.
+        Validating credentials with POST /auth/login alone keeps login
+        independent of any other endpoint's availability or module ACL, which
+        calling some arbitrary GET just to trigger the login would not.
 
         Honors the same credential precedence as any other request (m2m pair →
         CDESK refresh token → password), so it is valid for every client kind."""

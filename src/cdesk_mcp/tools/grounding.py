@@ -1,7 +1,6 @@
 """Grounded ("100% truth") answering, generalized across CDESK modules.
 
-The truth-gate that used to live only in the Request module now works for any
-domain the API can fetch — requests, tasks, customers, users, fills. Two tools
+The truth-gate works for any domain the API can fetch — requests, tasks, customers, users, fills. Two tools
 plus a prompt implement the grounding contract:
 
 - ``collect_records(domain, ...)`` — page through ALL records of a domain that
@@ -37,6 +36,7 @@ from cdesk_mcp.config import DEFAULT_EVIDENCE_THRESHOLD
 from cdesk_mcp.enums import EnumCache
 from cdesk_mcp.filters import (
     USER_TYPE_LABELS,
+    user_type_label,
     build_customer_filter,
     build_fill_filter,
     build_request_filter,
@@ -148,8 +148,7 @@ async def _resolve_request_filter(
         cache, "priority", f.get("priority_name"), kind="priority", field="action_code"
     )
     place_id = await resolve_enum_or_raise(cache, "place", f.get("place_name"), kind="place")
-    # Category type: sb `type` filters cat_type_id (backend JCD-32964); resolve
-    # the NAME → id. base_type is the raw base-type letter ('H'/'C'/…).
+    # Category type: sb `type` filters cat_type_id; resolve the NAME → id. base_type is the raw base-type letter ('H'/'C'/…).
     cat_type_id = await resolve_enum_or_raise(
         cache, "cat_type_id", f.get("cat_type_name"), kind="cat_type"
     )
@@ -160,8 +159,8 @@ async def _resolve_request_filter(
         priority_id=priority_id,
         cat_type_id=cat_type_id,
         base_type=f.get("base_type"),
-        # `company` mirrors the list_requests/create_request param name; accept
-        # the legacy `customer_id` key too as a transitional alias.
+        # `company` mirrors the list_requests/create_request param name;
+        # `customer_id` is accepted too as an alias.
         customer_id=f.get("company", f.get("customer_id")),
         solver_id=f.get("solver_id"),
         solver_group_id=f.get("solver_group_id"),
@@ -185,12 +184,11 @@ async def _resolve_task_filter(
         raise RuntimeError("tasks domain is missing its enum cache")
     status_id = await resolve_enum_or_raise(cache, "status", f.get("status_name"), kind="status")
     type_id = await resolve_enum_or_raise(cache, "type", f.get("type_name"), kind="type")
-    # NB: only_open/only_late remain removed — the sb TRUE/FALSE path can't
-    # reach those whereFilter branches (string 'TRUE' vs boolean true), which
-    # would poison absence verdicts with a false sense of scope.
-    # created_after/before are back: they work via the whereFilter key
-    # `created_at` with W3C-normalized values (build_task_filter handles the
-    # normalization; verified live 2026-06-04).
+    # NB: no only_open/only_late — the sb TRUE/FALSE path can't reach those
+    # whereFilter branches (string 'TRUE' vs boolean true), which would poison
+    # absence verdicts with a false sense of scope. created_after/before work
+    # via the whereFilter key `created_at` with W3C-normalized values
+    # (build_task_filter handles the normalization).
     return build_task_filter(
         text_search=f.get("text_search"),
         status_id=status_id,
@@ -212,7 +210,7 @@ async def _resolve_customer_filter(
     cache: EnumCache | None, f: dict[str, Any]
 ) -> dict[str, Any] | None:
     # No enum cache — `cache` is None and never used. `status` is a raw
-    # single-char flag (e.g. "A"); the customer sb honors `status` (verified).
+    # single-char flag (e.g. "A"); the customer sb honors `status`.
     return build_customer_filter(
         text_search=f.get("text_search"),
         status=f.get("status"),
@@ -225,6 +223,11 @@ async def _resolve_user_filter(
 ) -> dict[str, Any] | None:
     # No enum cache — `cache` is None and never used.
     user_type = f.get("user_type")
+    if isinstance(user_type, str):
+        try:
+            user_type = user_type_label(user_type)
+        except ValueError:
+            pass
     if user_type is not None and user_type not in USER_TYPE_LABELS:
         # Mirror list_users' client-side guard so a bogus type can't silently
         # match zero rows and turn an absence claim into a false confirmed_absence.
@@ -234,8 +237,8 @@ async def _resolve_user_filter(
         )
     # NB: no only_deleted — the endpoint only honors it as a FLAT query param
     # (onlyDeleted=1), which the grounding engine's sb-only list call can't
-    # carry; via sb it silently matched ACTIVE users (verified live), which
-    # would poison absence verdicts. Removed rather than mislead.
+    # carry; via sb it silently matches ACTIVE users, which would poison
+    # absence verdicts. Left out rather than mislead.
     return build_user_filter(
         text_search=f.get("text_search"),
         company_id=f.get("company_id"),
@@ -283,8 +286,8 @@ async def _resolve_fill_filter(
 _REQUEST_FILTER_KEYS = frozenset({
     "text_search", "status_name", "status_group", "priority_name", "place_name",
     "cat_type_name", "base_type",
-    # `company` matches the list_requests param; `customer_id` kept as a
-    # transitional alias (see _resolve_request_filter).
+    # `company` matches the list_requests param; `customer_id` is an alias
+    # (see _resolve_request_filter).
     "company", "customer_id",
     "solver_id", "solver_group_id", "catalog_id", "deal_id",
     "project_contract_id", "branch_id", "superior_request_id",
@@ -373,8 +376,7 @@ def build_domains(
             allowed_filter_keys=_REQUEST_FILTER_KEYS,
             filter_help=_REQUEST_FILTER_HELP,
             status_by_action_code=True,
-            # Live v3 request detail: id_company / id_solver / solver_group_id
-            # (verified 2026-10-09).
+            # The v3 request detail: id_company / id_solver / solver_group_id.
             scope_fields=(
                 ("company", "id_company"),
                 ("solver_id", "id_solver"),
@@ -454,7 +456,7 @@ def build_domains(
             list_endpoint="v3/fill",
             detail_template="v3/fill/{id}",
             # PK is `id` (the record's `fill_id` is a self/group ref and is null
-            # on a plain fill — verified live 2026-06-24).
+            # on a plain fill).
             id_fields=("id", "fill_id"),
             num_fields=("num",),
             title_fields=("description", "name"),
@@ -665,10 +667,9 @@ def register_grounding_tools(
                         if not disc:
                             return False
                         # Cap discussion text like the body text so the context
-                        # budget the cap protects isn't blown (BUG 5a). No
-                        # truthiness gate: 0 must cap to "" (ids/titles-only
-                        # sweep), not mean "unlimited" — `if cap and ...` made
-                        # 0 return FULL threads, the opposite of the contract.
+                        # budget the cap protects isn't blown. No truthiness
+                        # gate: 0 must cap to "" (ids/titles-only sweep), not
+                        # mean "unlimited".
                         capped = False
                         if len(disc) > text_chars_per_record:
                             disc = disc[:text_chars_per_record]
@@ -726,7 +727,7 @@ def register_grounding_tools(
                 else evidence_threshold
             )
             # Memoize fetches across all claims/evidence in this call so a record
-            # cited more than once is fetched once (round-2 BUG 8); the caches
+            # cited more than once is fetched once; the caches
             # hold in-flight Tasks so this holds even though claims run
             # concurrently. A semaphore bounds load on CDESK; gather preserves
             # claim order.
@@ -792,7 +793,7 @@ def register_grounding_tools(
 class _VerifyCaches:
     """Per-verify_claims-call memo. The fetch caches hold in-flight Tasks so
     concurrently-verified claims citing the same record (or the same customer)
-    share one fetch (round-2 BUG 8)."""
+    share one fetch."""
 
     status_names: dict[Any, str]
     records: dict[int, "asyncio.Task[dict[str, Any] | None]"] = field(default_factory=dict)
@@ -840,7 +841,7 @@ def _first_field(rec: dict[str, Any], fields: tuple[str, ...]) -> Any:
 
 def _meta_total(meta: dict[str, Any]) -> int | None:
     """Best-effort total-record count from list meta. CDESK's field name isn't
-    contractually documented (see unwrap_list), so we probe the common keys.
+    contractually documented (see unwrap_list), so the common keys are tried.
     Display-only — the truth-gate never depends on this value."""
     for key in ("totalItems", "total", "totalCount", "recordsTotal", "count"):
         value = meta.get(key)
@@ -864,8 +865,8 @@ def _record_text(
     SINGLE source of truth for what collect_records DISPLAYS and what
     verify_claims MATCHES against — both derive from here so the two can never
     drift. The truth-gate depends on that: the LLM must be able to verify a
-    quote copied from exactly what it was shown (rounds 1–2 BUG 3/7). Pass
-    normalize_for_display to read, normalize_for_match to compare.
+    quote copied from exactly what it was shown. Pass normalize_for_display to
+    read, normalize_for_match to compare.
 
     title = first non-empty title field; body = all non-empty body fields joined
     with a space (so a quote spanning two body fields still verifies, while one
@@ -893,12 +894,11 @@ def _collect_entry(
 ) -> tuple[dict[str, Any], bool]:
     """Project a raw record to a compact evidence entry. Returns
     (entry, text_was_truncated). `status_names` maps status enum id → name so
-    the LLM gets a readable status instead of an opaque id (BUG 4)."""
+    the LLM gets a readable status instead of an opaque id."""
     title, text = _record_text(domain, rec, normalize_for_display)
     truncated = False
     # No truthiness gate: text_chars_per_record=0 must cap to "" (a cheap
-    # ids/titles-only sweep), not mean "unlimited" — `if cap and ...` made 0
-    # return FULL bodies for up to 1000 records, the opposite of the contract.
+    # ids/titles-only sweep), not mean "unlimited".
     if len(text) > text_chars_per_record:
         text = text[:text_chars_per_record]
         truncated = True
@@ -950,7 +950,7 @@ def _discussion_text(
     """Flatten discussion message bodies into ONE string, each cleaned by
     `normalize`. SINGLE source of truth for the discussion text collect_records
     DISPLAYS and verify_claims MATCHES against — both derive from here so they
-    can't drift (rounds 1–2 BUG 1/7)."""
+    can't drift."""
     parts: list[str] = []
     for msg in records:
         if not isinstance(msg, dict):
@@ -974,10 +974,10 @@ async def _safe_discussion_text(
 def _record_match_units(domain: GroundingDomain, record: dict[str, Any]) -> list[str]:
     """The record's text in the SAME units collect_records displays — title as
     one unit, joined body as one unit — match-normalized via _record_text, the
-    shared source of truth. A quote spanning two body fields still verifies
-    (round-2 BUG 7); one crossing the title/body boundary (shown separately)
-    still fails (round-1 BUG 3). Empty units are dropped so a markup-only field
-    can't become a universal-match hole."""
+    shared source of truth. A quote spanning two body fields still verifies;
+    one crossing the title/body boundary (shown separately) still fails. Empty
+    units are dropped so a markup-only field can't become a universal-match
+    hole."""
     title, body = _record_text(domain, record, normalize_for_match)
     return [u for u in (title, body) if u]
 
@@ -990,10 +990,9 @@ async def _discussion_match_text(
 ) -> str:
     """Match-normalized discussion text as ONE unit, mirroring the display
     (_safe_discussion_text) via the shared _discussion_text so a quote copied
-    from the shown thread verifies (round-1 BUG 1, round-2 BUG 7). Memoized per
-    verify call (round-2 BUG 8) via an in-flight Task so concurrent claims share
-    one fetch; a fetch failure yields "" (the quote then can't be confirmed from
-    discussion), RuntimeError propagates."""
+    from the shown thread verifies. Memoized per verify call via an in-flight
+    Task so concurrent claims share one fetch; a fetch failure yields "" (the
+    quote then can't be confirmed from discussion), RuntimeError propagates."""
     task = cache.get(record_id)
     if task is None:
         task = asyncio.ensure_future(_load_discussion_match(client, spec, record_id))
@@ -1091,7 +1090,7 @@ async def _verify_one_claim(
         qn = normalize_for_match(quote)
         # Gate on the NORMALIZED length. A raw quote of only HTML/entities/
         # whitespace can be 15+ chars yet normalize to "" — and "" is a substring
-        # of every string, which would forge the gate (round-2 BUG 6).
+        # of every string, which would forge the gate.
         if len(qn) < MIN_QUOTE_CHARS:
             invalid.append({"record_id": rid, "quote": quote, "reason": f"quote normalizes to fewer than {MIN_QUOTE_CHARS} chars"})
             continue
@@ -1102,8 +1101,7 @@ async def _verify_one_claim(
         context = await _record_context(client, domain, record, caches)
         # Subject check before the quote check: a quote that really is in the
         # record still proves nothing about a customer/solver the record does
-        # not belong to (UAT 2026-10-09: a request of customer 65 "confirmed" a
-        # claim about customer 74).
+        # not belong to.
         mismatch = _scope_mismatch(domain, record, expected)
         if mismatch is not None:
             invalid.append({
@@ -1115,9 +1113,9 @@ async def _verify_one_claim(
             continue
         # Match against the SAME units collect_records displays — title as one
         # unit, the joined body as one unit — so a quote copied verbatim from what
-        # the LLM was shown verifies even if it spans two body fields (round-2
-        # BUG 7), while a span crossing the title/body boundary (shown as separate
-        # fields) still fails (round-1 BUG 3).
+        # the LLM was shown verifies even if it spans two body fields, while a
+        # span crossing the title/body boundary (shown as separate fields) still
+        # fails.
         units = units_cache.get(rid)
         if units is None:
             units = _record_match_units(domain, record)
@@ -1129,7 +1127,7 @@ async def _verify_one_claim(
             continue
         # Not in the record's own fields — for domains with a discussion thread
         # (requests) it may have been quoted from the thread that
-        # collect_records(include_discussion=True) surfaced (round-1 BUG 1).
+        # collect_records(include_discussion=True) surfaced.
         if domain.discussion is not None:
             disc = await _discussion_match_text(
                 client, domain.discussion, rid, caches.discussions
@@ -1322,8 +1320,8 @@ async def _verify_absence(
     # Resolve enums + build the filter under a local guard so an unknown filter
     # key, a bad enum name, or a malformed date in THIS absence_query becomes a
     # per-claim `error` verdict instead of aborting verification of every other
-    # claim in the batch (BUG 2). The full filter surface is forwarded so a
-    # scoped "no record about X from group G" isn't silently broadened (BUG 5b).
+    # claim in the batch. The full filter surface is forwarded so a scoped
+    # "no record about X from group G" isn't silently broadened.
     try:
         _validate_filters(domain, aq)
         sb = await domain.resolve_filter(domain.cache, aq)
@@ -1395,8 +1393,8 @@ async def _fetch_record(
     cache: dict[int, "asyncio.Task[dict[str, Any] | None]"],
 ) -> dict[str, Any] | None:
     """Fetch a record for quote verification, memoized per verify call so a
-    record cited more than once is fetched once (round-2 BUG 8) — even when
-    claims run concurrently, since the cache holds the in-flight Task and
+    record cited more than once is fetched once — even when claims run
+    concurrently, since the cache holds the in-flight Task and
     concurrent callers await the same one. Returns None if the record is
     missing/inaccessible (→ invalid citation). RuntimeError (unconfigured /
     instructional) propagates so the tool surfaces the cause.
@@ -1425,20 +1423,17 @@ async def _do_fetch_record(
 
 # --- contract, tool descriptions & prompt -------------------------------
 
-# ACCEPTED COMPLIANCE RISK (reviewed 2026-07-29, Anthropic connector directory).
-# This block is embedded in the collect_records + verify_claims descriptions and
-# is entirely behavioural — steps 0-4 tell the model how to answer. The directory
-# policy says "Describe what the tool does. Do not tell Claude how to behave",
-# and rejects descriptions that "tell Claude to behave in ways unrelated to the
-# tool's function".
+# The one behavioural block in a tool description. It is embedded in the
+# collect_records + verify_claims descriptions and is entirely behavioural —
+# steps 0-4 tell the model how to answer — whereas every other description here
+# only describes what its tool does.
 #
-# Kept deliberately. It IS these tools' function: verify_claims enforces the
-# quote-matching in code (re-fetches each record, rejects any quote that is not a
-# literal substring, recounts distinct supporters against the evidence
-# threshold). The text documents a protocol the server actually implements rather
-# than steering unrelated behaviour, which is the distinction the rule draws.
-# Removing it would gut the server's whole purpose, so if a reviewer objects,
-# argue the point — don't silently delete it.
+# Kept deliberately, because it IS these tools' function: verify_claims enforces
+# the quote-matching in code (re-fetches each record, rejects any quote that is
+# not a literal substring, recounts distinct supporters against the evidence
+# threshold). The text documents a protocol the server actually implements
+# rather than steering unrelated behaviour. Removing it would gut the server's
+# whole purpose.
 _GROUNDING_CONTRACT = inspect.cleandoc(
     """
     GROUNDED-ANSWER CONTRACT — when answering a question from CDESK data:
@@ -1591,13 +1586,10 @@ _VERIFY_CLAIMS_DESC = inspect.cleandoc(
 # DELIBERATELY DECLARATIVE — each entry says what the verdict MEANS about the
 # evidence, not what the caller must do about it. This text ships inside a tool
 # RESULT, the channel hosts treat as untrusted content, so imperative framing
-# here matches an Anthropic directory rejection pattern (and the shape of a
-# prompt-injection payload). It previously read "Build the answer ONLY from these
-# verdicts … rejected → do NOT state it … correct yourself" under a key named
-# `instructions_to_relay`, which is exactly the construction removed from
-# `unsupported_filter_directive` — see that docstring in tools/_helpers.py.
-# The OBLIGATION to answer only from verified evidence is unchanged and lives in
-# its legitimate home, server.py's `_SERVER_INSTRUCTIONS`. Keep this a legend.
+# here would take the shape of a prompt-injection payload (the same reasoning as
+# `unsupported_filter_directive` in tools/_helpers.py). The OBLIGATION to answer
+# only from verified evidence lives in server.py's `_SERVER_INSTRUCTIONS`.
+# Keep this a legend.
 _VERDICT_MEANINGS = inspect.cleandoc(
     """
     What each verdict says about the evidence:

@@ -5,12 +5,11 @@ settings (work orders, tasks, fills, customers, …), status enums with their
 action codes and every language variant, the user's own record and rights. The
 v3 API has no equivalent for several of these, and the per-module v1 settings
 endpoints (`workorder/settings`, `task/settings`, …) are admin-only
-(`Acl::canAccess('globalconfig')`), so a non-admin user could not read them.
-This endpoint has no such check (Core/Module.php baseConfig) and is built per
-user.
+(they need the `globalconfig` ACL), so a non-admin user could not read them.
+This endpoint has no such check and is built per user.
 
-It is large (~460 KB, ~0.7 s on cmpp 2026-10-12), so it is fetched only where a
-tool needs it, at most once per tool call, and never cached across calls
+It is large (hundreds of KB, most of a second to fetch), so it is fetched only
+where a tool needs it, at most once per tool call, and never cached across calls
 (tenant settings change at any time — same rule as the enums). A failed read
 yields None and the caller degrades (no form rules, CDESK decides).
 

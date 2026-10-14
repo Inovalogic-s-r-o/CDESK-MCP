@@ -37,8 +37,8 @@ class CdeskCredential(BaseModel):
     ``base_url`` is the CDESK server this session targets — chosen by the user on
     the login page (one of the hosted servers, or a custom URL). It rides in the
     credential so every per-request reconstruction, renewal, and logout hits the
-    right server, and so the choice is isolated per user. Empty on legacy tokens;
-    the provider falls back to its configured default in that case."""
+    right server, and so the choice is isolated per user. Empty when the token
+    carries none; the provider falls back to its configured default in that case."""
 
     login: str
     apitoken: str
@@ -60,8 +60,8 @@ class CdeskAuthCode(AuthorizationCode):
 class CdeskAccessToken(AccessToken):
     """Access token carrying the CDESK login it maps to (diagnostics), the stable
     ``grant_id`` (revocation key), and the ``cred`` the per-request resolver
-    rebuilds the user's ``CdeskClient`` from. ``grant_id`` defaults to "" for
-    older/test constructions and is set at issue time. The whole model is
+    rebuilds the user's ``CdeskClient`` from. ``grant_id`` is set at issue time
+    and defaults to "" for tokens constructed directly (e.g. in tests). The whole model is
     Fernet-encrypted into the opaque bearer ``token`` string."""
 
     cdesk_login: str

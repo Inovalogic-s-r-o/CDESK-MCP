@@ -1,4 +1,4 @@
-"""Request Catalog module MCP tools (M12).
+"""Request Catalog module MCP tools.
 
 Six tools that expose CDESK's Request Catalog v3 CRUD + the catalog
 enum lookup. A request catalog is a *template* used by create_request
@@ -76,8 +76,7 @@ _CATALOG_PARAMS = (
 )
 
 # update_request_catalog parameter → wire field for the fields its PUT clears
-# with an explicit null (nullable in the 2026-10 spec; change_manager_id
-# verified live 2026-10-07).
+# with an explicit null (both nullable in the API spec).
 _CATALOG_CLEARABLE = {
     "change_manager_id": "change_manager_id",
     "approval_rule_id": "approval_rule_id",
@@ -86,8 +85,8 @@ _CATALOG_CLEARABLE = {
 _MAX_PER_PAGE = 100
 
 # Labels next to a catalog's raw enum values, from the live catalog enums:
-# `type` is the KEY of the key/value `catalog_types` bucket (cmpp: "H" =
-# "Helpdesk"), `cat_type_id` the enum id in `cat_types` (183742 = "Podpora").
+# `type` is the KEY of the key/value `catalog_types` bucket (e.g. "H" =
+# "Helpdesk"), `cat_type_id` the enum id in `cat_types`.
 _CATALOG_ENUM_LABELS = (
     EnumLabel("type", "catalog_types", "type_name", by="key"),
     EnumLabel("cat_type_id", "cat_types", "cat_type_name"),
@@ -277,7 +276,7 @@ def register_request_catalog_tools(
             # The tenant's catalog FORM rules, read live (field_policy). A new
             # catalog starts as the form starts it: change management off, and
             # the change-manager type preselected to 1, a named manager
-            # (RequestCatalog/FE/js/editController.js; CDESK stores 1 too).
+            # (CDESK stores 1 too).
             await cache.load()
             form_manager_type = (
                 change_manager_type if change_manager_type is not None else CHANGE_MANAGER_CUSTOM
@@ -296,8 +295,8 @@ def register_request_catalog_tools(
                  **({"change_manager_type": form_manager_type} if change_management else {})},
             ))
             # The POST merges a partial base_params_decoded into the defaults it
-            # fills in, per key and per setting (live-verified 2026-10-07), so
-            # the filing values go on in the same write.
+            # fills in, per key and per setting, so the filing values go on in
+            # the same write.
             patch = _base_params_patch(template, base_params)
             if patch:
                 body[_BASE_PARAMS] = patch
@@ -392,9 +391,9 @@ def register_request_catalog_tools(
                 _require_change_manager(
                     change_management, change_manager_type, change_manager_id, current,
                 )
-            # The GET carries timestamp_check since the 2026-10 backend; older
-            # ones answered null, and the token is then rebuilt from updated_at
-            # (the PUT refuses a missing one with a misleading conflict).
+            # The GET carries timestamp_check; when it is null the token is
+            # rebuilt from updated_at (the PUT refuses a missing one with a
+            # misleading conflict).
             token = current.get("timestamp_check") or _lock_token_from_updated_at(
                 current.get("updated_at")
             )
@@ -464,7 +463,7 @@ async def _resolve_catalog_type_code(cache: EnumCache, type_code: str | None) ->
     display name ("Helpdesk"), case-insensitively, and returns the code.
 
     (The OpenAPI doc names a `createOnlyBaseTypes` bucket that the live API
-    does not ship; `catalog_types` is the real source — verified live.)"""
+    does not ship; `catalog_types` is the real source.)"""
     if not type_code or not type_code.strip():
         return None
     await cache.load()
@@ -544,8 +543,8 @@ def _filing_value(
 def _lock_token_from_updated_at(updated_at: Any) -> str | None:
     """Convert the GET response's ISO-8601 `updated_at`
     (e.g. '2026-06-04T08:23:00+00:00') into the 'YYYY-MM-DD HH:MM:SS'
-    form the catalog PUT accepts as `timestamp_check` (verified live —
-    the ISO form and null are both rejected with a conflict error)."""
+    form the catalog PUT accepts as `timestamp_check` (the ISO form and
+    null are both rejected with a conflict error)."""
     if not isinstance(updated_at, str) or not updated_at:
         return None
     try:
@@ -559,8 +558,8 @@ async def _fetch_for_update_catalog(client: CdeskClient, id: int) -> dict[str, A
     timestamp_check (if present) for the follow-up PUT.
 
     Uses fieldset="all" because the DEFAULT catalog GET omits
-    `base_params_decoded` (18 keys vs 63 — verified live 2026-07-29), which
-    every update has to send back. See `_BASE_PARAMS`."""
+    `base_params_decoded`, which every update has to send back. See
+    `_BASE_PARAMS`."""
     envelope = await client.get(
         f"v3/request-catalog/{id}", params={"fieldset": "all"}
     )
@@ -576,20 +575,20 @@ async def _fetch_for_update_catalog(client: CdeskClient, id: int) -> dict[str, A
 # `base_params_decoded` is the parsed form of a catalog's `base_params` — the
 # per-field {value, insert, update, restrict, ...} rules that make a catalog a
 # template (prefilled values and value restrictions). The write reads THIS key,
-# not the `base_params` string it returns (bisected live 2026-07-29).
+# not the `base_params` string it returns.
 #
-# Behaviour of the 2026-10 backend (live-verified 2026-10-07):
+# Backend behaviour:
 #   - a body that carries it, even partially, is MERGED per key and per setting
 #     — omitted keys keep their rules, an entry with only `value` keeps its
 #     insert/update/restrict. This holds on the POST too, so a create can file
 #     the catalog in its single write.
 #   - a PUT that does NOT carry it resets every value and setting to the
-#     defaults — a name-only, note-only or job-titles-only update wiped a
+#     defaults — a name-only, note-only or job-titles-only update clears a
 #     prefilled priority/urgency and an `update: 3` rule.
 # So every update sends the stored object back with its changes merged in.
-# (The other fields an omission used to reset — visibility, planned work,
-# use_catalog_item_name, the approval rules, job titles — are kept by the
-# 2026-10 PUT and are no longer echoed.)
+# (The other fields — visibility, planned work, use_catalog_item_name, the
+# approval rules, job titles — are kept by the PUT when omitted, so they are
+# not echoed.)
 _BASE_PARAMS = "base_params_decoded"
 
 
@@ -602,8 +601,8 @@ _CHECK_FIELDS = (
 
 def _for_customer_value(internal: bool | None) -> str | None:
     """The two `for_customers` enum keys: "hidden" (Interní) and "" (Obyčejná).
-    Any other string is stored as "" without a message (live-verified
-    2026-09-25), so the tool takes a bool instead of the raw key."""
+    Any other string is stored as "" without a message, so the tool takes a
+    bool instead of the raw key."""
     if internal is None:
         return None
     return "hidden" if internal else ""
@@ -611,7 +610,7 @@ def _for_customer_value(internal: bool | None) -> str | None:
 
 # Filing fields: the catalog stores them only inside `base_params` as
 # {value, insert, update, restrict}; a top-level `cat_type_id` in the PUT body is
-# ignored (live-verified 2026-09-25).
+# ignored.
 _BASE_PARAM_BUCKETS = {
     "cat_type_id": ("cat_types", "request type"),
     "cat_area_id": ("cat_areas", "catalog area"),
@@ -673,10 +672,9 @@ async def _resolve_template_fields(
     return out
 
 
-# The base_params keys the backend keeps (Model/Request/Catalog.php
-# $base_params_props — five more than the 2026-10 spec documents; the CNB-only
-# ones are left out), and the settings an entry may carry. The server ignores anything else without a word, so a typo would
-# look stored.
+# The base_params keys the backend keeps (five more than the API spec documents;
+# the tenant-specific ones are left out), and the settings an entry may carry.
+# The server ignores anything else without a word, so a typo would look stored.
 _BASE_PARAM_KEYS = frozenset({
     "cat_type_id", "cat_area_id", "cat_area_2nd_id", "priority",
     "solver_group_id", "id_solver", "reaction_missed_id_solver", "other_solvers",
@@ -725,8 +723,8 @@ def _base_params_patch(
                 f"pass it once"
             )
         entry = dict(entry)
-        # "No restriction" is the empty string (Catalog::*_RESTRICT_NONE = '');
-        # only "limited" restricts. Accept "none" as the same thing.
+        # "No restriction" is the empty string; only "limited" restricts.
+        # Accept "none" as the same thing.
         if entry.get("restrict") == "none":
             entry["restrict"] = ""
         patch[key] = entry
@@ -750,8 +748,8 @@ _CUSTOM_FIELD_KEYS = frozenset({
 
 
 def _validate_custom_field_bindings(custom_fields: Any) -> None:
-    """Shape only: the server ignores an unknown property id with a 200
-    (live-verified 2026-10-07), so an id cannot be confirmed here."""
+    """Shape only: the server ignores an unknown property id with a 200,
+    so an id cannot be confirmed here."""
     if custom_fields is None:
         return
     if not isinstance(custom_fields, list):
@@ -771,16 +769,15 @@ def _validate_custom_field_bindings(custom_fields: Any) -> None:
 
 
 def _validate_name(name: str) -> None:
-    # No length limit: neither the CDESK form nor the API has one (a 45-char
-    # name was stored, cmpp 2026-10-12). The 30-char limit is on `code`.
+    # No length limit: neither the CDESK form nor the API has one. The 30-char
+    # limit is on `code`.
     if not name or not name.strip():
         raise ValueError("name must be a non-empty string")
 
 
 def _validate_code(code: str | None) -> None:
-    # The CDESK form caps the catalog code at 30 characters
-    # (RequestCatalog/FormConfig.php maxLength). The API stores longer codes
-    # (35 chars accepted on cmpp, 2026-10-12); the tool follows the form.
+    # The CDESK form caps the catalog code at 30 characters. The API stores
+    # longer codes; the tool follows the form.
     if code is not None and len(code) > 30:
         raise ValueError(f"code must be ≤30 characters (the CDESK form's limit); got {len(code)}")
 
@@ -794,7 +791,7 @@ def _catalog_body(
     if keywords is not None and (
         not isinstance(keywords, list) or not all(isinstance(k, str) for k in keywords)
     ):
-        # A bare string is answered with an empty-bodied 500 (2026-10-07).
+        # A bare string is answered with an empty-bodied 500.
         raise ValueError("search_keywords must be a list of strings")
     _validate_custom_field_bindings(values.get("custom_fields"))
     public = dict(values)
@@ -813,7 +810,7 @@ def _with_warning(response: dict[str, Any], warning: str) -> dict[str, Any]:
 
 async def _require_user(client: CdeskClient, user_id: int | None) -> None:
     """The catalog write stores any integer as `change_manager_id`, a
-    nonexistent user included (live-verified 2026-09-25), so check it first."""
+    nonexistent user included, so check it first."""
     if user_id is None:
         return
     try:
@@ -855,7 +852,7 @@ _LIST_CATALOGS_DESC = inspect.cleandoc(
         nothing).
 
     NOT offered as typed params (the live CDESK catalog list silently ignores
-    the plain column forms — verified): type_id, auto_close_request,
+    the plain column forms): type_id, auto_close_request,
     category/change-manager/approval columns, date ranges, and soft-deleted.
     Some of these ARE reachable through sb_raw's DOTTED forms below (type_id
     and the category type/area in particular) — filter client-side only for
@@ -864,7 +861,7 @@ _LIST_CATALOGS_DESC = inspect.cleandoc(
     sb_raw — a CDESK sb filter object for the CDESK API v3 request-catalog list
     (JSON string or object, structured tree form; see docs/cdesk-api-v3.json).
     Advanced; mutually exclusive with the typed filters above. Only the
-    LIVE-VERIFIED working columns are applied server-side — id, type,
+    working columns are applied server-side — id, type,
     companyId (a real company id returns the catalogs available to it; a bogus
     one returns none), job_title_id, and the DOTTED forms
     request_catalog.name / .type_id / .cat_type_id / .cat_area_id, plus the

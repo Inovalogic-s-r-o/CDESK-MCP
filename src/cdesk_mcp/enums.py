@@ -1,4 +1,4 @@
-"""Tenant-specific enum lookups for the Task module.
+"""Tenant-specific enum lookups.
 
 Hides per-tenant enum ids behind human-readable names: the LLM (or end user)
 can say 'Otvorené' or 'received' or 'prijate'; we resolve to the tenant's id.
@@ -65,7 +65,7 @@ class EnumEntry:
     parent_id: int | None = None
     action_code: int | None = None
     lang_names: tuple[str, ...] = field(default_factory=tuple)
-    # CDESK's `in_use` flag (UAT B13): False = switched off on this tenant — the
+    # CDESK's `in_use` flag: False = switched off on this tenant — the
     # CDESK form no longer offers it, but old records may still carry it.
     # None when the bucket does not report it.
     in_use: bool | None = None
@@ -135,7 +135,7 @@ def _call_scope() -> dict[int, _Loaded]:
 
 class EnumCache:
     """Name ↔ id lookups over one enums endpoint, read fresh on every tool call
-    (the name is historical — nothing is kept between calls)."""
+    (despite the name, nothing is kept between calls)."""
 
     def __init__(
         self,
@@ -183,7 +183,7 @@ class EnumCache:
 
     @property
     def is_stale(self) -> bool:
-        """Kept for callers of the old TTL cache: true until this call fetched."""
+        """True until the current tool call has fetched the enums."""
         return not self.loaded
 
     async def load(self) -> None:
@@ -314,7 +314,7 @@ class EnumCache:
     def action_code_name_map(self, bucket: str) -> dict[Any, str]:
         """action_code → display name for ONE bucket. Needed for the Request
         module, whose records store status/priority by enum `action_code`
-        (e.g. 30) rather than the enum id (e.g. 183756) — so id_name_map()
+        (e.g. 30) rather than the enum id — so id_name_map()
         always misses on those records. On collision (two statuses sharing a
         code) first-match wins, matching how the action_code filter groups
         them."""
@@ -359,12 +359,9 @@ class EnumCache:
             if best_ratio >= min_ratio:
                 # Score against every alias (so a diacritic-stripped or
                 # English typo still finds the entry) but SUGGEST the tenant's
-                # own display name. Returning the matched alias surfaced
-                # Lithuanian/Hungarian/Czech names as suggestions on a Slovak
-                # tenant — `no-such-status` came back "Did you mean:
-                # sustabdyta, in progress AS, činnosti nasazení?", which is
-                # noise the caller cannot act on. `best_alias` is kept for the
-                # tie-break only.
+                # own display name: an alias in some other language is noise
+                # the caller cannot act on. `best_alias` is only the fallback
+                # for an entry without a display name.
                 scored.append((best_ratio, entry.name or best_alias))
         scored.sort(key=lambda t: t[0], reverse=True)
         seen: set[str] = set()
@@ -382,8 +379,7 @@ class EnumCache:
         CDESK gates whole buckets on tenant settings: `urgency`/`impact` need
         `request.priorityUrgencyImpact.enabled`, `cat_area`/`cat_area_2nd` need
         `request.enumCatAreas.status > 0`, `place` needs
-        `system.categories.places_enabled` + `request.place.enabled`
-        (Module/Request/Module.php::getBaseRequestEnums). When a bucket is
+        `system.categories.places_enabled` + `request.place.enabled`. When a bucket is
         absent, NO value can ever resolve, so "unknown value" is the wrong
         error — the caller needs to be told the feature is off rather than sent
         to an enums tool that will never list it.
@@ -497,9 +493,9 @@ def _restricts_as_keyvalue(rows: Any) -> list[dict[str, Any]]:
 
 def _flatten_catalog_enums(response: Any) -> Any:
     """The request-catalog enums endpoint nests several buckets one or two levels
-    down, where the list-only parser skipped them — so `cat_types` (the request
-    type a catalog tile belongs to) and `cat_areas` never reached the cache.
-    Rewrites them as ordinary list buckets (shapes as served 2026-09-25):
+    down, which the list-only parser cannot read — among them `cat_types` (the
+    request type a catalog tile belongs to) and `cat_areas`. Rewrites them as
+    ordinary list buckets:
 
       cat_status  {enums, restricts}                  → cat_status, cat_status_restricts
       flow_status {initial_enums, targets_enums}      → flow_status_initial, flow_status_targets
@@ -532,10 +528,9 @@ def _flatten_catalog_enums(response: Any) -> Any:
         flat["flow_status_targets"] = nested("flow_status", "targets_enums") or []
         enums.pop("flow_status")
     if isinstance(enums.get("cat_areas"), dict):
-        # CatArea::getEnumList puts BOTH levels in enumCatAreas.enumList.enums;
-        # a 2nd-level area has a parent (parent_id != 0 — Model/Fill.php
-        # 4325-4330 splits them the same way). enumCatAreas2nd carries only
-        # its status, so reading the areas there always gave an empty list.
+        # CDESK puts BOTH levels in enumCatAreas.enumList.enums; a 2nd-level
+        # area is one with a parent (parent_id != 0). enumCatAreas2nd carries
+        # only its status, not the areas.
         areas = nested("cat_areas", "enumCatAreas", "enumList", "enums") or []
         if isinstance(areas, dict):
             areas = list(areas.values())

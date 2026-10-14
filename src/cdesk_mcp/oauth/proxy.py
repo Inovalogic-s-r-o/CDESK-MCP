@@ -16,9 +16,8 @@ if TYPE_CHECKING:
     from cdesk_mcp.enums import EnumCache, EnumEntry
     from cdesk_mcp.oauth.provider import CdeskOAuthProvider
 
-# Raised from 32 when the enum-cache key went from per-SERVER to per-CALLER: the
-# key space is now the number of active users, not the number of hosted CDESK
-# servers, and evicting an active user just means re-fetching their enums. Each
+# Sized for a per-CALLER enum-cache key: the key space is the number of active
+# users, not the number of hosted CDESK servers, and evicting an active user just means re-fetching their enums. Each
 # entry holds a few small enum lists, and there is one map per enum endpoint (4).
 _DEFAULT_MAX_TENANTS = 128
 
@@ -28,7 +27,7 @@ class RequestScopedClient:
 
     Exposes the same async ``get/post/put/delete/close`` surface, but resolves
     the *actual* client per call via the injected ``resolve`` callable. This is
-    what lets all 37 existing tools keep calling ``client.get(...)`` unchanged
+    what lets every tool keep calling ``client.get(...)`` unchanged
     while, in http mode, each call runs as the request's authenticated CDESK
     user.
 
@@ -74,12 +73,11 @@ class RequestScopedEnumCache:
     Enum ids (status/type/priority …) are tenant-specific, so a shared cache
     would serve one tenant's ids to another. The subtlety that matters: a CDESK
     *server* is not a tenant. One host holds many ENVIRONMENTS, each an
-    ``admin_id`` (``User::getAdminId()`` = ``id_parent``, else own id), and the
-    backend scopes enums by exactly that
-    (``EnumEnum::where('admin_id', App::$user->getAdminId())``). Keying this map
-    on the base URL alone therefore shared one cache across every environment on
-    a host: whoever loaded first won, and the next caller got that environment's
-    status names and ids — a cross-environment read, and a name→id resolution
+    ``admin_id`` (the user's parent account id, else their own id), and CDESK
+    scopes enums by exactly that. Keying this map on the base URL alone would
+    share one cache across every environment on a host: whoever loaded first
+    would win, and the next caller would get that environment's status names
+    and ids — a cross-environment read, and a name→id resolution
     that yields a FOREIGN id for the write that follows.
 
     So the key is per-caller (``resolve_cache_key``), currently
