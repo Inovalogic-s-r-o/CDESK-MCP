@@ -41,7 +41,9 @@ from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
     list_meta,
     TEXT_MATCH_NOTE,
+    add_names,
     apply_field_scope,
+    ask_for_names,
     to_llm_error,
     unsupported_filter_directive,
     unwrap_list,
@@ -137,6 +139,7 @@ def register_fill_tools(
             params: dict[str, Any] = {"pg": page, "pp": per_page}
             apply_field_scope(params, fieldset, fields)
             added_times = _ask_for_list_times(params, fields)
+            ask_for_names(params, "fill", detail=False)
             if sort:
                 params["sort"] = resolve_sort("fills", sort)
             if sb is not None:
@@ -151,6 +154,7 @@ def register_fill_tools(
 
         records, meta = unwrap_list(response)
         warning = await _add_list_minutes(client, records, params)
+        add_names(records, "fill", detail=False, fieldset=fieldset, fields=fields)
         if added_times:
             records = [
                 {k: v for k, v in r.items() if k not in added_times} if isinstance(r, dict) else r
@@ -180,13 +184,15 @@ def register_fill_tools(
                 params["fieldset"] = fieldset
             if fields:
                 params["returnFields[]"] = fields
-            response = await client.get(f"v3/fill/{id}", params=params or None)
+            ask_for_names(params, "fill", detail=True)
+            response = await client.get(f"v3/fill/{id}", params=params)
         except ValueError as e:
             raise RuntimeError(f"get_fill input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="get_fill", record_id=id) from e
         record = unwrap_record(response)
         _add_detail_minutes(record)
+        add_names([record], "fill", detail=True, fieldset=fieldset, fields=fields)
         return record
 
     @mcp.tool(
@@ -666,6 +672,9 @@ _LIST_FILLS_DESC = inspect.cleandoc(
     List CDESK fills (fulfillments — logged work/time records). Returns a
     paginated `items` array; `meta.total` is the number of records matching the filter across all pages (CDESK's own count) and `meta.last_page` tells whether this is the last page.
 
+    Each record carries `customer_name` / `solver_name` next to the
+    customer and solver ids.
+
     Worked time: every item carries `duration_minutes` (int) — the fill's
     stored worked time, i.e. valid_to − valid_from plus `other_time`, the value
     CDESK bills and sums in its reports — and `other_time_minutes`, the
@@ -708,10 +717,13 @@ _LIST_FILLS_DESC = inspect.cleandoc(
 _GET_FILL_DESC = inspect.cleandoc(
     """
     Fetch a single fill (fulfillment) by id.
+    Each record carries `customer_name` / `solver_name` next to the
+    customer and solver ids.
 
     fieldset selects the field group returned: "base", "extended" (CDESK's
     default when omitted), "all" (base+extended+custom), or "custom". fields is
-    an exact whitelist of field names (returnFields; union with fieldset).
+    a whitelist of field names (returnFields; union with fieldset);
+    `customer_name` / `solver_name` are added to it.
 
     `duration` here is the stored worked time in SECONDS (valid_to − valid_from
     plus `other_time`, the correction, also seconds); `duration_minutes` /

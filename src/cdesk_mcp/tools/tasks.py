@@ -37,7 +37,9 @@ from cdesk_mcp.tools._helpers import (
     TEXT_MATCH_NOTE,
     EnumLabel,
     add_enum_names,
+    add_names,
     apply_field_scope,
+    ask_for_names,
     resolve_enum_or_raise,
     to_llm_error,
     unsupported_filter_directive,
@@ -170,6 +172,7 @@ def register_task_tools(
             )
             params: dict[str, Any] = {"pg": page, "pp": per_page}
             apply_field_scope(params, fieldset, fields)
+            ask_for_names(params, "task", detail=False)
             if sort:
                 params["sort"] = resolve_sort("tasks", sort)
             if sb is not None:
@@ -183,6 +186,7 @@ def register_task_tools(
             raise to_llm_error(e, operation="list_tasks") from e
 
         records, meta = unwrap_list(response)
+        add_names(records, "task", detail=False, fieldset=fieldset, fields=fields)
         await add_enum_names(cache, records, _TASK_ENUM_LABELS)
         result = {"items": records, "meta": list_meta(meta, paging, dropped=dropped_clauses), "page": page, "per_page": per_page}
         if dropped_clauses:
@@ -214,12 +218,14 @@ def register_task_tools(
                 params["fieldset"] = fieldset
             if fields:
                 params["returnFields[]"] = fields
-            response = await client.get(f"v3/task/{id}", params=params or None)
+            ask_for_names(params, "task", detail=True)
+            response = await client.get(f"v3/task/{id}", params=params)
         except ValueError as e:
             raise RuntimeError(f"get_task input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="get_task", record_id=id) from e
         record = unwrap_record(response)
+        add_names([record], "task", detail=True, fieldset=fieldset, fields=fields)
         await add_enum_names(cache, [record], _TASK_ENUM_LABELS)
         return record
 
@@ -701,6 +707,8 @@ _LIST_TASKS_DESC = inspect.cleandoc(
     below action code 80, and tasks with no status) or "closed" (80 and up).
     get_task_enums lists each status's group.
 
+    Each record carries `customer_name` / `solver_name` next to the
+    customer and solver ids.
     Enum fields carry their label alongside: `status_name`, `type_name`,
     `type_2nd_name`, `place_name`, `assign_name` sit next to the raw enum id
     (e.g. `status: <id>, status_name: "prijatá"`) and are the names the
@@ -737,7 +745,8 @@ _LIST_TASKS_DESC = inspect.cleandoc(
 
     Response shaping (same semantics as get_task): fieldset selects the
     field group per record ("base"/"extended"/"all"/"custom"); fields is
-    an exact whitelist of field names (returnFields; union with fieldset).
+    a whitelist of field names (returnFields; union with fieldset);
+    `customer_name` / `solver_name` are added to it.
     Use fieldset="base" or fields=[...] to keep large lists compact.
     """
 )
@@ -748,6 +757,8 @@ _GET_TASK_DESC = inspect.cleandoc(
     error if the task doesn't exist or your account doesn't have admin
     scope over it.
 
+    Each record carries `customer_name` / `solver_name` next to the
+    customer and solver ids.
     Enum fields carry their label alongside: `status_name`, `type_name`,
     `type_2nd_name`, `place_name`, `assign_name` sit next to the raw enum id
     (e.g. `status: <id>, status_name: "prijatá"`) and are the names the
@@ -761,9 +772,9 @@ _GET_TASK_DESC = inspect.cleandoc(
     `task_watchers_ids`, `is_completed`, `rights`, …). Typical field counts:
     base 7, extended 24, custom 31, all 55.
 
-    fields: an exact whitelist of field names to return (CDESK's
-    returnFields). Composes with fieldset as a union; unknown names are
-    silently ignored by CDESK.
+    fields: a whitelist of field names to return (CDESK's returnFields);
+    `customer_name` / `solver_name` are added to it. Composes with fieldset
+    as a union; unknown names are silently ignored by CDESK.
     """
 )
 

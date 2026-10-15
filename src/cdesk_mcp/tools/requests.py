@@ -47,7 +47,9 @@ from cdesk_mcp.tools._helpers import (
     EnumLabel,
     add_enum_names,
     annotate_write_warnings,
+    add_names,
     apply_field_scope,
+    ask_for_names,
     forbid_unknown_arguments,
     resolve_enum_field_or_raise,
     resolve_enum_or_raise,
@@ -418,6 +420,7 @@ def register_request_tools(
             params: dict[str, Any] = {"pg": page, "pp": per_page}
             fieldset, fields = _ensure_periodic_field(fieldset, fields)
             apply_field_scope(params, fieldset, fields)
+            only = ask_for_names(params, "request", detail=False)
             if sort:
                 params["sort"] = resolve_sort("requests", sort)
             # Flat query param, NOT an sb column (an sb deleted_at clause is
@@ -438,6 +441,7 @@ def register_request_tools(
             raise to_llm_error(e, operation="list_requests") from e
 
         records, meta = unwrap_list(response)
+        add_names(records, "request", detail=False, fieldset=fieldset, fields=fields, only=only)
         for rec in records:
             _add_is_periodic(rec)
             _add_time_fields(rec)
@@ -466,6 +470,7 @@ def register_request_tools(
                 params["fieldset"] = fieldset
             if fields:
                 params["returnFields[]"] = fields
+            ask_for_names(params, "request", detail=True)
             # Soft-deleted requests 404 on a plain GET; includeDeleted=1
             # returns them (request module only).
             if include_deleted:
@@ -476,6 +481,7 @@ def register_request_tools(
         except Exception as e:
             raise to_llm_error(e, operation="get_request", record_id=id) from e
         record = _add_time_fields(_add_is_periodic(unwrap_record(response)))
+        add_names([record], "request", detail=True, fieldset=fieldset, fields=fields)
         await add_enum_names(cache, [record], _REQUEST_ENUM_LABELS)
         return record
 
@@ -1509,6 +1515,8 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
     the request was generated from a periodical request) alongside the raw
     `periodical_request_id` it is derived from.
 
+    Each record carries `customer_name` / `solver_name` next to the
+    customer and solver ids.
     Enum fields carry their label alongside: `status_name`, `priority_name`,
     `type_name`, `cat_type_name`, … sit next to the raw value. The raw
     `status` and `priority` are enum ACTION CODES, not names or ids —
@@ -1551,8 +1559,9 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
     `unsupported_filters` block naming them.
 
     Response shaping (same semantics as get_request): fieldset selects the
-    field group per record ("base"/"extended"/"all"/"custom"); fields is an
-    exact whitelist of field names (returnFields; union with fieldset).
+    field group per record ("base"/"extended"/"all"/"custom"); fields is a
+    whitelist of field names (returnFields; union with fieldset);
+    `customer_name` / `solver_name` are added to it.
     Use fieldset="base" or fields=[...] to keep large lists compact.
 
     status_group filters by CDESK's own status groups (what its UI quick filters
@@ -1597,9 +1606,9 @@ _GET_REQUEST_DESC = inspect.cleandoc(
     "custom" (custom fields only). Pass "all" or "custom" to read the
     stored custom-field (cfield_*) values.
 
-    fields: an exact whitelist of field names to return (CDESK's
-    returnFields). Composes with fieldset as a union; unknown names are
-    silently ignored by CDESK.
+    fields: a whitelist of field names to return (CDESK's returnFields);
+    `customer_name` / `solver_name` are added to it. Composes with fieldset
+    as a union; unknown names are silently ignored by CDESK.
 
     include_deleted: a soft-deleted request 404s on a plain GET; pass
     True to retrieve it anyway (requests are the only module where
@@ -1610,6 +1619,8 @@ _GET_REQUEST_DESC = inspect.cleandoc(
     `periodical_request_id` it rests on — both are included regardless of
     fieldset/fields.
 
+    Each record carries `customer_name` / `solver_name` next to the
+    customer and solver ids.
     Enum fields carry their label alongside: `status_name`, `priority_name`,
     `type_name`, `cat_type_name`, … sit next to the raw value. The raw
     `status` and `priority` are enum ACTION CODES, not names or ids —

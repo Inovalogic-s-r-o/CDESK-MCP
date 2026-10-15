@@ -46,6 +46,9 @@ from cdesk_mcp.filters import (
     ensure_fill_start_date_window,
 )
 from cdesk_mcp.tools._helpers import (
+    NAME_TARGETS,
+    add_names,
+    ask_for_names,
     resolve_enum_field_or_raise,
     resolve_enum_or_raise,
     to_llm_error,
@@ -123,6 +126,9 @@ class GroundingDomain:
     scope_fields: tuple[tuple[str, str], ...] = ()
     context_fields: tuple[tuple[str, str], ...] = ()
     company_field: str | None = None
+    # The module whose customer / solver names are read with the record
+    # (see ask_for_names); None for domains without them.
+    names_module: str | None = None
 
 
 # --- per-domain filter resolvers ----------------------------------------
@@ -388,6 +394,7 @@ def build_domains(
                 ("solver_group_id", "solver_group_id"),
             ),
             company_field="id_company",
+            names_module="request",
         ),
         "tasks": GroundingDomain(
             name="tasks",
@@ -408,6 +415,7 @@ def build_domains(
             scope_fields=(("customer_id", "company_id"), ("solver_id", "solver_id")),
             context_fields=(("company_id", "company_id"), ("solver_id", "solver_id")),
             company_field="company_id",
+            names_module="task",
         ),
         "customers": GroundingDomain(
             name="customers",
@@ -485,6 +493,7 @@ def build_domains(
                 ("request_id", "request_id"),
             ),
             company_field="company_id",
+            names_module="fill",
         ),
     }
 
@@ -629,6 +638,8 @@ def register_grounding_tools(
                 params: dict[str, Any] = {"pg": page, "pp": _MAX_PER_PAGE}
                 if sb_encoded is not None:
                     params["sb"] = sb_encoded
+                if dom.names_module is not None:
+                    ask_for_names(params, dom.names_module, detail=False)
                 response, paging = await client.get_page(dom.list_endpoint, params=params)
                 records, meta = unwrap_list(response)
                 if total_reported is None:
@@ -911,6 +922,10 @@ def _collect_entry(
         "status": status,
         "created": _first_field(rec, domain.created_fields),
     }
+    if domain.names_module is not None:
+        add_names([rec], domain.names_module, detail=False, fieldset=None, fields=None)
+        for key in NAME_TARGETS:
+            entry[key] = rec.get(key)
     return entry, truncated
 
 
@@ -1268,7 +1283,14 @@ async def _record_context(
     if domain.company_field is not None:
         company_id = _coerce_int(record.get(domain.company_field))
         if isinstance(company_id, int) and not isinstance(company_id, bool) and company_id > 0:
-            ctx["company_name"] = await _company_name(client, company_id, caches.company_names)
+            # The name read with the record; a lookup only when CDESK sent none.
+            named = record.get("customer_name")
+            ctx["company_name"] = (
+                named if isinstance(named, str) and named
+                else await _company_name(client, company_id, caches.company_names)
+            )
+    if domain.names_module is not None:
+        ctx["solver_name"] = record.get("solver_name")
     if domain.status_fields and domain.status_bucket is not None:
         ctx["status"] = _status_display(domain, record, caches.status_names)
     return ctx
@@ -1411,14 +1433,23 @@ async def _fetch_record(
 async def _do_fetch_record(
     client: CdeskClient, domain: GroundingDomain, record_id: int
 ) -> dict[str, Any] | None:
+    params: dict[str, Any] = {}
+    if domain.names_module is not None:
+        ask_for_names(params, domain.names_module, detail=True)
     try:
-        envelope = await client.get(domain.detail_template.format(id=record_id))
+        envelope = await client.get(
+            domain.detail_template.format(id=record_id), params=params or None
+        )
     except RuntimeError:
         raise
     except Exception:
         return None
     record = unwrap_record(envelope)
-    return record if isinstance(record, dict) else None
+    if not isinstance(record, dict):
+        return None
+    if domain.names_module is not None:
+        add_names([record], domain.names_module, detail=True, fieldset=None, fields=None)
+    return record
 
 
 # --- contract, tool descriptions & prompt -------------------------------
@@ -1504,7 +1535,8 @@ _COLLECT_RECORDS_DESC = inspect.cleandoc(
       - domain: the resolved domain name.
       - items: [{id, num, title, text, status, created}] (text = cleaned
         title+body, capped at text_chars_per_record; pass 0 for a cheap
-        ids/titles-only sweep with no body text).
+        ids/titles-only sweep with no body text). Requests, tasks and
+        fills add customer_name and solver_name.
       - coverage: {scanned, total_reported, complete, truncated, cap,
         text_truncated_count, include_discussion[, discussion_unsupported]}.
         total_reported is CDESK's own count of the records matching the filter;
@@ -1566,7 +1598,7 @@ _VERIFY_CLAIMS_DESC = inspect.cleandoc(
     bad id, quote-too-short, out_of_scope, quote-not-found), supported_count and
     verdict. For requests, tasks and fills each evidence entry also carries
     `record`: who the cited record is about (company_id + company_name,
-    solver_id, solver_group_id/request_id, status), so a record belonging to a
+    solver_id + solver_name, solver_group_id/request_id, status), so a record belonging to a
     different subject than the claim is visible even without a scope.
     Relay only confirmed claims (cite the ids); report below_threshold as
     isolated mentions with counts; DROP rejected claims; for refuted absence,

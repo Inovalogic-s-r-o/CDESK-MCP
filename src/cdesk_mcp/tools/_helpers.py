@@ -60,6 +60,83 @@ def apply_field_scope(
         params["returnFields[]"] = fields
 
 
+# The customer and solver names of a request, task or fill. CDESK sends them
+# only when asked for in returnFields[], and in a different shape per module
+# and per read: a flat string on list rows, an object carrying `name` on a
+# detail read. The tools write them as `customer_name` / `solver_name` next to
+# the ids, so a record never shows a customer or solver as a bare id.
+NAME_TARGETS = ("customer_name", "solver_name")
+_NAME_SOURCES: dict[str, tuple[tuple[str, str], tuple[str, str]]] = {
+    #           (customer, solver) on a list row, then on a detail read
+    "request": (("customer_name", "solver_name"), ("customer_name", "solver")),
+    "task": (("company", "solver"), ("company", "solver")),
+    "fill": (("company_name", "solver_name"), ("company", "solver")),
+}
+
+
+def name_sources(module: str, *, detail: bool) -> tuple[str, str]:
+    return _NAME_SOURCES[module][1 if detail else 0]
+
+
+def ask_for_names(
+    params: dict[str, Any], module: str, *, detail: bool,
+) -> frozenset[str] | None:
+    """Add the module's name fields to the read. Call it after the field scope
+    is applied. A caller's `returnFields[]` whitelist stays a whitelist with
+    the names appended; without one the fieldset is pinned (CDESK's default
+    `extended` when none was given), because returnFields[] next to a fieldset
+    adds to it while returnFields[] alone narrows the response to itself.
+
+    The request list sends its names only next to a fieldset, so a whitelist
+    there goes out with the smallest one (`base`); the keys the whitelist
+    allows are returned, for add_names to trim the rows back to them."""
+    sources = name_sources(module, detail=detail)
+    fields = params.get("returnFields[]")
+    if fields:
+        params["returnFields[]"] = [*fields, *(s for s in sources if s not in fields)]
+        if module == "request" and not detail and "fieldset" not in params:
+            params["fieldset"] = "base"
+            return frozenset(params["returnFields[]"])
+        return None
+    params.setdefault("fieldset", "extended")
+    params["returnFields[]"] = list(sources)
+    return None
+
+
+def add_names(
+    rows: Iterable[Any],
+    module: str,
+    *,
+    detail: bool,
+    fieldset: str | None,
+    fields: list[str] | None,
+    only: frozenset[str] | None = None,
+) -> None:
+    """Write `customer_name` / `solver_name` onto each row from whatever shape
+    CDESK sent. A source key with another name (`company`, `solver`,
+    `company_name`) is removed again unless the caller asked for it — by
+    naming it in `fields` or with fieldset "all"; the detail objects carry
+    contact data the caller did not ask for. `only` (from ask_for_names) trims
+    each row to those keys plus the names, before anything is derived from
+    the row."""
+    asked = set(fields or ())
+    keep_all = fieldset == "all"
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if only is not None:
+            for key in [k for k in row if k not in only and k not in NAME_TARGETS]:
+                del row[key]
+        for target, source in zip(NAME_TARGETS, name_sources(module, detail=detail)):
+            if source not in row:
+                continue
+            value = row[source]
+            name = value.get("name") if isinstance(value, dict) else value
+            if source != target and not keep_all and source not in asked:
+                del row[source]
+            row[target] = name if isinstance(name, str) else None
+
+
 def validate_fields(fields: Any) -> None:
     """`fields` must be a non-empty list of non-empty strings (wired to the
     `returnFields[]` whitelist). Unknown field names are silently ignored by
