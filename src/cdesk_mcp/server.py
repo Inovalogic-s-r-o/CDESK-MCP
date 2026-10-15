@@ -1,31 +1,7 @@
 """FastMCP server factory and tool registrations.
 
-RELEASE-BRANCH SCOPE: five modules are not registered here.
-
-Three are held back for KNOWN PROBLEMS: the **Knowledge base** has open backend
-defects on this tenant (the article type never persists, an omitted visibility
-publishes the article, and the whole surface is ungated by
-`knowledgebase.enabled` — see docs/bugs.md); the **Schedule / calendar** has no
-`sb` filter surface and `get_schedule` / `get_schedule_planning` answer HTTP 500;
-and **Approval**'s decide paths cannot be exercised because no request catalog
-carries an `approval_rule_id`, so no approval can be spawned to act on (all
-verified 2026-07-31).
-
-Two — **Project** and **Work order** — are withheld by RELEASE DECISION, not for
-any defect: both were live-verified end to end on 2026-07-31 (full CRUD round
-trips; projects found clean, work order's only finding was an undocumented sort
-capability). They can be restored from `develop` whenever the release scope
-allows, with no backend prerequisite.
-
-All five modules' files are deleted on this branch.
-
-The CNB CMDB export IS included: it only ever runs against the production CNB
-tenant, and on any other server it fails with an explicit message naming the
-CMDB custom fields that endpoint's column set needs — never with misleading
-output.
-
 When CDESK credentials are missing or the startup health probe fails, the
-server still registers all 65 tools — backed by stand-in client/cache
+server still registers every tool — backed by stand-in client/cache
 stubs that raise a clear, *context-specific* error when called. This way
 an MCP client (Claude Desktop, etc.) can call tools/list and see what's
 available, and the LLM gets actionable text on its first tool-call
@@ -78,6 +54,7 @@ from cdesk_mcp.tools.fill import register_fill_tools
 from cdesk_mcp.tools.customers import register_customer_tools
 from cdesk_mcp.tools.deals import register_deal_tools
 from cdesk_mcp.tools.grounding import build_domains, register_grounding_tools
+from cdesk_mcp.tools.knowledgebase import register_knowledgebase_tools
 from cdesk_mcp.tools.request_catalogs import register_request_catalog_tools
 from cdesk_mcp.tools.requests import register_request_tools
 from cdesk_mcp.tools.tasks import register_task_tools
@@ -101,6 +78,7 @@ _FILTERABLE_LIST_TOOLS: tuple[str, ...] = (
     "list_configuration_items",
     "list_cmdb_types",
     "list_request_catalogs",
+    "list_kb_articles",
 )
 
 _SERVER_INFO_DESC = inspect.cleandoc(
@@ -383,7 +361,7 @@ def build_server(
     """Build a FastMCP server instance.
 
     All client/cache args are optional — when omitted, stand-in stubs
-    are used so all 65 tools register regardless. Calling any CDESK-
+    are used so every tool registers regardless. Calling any CDESK-
     dependent tool against the stubs raises a clear error explaining
     *why* the server is degraded:
 
@@ -577,6 +555,9 @@ def build_server(
     register_fill_tools(mcp, effective_client)
     # Deal statuses/phases/types ARE tenant enum data — 4th cached module.
     register_deal_tools(mcp, effective_client, effective_deal_cache)
+    # Knowledge base is cache-less (its enums envelope isn't EnumCache-shaped;
+    # article types are resolved inline against a fresh enums GET).
+    register_knowledgebase_tools(mcp, effective_client)
     # CNB-only bulk CI export: it only works on a CNB tenant (elsewhere CDESK
     # answers code 14). stdio knows its one tenant at startup and leaves the
     # tools out there; http serves many tenants, so the tools stay and refuse a

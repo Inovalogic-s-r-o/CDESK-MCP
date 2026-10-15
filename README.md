@@ -31,8 +31,8 @@ and day-to-day usage are all documented there — not in this repository.
 
 ## Technical summary
 
-A thin translation layer between an AI client and the CDESK v3 API — **65 tools
-across 10 modules**, no datastore of its own:
+A thin translation layer between an AI client and the CDESK v3 API — **76 tools
+across 11 modules**, no datastore of its own:
 
 ```
 ┌─────────────────┐   MCP (JSON-RPC)   ┌──────────────────┐   HTTPS   ┌──────────────┐
@@ -49,10 +49,9 @@ account. Python 3.11+, `uv`-managed.
 Each tool's own description, visible in the client's tool list, is the
 authoritative reference for its parameters and behavior.
 
-> **Release-branch scope (`rc`).** Five modules — knowledge base, calendar,
-> approval, project and work order — are not part of this build and remain on
-> `develop`. The CNB CMDB export is included, but runs only against the
-> production CNB tenant.
+> **Scope of this build.** Four modules — calendar, approval, project and work
+> order — are not part of this build. The CNB CMDB export is included, but runs
+> only against the production CNB tenant.
 
 ## Acknowledgments
 
