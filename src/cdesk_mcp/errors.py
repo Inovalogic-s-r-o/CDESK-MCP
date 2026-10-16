@@ -55,6 +55,8 @@ _BODY_PREVIEW_MAX = 200
 # whose body carries ANY other code is a refusal with a reason, not a missing
 # record (see the 404 branch of _translate_status).
 _NOT_FOUND_CODES = frozenset({2, 4, 112, 114, 116, 118})
+# CDESK's "Modul vypnutý": the endpoint's module is switched off on the tenant.
+_MODULE_DISABLED_CODE = 9
 
 
 def translate_error(
@@ -151,6 +153,14 @@ def _translate_status(
         )
         return _append_cdesk(base, cdesk) + suffix
     if status == 403:
+        codes, _messages = _extract_cdesk_messages(body)
+        if _MODULE_DISABLED_CODE in codes:
+            base = (
+                f"CDESK refused '{operation}'{rid_suffix}: the module it belongs "
+                f"to is switched off on this tenant (HTTP 403, code 9). An "
+                f"administrator can switch it on in the CDESK settings"
+            )
+            return _append_cdesk(base, cdesk) + "."
         base = f"CDESK rejected '{operation}'{rid_suffix} (HTTP 403)"
         if cdesk:
             return _append_cdesk(base, cdesk) + "."
@@ -162,11 +172,10 @@ def _translate_status(
     if status == 404:
         codes, _messages = _extract_cdesk_messages(body)
         if any(code not in _NOT_FOUND_CODES for code in codes):
-            # A refusal, not a missing record: v1 handlers end EVERY failure
-            # path in a 404 (e.g. a customer delete blocked by its open
-            # tasks), and the body then carries the real reason next to the
-            # generic "Záznam sa nepodarilo zmazať" (e.g. codes [8, 118],
-            # "…ukončite jeho otvorené Úlohy").
+            # A refusal, not a missing record: some delete handlers (e.g. a
+            # contact or a knowledge-base article) end EVERY failure path in a
+            # 404, and the body then carries the real reason next to the
+            # generic "Záznam sa nepodarilo zmazať" (code 118).
             base = (
                 f"CDESK refused '{operation}'{rid_suffix}. It answered HTTP 404, "
                 f"but the reason it gave is not that the record is missing — the "
@@ -174,10 +183,14 @@ def _translate_status(
             )
             return _append_cdesk(base, cdesk) + "."
         base = f"Record not found{rid_suffix} during '{operation}'"
+        hidden = (
+            " It may also belong to a customer that does not allow AI "
+            "processing, which CDESK hides from this connector."
+        )
         if cdesk:
-            return _append_cdesk(base, cdesk) + "."
+            return _append_cdesk(base, cdesk) + "." + hidden
         return (
-            f"{base}, or your account doesn't have admin scope over it."
+            f"{base}, or your account doesn't have admin scope over it." + hidden
         )
     if status == 409:
         return _translate_409(body, operation, rid_suffix, cdesk)
@@ -234,6 +247,14 @@ def _translate_409(
             f"Optimistic-lock conflict{rid_suffix}: the record was modified by "
             f"someone else since it was last fetched. Re-fetch the record with "
             f"the appropriate get_* tool and retry '{operation}'"
+        )
+        return _append_cdesk(base, cdesk_reason) + "."
+    if operation.startswith("delete_"):
+        # A delete CDESK refuses (e.g. a customer with open tasks) answers 409
+        # with the reason in the body.
+        base = (
+            f"CDESK refused '{operation}'{rid_suffix}: the record exists and "
+            f"the delete was blocked"
         )
         return _append_cdesk(base, cdesk_reason) + "."
     if any(word in lower for word in ("depend", "linked", "reference")):

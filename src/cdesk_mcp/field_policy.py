@@ -179,6 +179,45 @@ REQUEST_FIELDS: tuple[FieldRule, ...] = (
 )
 
 
+# Two request fields are gated by settings of other modules, which only
+# core/base-config carries: CDESK keeps `invoice_date` only while fills are on
+# with the invoicing date set to the request's invoice date, and
+# `percent_done_manual` only while `project_contract.percent_done` is on.
+FILL_INVOICING_DATE_REQUEST_INVOICE = 3
+
+
+def _request_invoice_date(s: Mapping[str, Any]) -> tuple[State, str] | None:
+    fill = s.get("fill")
+    if not isinstance(fill, Mapping):
+        return "off", "fill.enabled is off"
+    date = _int(fill.get("invoicingDate"))
+    if date == FILL_INVOICING_DATE_REQUEST_INVOICE:
+        return "optional", f"fill.invoicing.date = {date} (the request invoice date)"
+    return "off", f"fill.invoicing.date = {date} (not the request invoice date)"
+
+
+def _request_percent_done(s: Mapping[str, Any]) -> tuple[State, str] | None:
+    project_contract = s.get("projectContract")
+    if not isinstance(project_contract, Mapping) or "percent_done" not in project_contract:
+        return None
+    on = bool(project_contract.get("percent_done"))
+    return ("optional" if on else "off"), f"project_contract.percent_done = {project_contract.get('percent_done')!r}"
+
+
+REQUEST_BASE_FIELDS: tuple[FieldRule, ...] = (
+    FieldRule(("invoice_date",), _request_invoice_date),
+    FieldRule(("percent_done",), _request_percent_done),
+)
+
+
+def request_base_settings(base: Any) -> dict[str, Any] | None:
+    """The mapping REQUEST_BASE_FIELDS reads, from core/base-config: its
+    `fill` block (present only while fills are on) and `projectContract`."""
+    if not isinstance(base, Mapping) or not base:
+        return None
+    return {"fill": base.get("fill"), "projectContract": base.get("projectContract")}
+
+
 # --- deals (v3/contract/enums `settings`) -------------------------------------
 
 def _deal_code(s: Mapping[str, Any]) -> tuple[State, str] | None:
@@ -312,6 +351,22 @@ def task_settings(base: Any) -> dict[str, Any] | None:
     if not isinstance(settings, Mapping):
         return None
     return {**settings, "taskWatchers": _get(base, "task.taskWatchers")}
+
+
+def requires_task_type(settings: Mapping[str, Any] | None) -> bool:
+    return isinstance(settings, Mapping) and _int(_get(settings, "type.status")) == 2
+
+
+def without_required_task_type(settings: Mapping[str, Any]) -> dict[str, Any]:
+    """`settings` with the task type (and second-level type) optional instead
+    of required — for a tenant that requires a type but has none to choose,
+    where CDESK stores the task without one."""
+    out = dict(settings)
+    for key in ("type", "type2nd"):
+        node = out.get(key)
+        if isinstance(node, Mapping) and _int(node.get("status")) == 2:
+            out[key] = {**node, "status": 1}
+    return out
 
 
 def _fill_description(s: Mapping[str, Any]) -> tuple[State, str] | None:

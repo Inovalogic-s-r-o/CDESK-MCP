@@ -27,12 +27,15 @@ from typing import Any, Literal
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
+from cdesk_mcp import base_config
 from cdesk_mcp.cdesk_client import CdeskClient
 from cdesk_mcp.enums import EnumCache
 from cdesk_mcp.field_policy import (
+    REQUEST_BASE_FIELDS,
     REQUEST_FIELDS,
     describe,
     refuse_if_violated,
+    request_base_settings,
     violations,
 )
 from cdesk_mcp.filters import build_request_filter, encode_sb
@@ -61,6 +64,7 @@ from cdesk_mcp.tools._helpers import (
     validate_custom_fields,
     validate_fields,
     validate_fieldset,
+    with_warning_texts,
 )
 from cdesk_mcp.tz import localize_naive_datetime
 
@@ -83,6 +87,7 @@ _REQUEST_CREATE_FIELDS = {
 _REQUEST_TOOL_NAMES = (
     "list_requests",
     "get_request",
+    "list_request_solver_groups",
     "get_request_custom_fields",
     "get_request_enums",
     "create_request",
@@ -95,8 +100,9 @@ _REQUEST_TOOL_NAMES = (
 
 # Fields CDESK strips from a request write (create and update alike) when the
 # tenant feature behind them is off or the account lacks the write right. The
-# API returns 200 and emits NO message of its own for any of these except
-# `code`, so without this table the value vanishes and the tool reports success.
+# API returns 200; CDESK's own `warnings` entry for such a field does not say
+# which setting or right is missing, and not every CDESK version sends one, so
+# the savedData diff uses this table to report the drop and its cause.
 #
 # Keys are the WIRE names as they appear in the body and in savedData. Each note
 # names the setting and right, mirroring the wording CDESK uses for `code`.
@@ -113,7 +119,7 @@ _REQUEST_GATED_FIELDS: dict[str, str] = {
         "`request/fields/solution` write right"
     ),
     "percent_done_manual": (
-        "requires the tenant setting `project_deal.percent_done` and the "
+        "requires the tenant setting `project_contract.percent_done` and the "
         "`request/fields/percent-done` write right"
     ),
     "desired_date": (
@@ -129,8 +135,9 @@ _REQUEST_GATED_FIELDS: dict[str, str] = {
         "`request/fields/calendar_date_start` write right"
     ),
     "invoice_date": (
-        "requires the Fills module (`fill.enabled`) and the "
-        "`request/fields/invoice_date` write right"
+        "requires the Fills module (`fill.enabled`) with `fill.invoicing.date` "
+        "set to the request invoice date, and the `request/fields/invoice_date` "
+        "write right"
     ),
     "catalog_id": (
         "requires the tenant setting `request.catalog.enabled`"
@@ -302,6 +309,48 @@ def _add_time_fields(rec: Any, now: datetime | None = None) -> Any:
     return rec
 
 
+# CDESK sets `close_date` / `duration_open` when a request reaches a completed
+# status (80, 81, 85, 86) or is refused (95). Accepted completion (90) does not
+# run that step, so a request moved to 90 straight from an open status
+# (below 80) is left without a close date.
+_ACCEPTED_COMPLETION = 90
+_COMPLETED_FROM = 80
+
+
+async def _check_status_allowed(
+    client: CdeskClient, id: int, current: dict[str, Any], status: Any,
+) -> None:
+    """Refuse a status change CDESK's status rules do not allow, naming the
+    allowed statuses (GET /v3/request/{id}/statuses — the current one
+    included). Unreadable statuses leave the decision to CDESK."""
+    if status is None or status == current.get("status"):
+        return
+    try:
+        rows = unwrap_record(await client.get(f"v3/request/{id}/statuses"))
+    except Exception:  # noqa: BLE001 — CDESK still refuses a disallowed change
+        return
+    allowed = _allowed_statuses(rows)
+    if not allowed or any(s["action_code"] == status for s in allowed):
+        return
+    names = ", ".join(f"{s['name']} ({s['action_code']})" for s in allowed)
+    raise ValueError(
+        f"request {id} cannot move to status {status} from its current status "
+        f"{current.get('status')}; the tenant's status rules allow: {names}"
+    )
+
+
+def _with_direct_close_warning(result: dict[str, Any], current: Any, new: Any) -> dict[str, Any]:
+    if new != _ACCEPTED_COMPLETION or not isinstance(current, int) or current >= _COMPLETED_FROM:
+        return result
+    return with_warning_texts(result, [
+        f"The request moved from status {current} straight to 90 (accepted "
+        f"completion). CDESK sets no close_date and no duration_open on that move "
+        f"— only a completed status (80, 81, 85, 86) or 95 does — so the request "
+        f"has no close date. Complete it first (e.g. 80) when the close date "
+        f"matters."
+    ])
+
+
 async def _label_write_result(cache: EnumCache, result: dict[str, Any]) -> dict[str, Any]:
     """Enum labels on a write response: the record is in `savedData` (or in
     `data` on endpoints that return the record there)."""
@@ -460,6 +509,7 @@ def register_request_tools(
         fieldset: str | None = None,
         fields: list[str] | None = None,
         include_deleted: bool = False,
+        include_allowed_statuses: bool = False,
     ) -> Any:
         try:
             validate_fieldset(fieldset)
@@ -483,7 +533,51 @@ def register_request_tools(
         record = _add_time_fields(_add_is_periodic(unwrap_record(response)))
         add_names([record], "request", detail=True, fieldset=fieldset, fields=fields)
         await add_enum_names(cache, [record], _REQUEST_ENUM_LABELS)
+        if include_allowed_statuses and isinstance(record, dict):
+            try:
+                rows = unwrap_record(await client.get(f"v3/request/{id}/statuses"))
+            except Exception as e:
+                raise to_llm_error(e, operation="get_request", record_id=id) from e
+            record["allowed_statuses"] = _allowed_statuses(rows)
         return record
+
+    @mcp.tool(
+        description=_LIST_REQUEST_SOLVER_GROUPS_DESC,
+        annotations=ToolAnnotations(title="List request solver groups", readOnlyHint=True),
+    )
+    async def list_request_solver_groups(
+        customer_id: int,
+        cat_area_id: int | None = None,
+        cat_area_2nd_id: int | None = None,
+        catalog_id: int | None = None,
+        project_contract_id: int | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"company_id": customer_id, "include_metadata": "true"}
+        for key, value in (
+            ("cat_area_id", cat_area_id), ("cat_area_2nd_id", cat_area_2nd_id),
+            ("catalog_id", catalog_id), ("project_contract_id", project_contract_id),
+        ):
+            if value is not None:
+                params[key] = value
+        try:
+            response = await client.get("v3/request/solver-groups", params=params)
+        except Exception as e:
+            raise to_llm_error(e, operation="list_request_solver_groups") from e
+        rows = unwrap_record(response)
+        items = [
+            {k: row[k] for k in _SOLVER_GROUP_FIELDS if k in row}
+            for row in (rows if isinstance(rows, list) else []) if isinstance(row, dict)
+        ]
+        result: dict[str, Any] = {"items": items, "count": len(items)}
+        preselected = response.get("preselected_solver_group_id") if isinstance(response, dict) else None
+        if preselected is not None:
+            result["preselected_solver_group_id"] = preselected
+        if not items:
+            result["note"] = (
+                "No solver groups: the tenant does not use solver groups on "
+                "requests, or none fits this customer / service area / catalog."
+            )
+        return result
 
     @mcp.tool(
         description=_GET_REQUEST_CUSTOM_FIELDS_DESC,
@@ -531,7 +625,11 @@ def register_request_tools(
         result["fields"] = {
             "always_required": ["company", "description (unless a catalog hides it)",
                                 "type_code or type_name"],
-            "by_tenant_setting": describe(REQUEST_FIELDS, cache.extra("config")),
+            "by_tenant_setting": {
+                **describe(REQUEST_FIELDS, cache.extra("config")),
+                **describe(REQUEST_BASE_FIELDS,
+                           request_base_settings(await base_config.load(client))),
+            },
             "note": (
                 "State of each configurable create_request/update_request "
                 "parameter on this tenant, from its live request settings: off "
@@ -643,6 +741,9 @@ def register_request_tools(
                     "catalog_id": catalog_id, "place_name": place_name,
                     "branch_id": branch_id,
                 },
+            ) + violations(
+                REQUEST_BASE_FIELDS, request_base_settings(await base_config.load(client)),
+                {"invoice_date": invoice_date, "percent_done": percent_done},
             ))
             # With auto-naming on, the CDESK web form fills an empty title from
             # the description before saving; the server itself does not (a
@@ -919,6 +1020,10 @@ def register_request_tools(
                     "branch_id": branch_id,
                 },
                 update=True,
+            ) + violations(
+                REQUEST_BASE_FIELDS, request_base_settings(await base_config.load(client)),
+                {"invoice_date": invoice_date, "percent_done": percent_done},
+                update=True,
             ))
             # CDESK stores req_status and req_priority by the enum ACTION_CODE,
             # NOT the enum id — sending the id overflows the tinyint column and
@@ -965,6 +1070,7 @@ def register_request_tools(
             )
 
             current = await _fetch_for_update_request(client, id)
+            await _check_status_allowed(client, id, current, status_id)
 
             body = _build_request_body(
                 {
@@ -1040,12 +1146,14 @@ def register_request_tools(
         except Exception as e:
             raise to_llm_error(e, operation="update_request", record_id=id) from e
         # solver_note: silently dropped like code (see create_request note).
-        return await _label_write_result(cache, annotate_write_warnings(
+        result = annotate_write_warnings(
             response if isinstance(response, dict) else {"data": response},
             sent_body=body,
             check_fields=tuple(_REQUEST_GATED_FIELDS),
             field_notes=_REQUEST_GATED_FIELDS,
-        ))
+        )
+        result = _with_direct_close_warning(result, current.get("status"), body.get("status"))
+        return await _label_write_result(cache, result)
 
     @mcp.tool(
         description=_DELETE_REQUEST_DESC,
@@ -1077,6 +1185,7 @@ def register_request_tools(
             if status_id is None:
                 raise RuntimeError("set_request_status requires a non-empty status_name")
             current = await _fetch_for_update_request(client, id)
+            await _check_status_allowed(client, id, current, status_id)
             body: dict[str, Any] = {"status": status_id, "timestamp_check": current["timestamp_check"]}
             for key, value in (
                 ("notify_block", notify_block_value(notify_block)),
@@ -1088,11 +1197,15 @@ def register_request_tools(
             response = await client.put(f"v3/request/{id}", json=body)
         except RuntimeError:
             raise
+        except ValueError as e:
+            raise RuntimeError(f"set_request_status input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="set_request_status", record_id=id) from e
-        return await _label_write_result(
-            cache, response if isinstance(response, dict) else {"data": response}
+        result = _with_direct_close_warning(
+            response if isinstance(response, dict) else {"data": response},
+            current.get("status"), status_id,
         )
+        return await _label_write_result(cache, result)
 
     @mcp.tool(
         description=_LIST_REQUEST_DISCUSSION_DESC,
@@ -1340,15 +1453,11 @@ def _build_discussion_body(
         body["changeStatusToWaitingForCustomer"] = True
     if work_order_id is not None:
         body["work_order_id"] = work_order_id
+    # `notify_block` (snake case) silences the post itself and the status
+    # change it causes; the camel-case `notifyBlock` would stop only the latter.
     block = notify_block_value(notify_block)
     if block is not None:
-        body["notifyBlock"] = block
-    if block == 1:
-        # notifyBlock stops only the notification a status change can trigger;
-        # the post's own receivers are still e-mailed. An empty receiver list
-        # with customNotify replaces them with nobody.
-        body[to_key] = {"auto": [], "manual": []}
-        body["customNotify"] = True
+        body["notify_block"] = block
     if notify_customer_block is not None:
         body["notifyCustomerBlock"] = notify_customer_block
     if notify_sms_block is not None:
@@ -1585,6 +1694,22 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
     """
 )
 
+# A solver-group row of GET /v3/request/solver-groups is a group's user record;
+# these keys identify it and say why the form lists it first.
+_SOLVER_GROUP_FIELDS = (
+    "id", "name", "email", "assigned_group_to_catarea", "assigned_group_to_company",
+)
+
+
+def _allowed_statuses(rows: Any) -> list[dict[str, Any]]:
+    """The statuses GET /v3/request/{id}/statuses returns, as action code +
+    name (the value set_request_status / update_request take as status_name)."""
+    return [
+        {"action_code": row.get("action_code"), "name": row.get("name")}
+        for row in (rows if isinstance(rows, list) else []) if isinstance(row, dict)
+    ]
+
+
 _GET_REQUEST_DESC = inspect.cleandoc(
     """
     Fetch a single request by id. Returns the request record including
@@ -1614,6 +1739,12 @@ _GET_REQUEST_DESC = inspect.cleandoc(
     True to retrieve it anyway (requests are the only module where
     deleted records remain reachable).
 
+    include_allowed_statuses: True adds `allowed_statuses` — the statuses
+    the request may be moved to now (action code + name, the current one
+    included), per the tenant's status rules and the request's catalog
+    status flow. CDESK refuses any other status on set_request_status /
+    update_request.
+
     The response carries a derived `is_periodic` boolean (True when the
     request was generated from a periodical request) plus the raw
     `periodical_request_id` it rests on — both are included regardless of
@@ -1629,6 +1760,26 @@ _GET_REQUEST_DESC = inspect.cleandoc(
     status_name / priority_name / … parameters accept. A value with no
     label (empty, or a category switched off on the tenant) has no
     `*_name` key.
+    """
+)
+
+_LIST_REQUEST_SOLVER_GROUPS_DESC = inspect.cleandoc(
+    """
+    The solver groups CDESK's request form offers for `solver_group_id` on a
+    request of this customer, optionally narrowed by service area
+    (cat_area_id / cat_area_2nd_id), request-catalog item (catalog_id) and
+    project contract (project_contract_id). Groups assigned to the service
+    area come first, then the customer's groups, then the rest; a project
+    contract with its own solver group adds its project-team group first.
+    Each item: id, name, email, and the flags assigned_group_to_catarea /
+    assigned_group_to_company marking the preferred groups.
+    `preselected_solver_group_id`, when present, is the group the form would
+    preselect for a new request.
+
+    An empty list means the tenant does not use solver groups on requests
+    (get_request_enums → fields shows use_solver_group), or no group fits.
+    Service-area ids come from get_request_enums, catalog ids from
+    list_request_catalogs.
     """
 )
 
@@ -1736,7 +1887,8 @@ _CREATE_REQUEST_DESC = inspect.cleandoc(
         enum is id-based; where it is key/value, pass type_code.)
       - solver_id, solver_group_id: who handles the request (CDESK requires a
         solver or solver group). Solver group ids are user-group ids
-        (list_user_groups; a root group, main_group=true, is not accepted);
+        (list_request_solver_groups lists the ones the request form offers;
+        a root group, root_group=true in list_user_groups, is not accepted);
         whether the group is required follows use_solver_group
         (get_request_enums → fields).
       - catalog_id: instantiate from a request-catalog template.
@@ -1755,9 +1907,9 @@ _CREATE_REQUEST_DESC = inspect.cleandoc(
         with the tenant's fixedDueDate setting.
       - solution, solver_note, note, code, computer_code: free-text
         bodies. NB: `code` requires the
-        request/fields/code write right — without it CDESK silently
-        drops the value with a 200; this tool detects
-        the drop and adds a `warnings` entry to the result.
+        request/fields/code write right — without it CDESK drops the
+        value with a 200; this tool detects the drop and names it in
+        the result's `warnings`.
       - for_customer: visibility flag (customer can see the ticket).
       - user_entered_by / contact_entered_by / entered_by: applicant
         identifier (one of: existing user id, customer-contact id, or
@@ -1827,9 +1979,9 @@ _UPDATE_REQUEST_DESC = inspect.cleandoc(
     keys → values (discover keys via get_request_custom_fields; read
     stored values via get_request(id, fieldset="all")). Unrecognized
     keys are ignored with a 200 and reported in the result's `warnings`
-    key (not a 400). `code` is silently dropped without the
+    key (not a 400). `code` is dropped with a 200 without the
     request/fields/code write right — this tool detects the drop and
-    adds a `warnings` entry.
+    names it in `warnings`.
 
     Reparenting (changing company) may be rejected once the request
     is completed or has bound devices/approvals — CDESK's error message
@@ -1863,6 +2015,9 @@ _SET_REQUEST_STATUS_DESC = inspect.cleandoc(
     Intent helper: change a request's status by name. Resolves the
     status name via the Request enum cache, handles the optimistic-lock
     fetch internally, and PUTs only the {status, timestamp_check} pair.
+    A status the tenant's status rules do not allow from the current one is
+    refused before anything is written, naming the allowed statuses
+    (get_request(include_allowed_statuses=True) lists them too).
 
     notify_block=1 sends no notification for this change (notify_customer_block
     / notify_sms_block: none to the customer / no SMS).
@@ -1931,7 +2086,8 @@ _POST_REQUEST_DISCUSSION_DESC = inspect.cleandoc(
         are notified, and CDESK's default receivers are not. Requires at
         least one receiver.
       - notify_block — 1 = nobody is notified about this post: neither
-        its receivers nor the notification a status change can trigger.
+        its receivers nor the notification a status change can trigger
+        (with work_order_id, the work order's receivers still are).
         Cannot be combined with notify_user_ids / discussion_receivers.
       - notify_customer_block / notify_sms_block — 0 or 1 flags that
         suppress the customer / SMS notification of a status change the
@@ -1945,8 +2101,6 @@ _POST_REQUEST_DISCUSSION_DESC = inspect.cleandoc(
     in-app notification for, and CDESK's confirmation message; it
     carries a `warning` when a requested receiver is not in the recorded
     list or CDESK sent no confirmation.
-    notify_block=1 is sent so that the post's own receivers are replaced by
-    nobody as well (CDESK reports it in `warnings`: "Nobody was notified").
 
     Side effects (by CDESK): with the tenant's automatic status change on, a post
     by the request's solver (or a member of its solver group) moves a request in

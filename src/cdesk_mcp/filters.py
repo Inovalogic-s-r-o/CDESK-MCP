@@ -1843,12 +1843,16 @@ _REFUSED_CMPS: dict[str, dict[str, tuple[frozenset[str], str]]] = {
             "it is a scope preset; use '=' with one of 10-16, or a list of them",
         ),
         "approver_id": (
-            frozenset({"ISNULL", "ISNOTNULL"}),
-            "CDESK answers it with no approvals at all; filter by an approver id with '='",
+            frozenset({"ISNULL", "ISNOTNULL", "!=", "ISNOT", ">", ">=", "<", "<=", "BETWEEN"}),
+            "CDESK applies only '=' on this step-level column (a range or '!=' is "
+            "read as equality, ISNULL / ISNOTNULL match no approval); filter by "
+            "an approver id with '=', or a list of ids",
         ),
         "processed_state": (
-            frozenset({"ISNULL", "ISNOTNULL"}),
-            "CDESK answers it with no approvals at all; filter by a state with '='",
+            frozenset({"ISNULL", "ISNOTNULL", "!=", "ISNOT", ">", ">=", "<", "<=", "BETWEEN"}),
+            "CDESK applies only '=' on this step-level column (a range or '!=' is "
+            "read as equality, ISNULL / ISNOTNULL match no approval); filter by a "
+            "state with '=', or a list of states",
         ),
         "processed_approver": (
             frozenset({">", ">=", "<", "<=", "BETWEEN"}),
@@ -1866,6 +1870,19 @@ _REFUSED_CMPS: dict[str, dict[str, tuple[frozenset[str], str]]] = {
             frozenset({"<", "<=", "!=", "ISNOT", "BETWEEN", "CONTAINS"}),
             "use '=' 1 (an amount ready for invoicing) or '=' 0 (none)",
         ),
+    },
+    "projects": {
+        col: (
+            frozenset({"ISNULL", "ISNOTNULL"}),
+            "every project holds a number here (0.00 when nothing is set) and "
+            "CDESK reads 0.00 as empty; use '> 0' for a set amount",
+        )
+        for col in (
+            "duration", "planned_hours", "agreed_revenue", "real_revenue",
+            "plan_lien", "real_lien", "agreed_external_costs",
+            "real_external_costs", "agreed_gross_margin", "real_gross_margin",
+            "plan_gross_margin",
+        )
     },
     "kb_articles": {
         "category_id": (

@@ -53,6 +53,7 @@ from cdesk_mcp.tools._helpers import (
     unwrap_record,
     validate_fields,
     validate_fieldset,
+    warned_fields,
     write_values_match,
 )
 
@@ -249,7 +250,8 @@ def register_knowledgebase_tools(
         data = annotated.get("data")
         new_id = data.get("id") if isinstance(data, dict) else data
         result = await _verify_write(
-            client, new_id, body, annotated, operation="create_kb_article"
+            client, new_id, body, annotated, operation="create_kb_article",
+            reported=warned_fields(response),
         )
         await _label_articles(client, [result.get("data")])
         return result
@@ -315,7 +317,8 @@ def register_knowledgebase_tools(
             sent_body={}, check_fields=(),
         )
         result = await _verify_write(
-            client, id, body, annotated, operation="update_kb_article"
+            client, id, body, annotated, operation="update_kb_article",
+            reported=warned_fields(response),
         )
         await _label_articles(client, [result.get("data")])
         return result
@@ -339,6 +342,7 @@ def register_knowledgebase_tools(
         try:
             if per_page < 1:
                 raise ValueError(f"per_page must be positive (got {per_page})")
+            await _require_kb_enabled(client)
             response = await client.get(
                 "knowledgebase/space", params={"perpage": per_page}
             )
@@ -363,6 +367,7 @@ def register_knowledgebase_tools(
             params: dict[str, Any] = {"perpage": per_page}
             if space_id is not None:
                 params["space_id"] = space_id
+            await _require_kb_enabled(client)
             response = await client.get("knowledgebase/category", params=params)
         except ValueError as e:
             raise RuntimeError(f"list_kb_categories input error: {e}") from e
@@ -373,6 +378,13 @@ def register_knowledgebase_tools(
 
 
 # --- internals ----------------------------------------------------------
+
+async def _require_kb_enabled(client: CdeskClient) -> None:
+    """Raise CDESK's own refusal when the knowledge-base module is off. The
+    spaces and categories are read from routes outside v3 that answer even
+    with the module off; every v3 knowledge-base route is refused then (403,
+    code 9), so the small article-enums call decides first."""
+    await client.get("v3/knowledgebase/article/enums")
 
 # CDESK ignores `sort` on the article list (always id ascending), so a sorted
 # list is built here: every matching article is fetched, sorted, and the
@@ -639,11 +651,13 @@ async def _verify_write(
     response: dict[str, Any],
     *,
     operation: str,
+    reported: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Re-READ the article and warn about anything sent but not stored.
 
     The write response is not a reliable record of what was stored, so the
-    check reads the article back; it costs one extra GET per write.
+    check reads the article back; it costs one extra GET per write. Fields in
+    `reported` are already named in CDESK's own warnings and are not repeated.
     """
     if not isinstance(article_id, int):
         return response
@@ -664,7 +678,7 @@ async def _verify_write(
         return response
     dropped: list[str] = []
     for column in _READ_BACK_FIELDS:
-        if column not in sent_body:
+        if column not in sent_body or column in reported:
             continue
         sent = sent_body[column]
         if sent is None or sent == "":
@@ -821,7 +835,8 @@ _LIST_KB_SPACES_DESC = inspect.cleandoc(
     List knowledge-base SPACES (v1-backed helper — spaces are not exposed via
     the v3 API). A space is the mandatory parent container of every article:
     use an item's id as create_kb_article's space_id. Only spaces the account
-    has record rights on are returned.
+    has record rights on are returned. Refused, like every knowledge-base
+    tool, while the knowledge-base module is switched off.
     """
 )
 
@@ -830,6 +845,7 @@ _LIST_KB_CATEGORIES_DESC = inspect.cleandoc(
     List knowledge-base CATEGORIES (v1-backed helper). Categories are flat
     per-space lists (no hierarchy); optionally narrow by space_id. Use an
     item's id as category_id in create/update_kb_article or as the
-    list_kb_articles category filter.
+    list_kb_articles category filter. Refused, like every knowledge-base
+    tool, while the knowledge-base module is switched off.
     """
 )

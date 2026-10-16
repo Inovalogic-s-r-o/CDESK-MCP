@@ -12,23 +12,15 @@ Special handling:
     CDESK rejects passwords that match the previous value on update with
     HTTP 412; errors.translate_error maps that to a clear "password must
     differ" message.
-  - cm_access: CDESK's 2-char Y/N feature flag. **The OpenAPI spec
-    mis-documents the positions** (says pos 1 = CMonitor, pos 2 = CDESK);
-    CDESK reads `cm_access[1]` ('the 2nd character') as the CMonitor flag.
-    So:
-        position 1 (index 0) = CDESK
-        position 2 (index 1) = CMonitor
-    A CDESK-only API user (no CMonitor surface) carries `cm_access='YN'`.
-    Exposed as two booleans (`cdesk_access`, `cmonitor_access`) for
-    LLM ergonomics; combined into the 2-char string before sending.
-    Defaults are None on both — CDESK applies its tenant default if
-    neither is set on create. On update, missing bools preserve the
-    current stored position (we already GET for timestamp_check).
-  - help/email/guest/test account flags: bools mapped to 'Y' or omitted
-    via tools._helpers.yn (same convention as Customer.cdesk_allowed).
+  - help account flag: a bool mapped to 'Y' or omitted via tools._helpers.yn.
 
 Not exposed:
   - `encrypted_password` (SSO/migration niche)
+  - fields the v3 API does not store (it answers with a `not_writable`
+    warning): `cm_access` (the CDESK / CMonitor access flags), `test_account`,
+    `email_account`, `guest_account`, `id_company`, `type` and `role` (both
+    follow from group membership),
+    `cm_language`, `timezone`, `ad_username`
   - notification fields requiring the `acl/user/fields/email_settings` ACL
     (CDESK silently ignores them without it)
 
@@ -62,6 +54,7 @@ from cdesk_mcp.tools._helpers import (
     validate_custom_fields,
     validate_fields,
     validate_fieldset,
+    with_warning_texts,
     yn as _yn,
 )
 
@@ -78,13 +71,10 @@ _USER_CREATE_FIELDS = {
     # other: with `sendPassword` the user is created with no password and no
     # e-mail.
     "send_password_email": "password_action",
-    "company_id": "id_company",              # CDESK uses older naming
     # `group_id` replaces the whole membership; the API also accepts `groups`
     # and `group_ids` as aliases (all three are stored).
     "group_ids": "group_id",
-    "language": "cm_language",               # shorter LLM-facing name
     "mobile_phone": "mobil",                 # CDESK uses cz spelling
-    "user_type": "type",                     # avoid shadowing Python builtin
 }
 
 _MAX_PER_PAGE = 100
@@ -131,25 +121,34 @@ def _drop_oversized_user_keys(record: dict[str, Any]) -> dict[str, Any]:
 # User groups. The v3 spec: user groups "are also solver groups and
 # approver groups", and `solver_group_id` is "FK to a user group id". The list
 # is trimmed to the identifying fields by default — a group record also carries
-# its rights and user settings. `main_group` marks a ROOT group (Administrators,
-# Operators, Customer accounts, …), which CDESK never offers as a request's
-# solver group.
+# its rights and user settings. CDESK sends three flags on every group:
+# `root_group` (one of the tenant's built-in root groups — Administrators,
+# Operators, Customer accounts, … — which CDESK never offers as a request's
+# solver group), `main_group` (a direct child of a root group) and, on the list,
+# `toplevel_group` (no parent group).
 _MAX_GROUPS_PER_PAGE = 100
 _GROUP_LIST_FIELDS = (
-    "id", "name", "description", "enabled", "main_group", "parent_id",
-    "assigned_company_count",
+    "id", "name", "description", "enabled", "root_group", "main_group",
+    "toplevel_group", "parent_id", "assigned_company_count",
 )
-# `id_parent` on a group is NOT its parent group (it holds the id of the user
-# who created the group); the parents are
-# `group_id`, which v3 documents as "Parent group ids".
-_GROUP_DETAIL_FIELDS = ("id", "name", "nick", "description", "enabled", "main_group")
+# `id_parent` on a group detail is NOT its parent group (it holds the tenant's
+# admin account id); the parents are `group_id`.
+_GROUP_DETAIL_FIELDS = (
+    "id", "name", "nick", "description", "enabled", "root_group", "main_group",
+)
 
 
-# whoami. The v3 API has no "current user" endpoint and its login
-# answer carries only tokens; core/base-config — the payload the CDESK web app
-# loads for every logged-in user, already used for the form rules — holds the
-# caller's own record in its `user` block. That block ALSO holds the session's
-# apitoken (`token`) and `gsh`, so only the fields named here ever leave it.
+# whoami. GET /v3/user/me gives the caller's identity and main roles; the
+# company, language, timezone and the request-solver / customer roles come from
+# core/base-config — the payload the CDESK web app loads for every logged-in
+# user, already used for the form rules — whose `user` block holds the caller's
+# own record. That block ALSO holds the session's apitoken (`token`) and `gsh`,
+# so only the fields named here ever leave it. Either source alone is enough;
+# where both have a field, /v3/user/me wins.
+_ME_FIELDS = (
+    "id", "user", "name", "email", "type", "job_title_id",
+    "is_admin", "is_operator", "is_solver", "is_authorizing_officer",
+)
 _WHOAMI_FIELDS = (
     ("id", "id"),
     ("login", "user"),
@@ -171,14 +170,24 @@ _WHOAMI_ROLES = (
 )
 
 
-def whoami_record(base: Any) -> dict[str, Any] | None:
-    """The calling user's allow-listed fields from core/base-config, or None
-    when the payload has no usable `user` block."""
+def whoami_record(base: Any, me: Any = None) -> dict[str, Any] | None:
+    """The calling user's allow-listed fields from the /v3/user/me record `me`
+    and core/base-config's `user` block, or None when neither names a user.
+    A base-config block for a different user than `me` is ignored."""
     user = base_config.section(base, "user")
     if not isinstance(user, dict) or not isinstance(user.get("id"), int):
+        user = None
+    if not isinstance(me, dict) or not isinstance(me.get("id"), int):
+        me = None
+    if me is None and user is None:
         return None
-    out: dict[str, Any] = {key: user.get(src) for key, src in _WHOAMI_FIELDS}
-    out["roles"] = {key: bool(user.get(src)) for key, src in _WHOAMI_ROLES}
+    if me is not None and user is not None and user["id"] != me["id"]:
+        user = None
+    source = dict(user or {})
+    if me is not None:
+        source.update({k: me[k] for k in _ME_FIELDS if k in me})
+    out: dict[str, Any] = {key: source.get(src) for key, src in _WHOAMI_FIELDS}
+    out["roles"] = {key: bool(source.get(src)) for key, src in _WHOAMI_ROLES}
     return out
 
 
@@ -194,13 +203,19 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
         annotations=ToolAnnotations(title="Who am I", readOnlyHint=True),
     )
     async def whoami() -> dict[str, Any]:
+        try:
+            own = unwrap_record(
+                await client.get("v3/user/me", params={"returnFields[]": list(_ME_FIELDS)})
+            )
+        except Exception:  # noqa: BLE001 — core/base-config still names the caller
+            own = None
         data = await base_config.load(client)
-        me = whoami_record(data)
+        me = whoami_record(data, own)
         if me is None:
             raise RuntimeError(
                 "whoami: CDESK did not return the calling user's record "
-                "(core/base-config unreadable); try again, or check the "
-                "connection with server_info."
+                "(neither /v3/user/me nor core/base-config was readable); try "
+                "again, or check the connection with server_info."
             )
         return me
 
@@ -234,11 +249,6 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
         except Exception as e:
             raise to_llm_error(e, operation="list_user_groups") from e
         records, meta = unwrap_list(response)
-        for row in records:
-            # CDESK sends main_group only for a root group and leaves the key
-            # out otherwise — make it always a bool.
-            if isinstance(row, dict) and (fields is None or "main_group" in fields):
-                row["main_group"] = row.get("main_group") is True
         return {"items": records, "meta": list_meta(meta, paging),
                 "page": page, "per_page": per_page}
 
@@ -255,7 +265,6 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
         if not isinstance(record, dict):
             raise RuntimeError(f"get_user_group: unexpected response for group {id}")
         out = {key: record.get(key) for key in _GROUP_DETAIL_FIELDS}
-        out["main_group"] = record.get("main_group") is True  # absent = not a root group
         members = record.get("assigned_user_id")
         out["member_ids"] = members if isinstance(members, list) else []
         parents = record.get("group_id")
@@ -426,21 +435,10 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
         position: str | None = None,
         phone: str | None = None,
         mobile_phone: str | None = None,
-        company_id: int | None = None,
-        user_type: str | None = None,
-        cdesk_access: bool | None = None,
-        cmonitor_access: bool | None = None,
-        role: str | None = None,
         group_ids: list[int] | None = None,
         job_title_id: int | None = None,
-        language: str | None = None,
-        timezone: str | None = None,
         personal_number: str | None = None,
-        ad_username: str | None = None,
         is_help_account: bool | None = None,
-        is_email_account: bool | None = None,
-        is_guest_account: bool | None = None,
-        is_test_account: bool | None = None,
         custom_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
@@ -478,11 +476,6 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
             # invalid values up-front so the user gets a clear message
             # instead of a CDESK 400.
             _validate_auto_logout_and_ips(auto_logout, ips)
-            # On create there is no stored record to preserve, so an unspecified
-            # access position must NOT default to grant. Pass current="NN" so
-            # setting one access flag doesn't silently grant the other (the
-            # "YY" default is only safe on update, where the stored value is read).
-            cm_access = _combine_cm_access(cdesk_access, cmonitor_access, current="NN")
             body = _build_user_body(
                 {
                     "login": login,
@@ -500,20 +493,10 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                     "position": position,
                     "phone": phone,
                     "mobile_phone": mobile_phone,
-                    "company_id": company_id,
-                    "user_type": user_type,
-                    "cm_access": cm_access,
-                    "role": role,
                     "group_ids": group_ids,
                     "job_title_id": job_title_id,
-                    "language": language,
-                    "timezone": timezone,
                     "personal_number": personal_number,
-                    "ad_username": ad_username,
                     "help_account": _yn(is_help_account),
-                    "email_account": _yn(is_email_account),
-                    "guest_account": _yn(is_guest_account),
-                    "test_account": _yn(is_test_account),
                 }
             )
             # customFields keys are already wire-format (cfield_*) — set after
@@ -522,7 +505,7 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                 body["customFields"] = custom_fields
             response = await client.post("v3/user", json=body)
             result = response if isinstance(response, dict) else {"data": response}
-            result = _with_test_account_warning(body, result)
+            result = with_warning_texts(result)
         except (CdeskApiError, CdeskAuthError) as e:
             # CDESK-signaled errors (both RuntimeError subclasses) need
             # translation — must be caught before the plain-RuntimeError
@@ -553,21 +536,10 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
         position: str | None = None,
         phone: str | None = None,
         mobile_phone: str | None = None,
-        company_id: int | None = None,
-        user_type: str | None = None,
-        cdesk_access: bool | None = None,
-        cmonitor_access: bool | None = None,
-        role: str | None = None,
         group_ids: list[int] | None = None,
         job_title_id: int | None = None,
-        language: str | None = None,
-        timezone: str | None = None,
         personal_number: str | None = None,
-        ad_username: str | None = None,
         is_help_account: bool | None = None,
-        is_email_account: bool | None = None,
-        is_guest_account: bool | None = None,
-        is_test_account: bool | None = None,
         custom_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
@@ -583,28 +555,6 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                     ips if ips is not None else "*.*.*.*",
                 )
             current = await _fetch_for_update(client, id)
-            # cm_access: preserve any position the caller didn't specify.
-            # If the GET response has no usable cm_access the field is omitted
-            # entirely (don't fabricate a 'YY' fallback — that would
-            # silently grant access positions we can't observe).
-            cm_access: str | None = None
-            if cdesk_access is not None or cmonitor_access is not None:
-                raw_current = current.get("cm_access")
-                if isinstance(raw_current, str) and len(raw_current) >= 2:
-                    cm_access = _combine_cm_access(
-                        cdesk_access, cmonitor_access, current=raw_current,
-                    )
-                elif cdesk_access is not None and cmonitor_access is not None:
-                    # Both positions explicitly provided — no current needed.
-                    cm_access = _combine_cm_access(cdesk_access, cmonitor_access)
-                else:
-                    raise RuntimeError(
-                        f"update_user: cannot preserve unspecified cm_access "
-                        f"position on user {id}: the GET response has no "
-                        f"cm_access field. Pass BOTH cdesk_access and "
-                        f"cmonitor_access explicitly, or omit both to keep "
-                        f"the stored value."
-                    )
             body = _build_user_body(
                 {
                     "login": login,
@@ -619,20 +569,10 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
                     "position": position,
                     "phone": phone,
                     "mobile_phone": mobile_phone,
-                    "company_id": company_id,
-                    "user_type": user_type,
-                    "cm_access": cm_access,
-                    "role": role,
                     "group_ids": group_ids,
                     "job_title_id": job_title_id,
-                    "language": language,
-                    "timezone": timezone,
                     "personal_number": personal_number,
-                    "ad_username": ad_username,
                     "help_account": _yn(is_help_account),
-                    "email_account": _yn(is_email_account),
-                    "guest_account": _yn(is_guest_account),
-                    "test_account": _yn(is_test_account),
                 }
             )
             # customFields keys are already wire-format (cfield_*) — set after
@@ -642,7 +582,7 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
             body["timestamp_check"] = current["timestamp_check"]
             response = await client.put(f"v3/user/{id}", json=body)
             result = response if isinstance(response, dict) else {"data": response}
-            result = _with_test_account_warning(body, result)
+            result = with_warning_texts(result)
         except (CdeskApiError, CdeskAuthError) as e:
             # CDESK-signaled errors (both RuntimeError subclasses) need
             # translation — must be caught before the plain-RuntimeError
@@ -672,35 +612,6 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
 # Group membership (`group_id`), `job_title_id` and `position` (a job-title
 # name) are stored and validated by the API — an unknown group, job title or
 # position name is a 400 — so they need no read-back.
-# `test_account` is the one field still answered with a 200 without storing:
-# GET never carries it, so it is checked only through the row a write echoes.
-
-
-def _with_test_account_warning(
-    body: dict[str, Any], result: dict[str, Any],
-) -> dict[str, Any]:
-    """Attach a warning when a sent `test_account` flag is not confirmed by the
-    row the write echoed. The PUT echoes the stored row, the POST sometimes the
-    row and sometimes a bare id."""
-    if not body.get("test_account"):
-        return result
-    echoed = result.get("data")
-    stored_flag = echoed.get("test_account") if isinstance(echoed, dict) else None
-    if stored_flag is None:
-        warning = (
-            "is_test_account was sent, but this response does not echo the "
-            "flag and CDESK never returns it on read, so whether it stored "
-            "cannot be checked here — it has been observed NOT to store; "
-            "check it in the CDESK UI."
-        )
-    elif stored_flag != body["test_account"]:
-        warning = (
-            f"is_test_account was sent but the stored flag is "
-            f"{stored_flag!r} — it was NOT stored."
-        )
-    else:
-        return result
-    return {**result, "warnings": [*(result.get("warnings") or []), warning]}
 
 
 def _validate_auto_logout_and_ips(auto_logout: int, ips: str) -> None:
@@ -733,35 +644,6 @@ def _build_user_body(raw: dict[str, Any]) -> dict[str, Any]:
     return body
 
 
-def _combine_cm_access(
-    cdesk: bool | None,
-    cmonitor: bool | None,
-    *,
-    current: str = "YY",
-) -> str | None:
-    """Combine two LLM-facing booleans into CDESK's 2-char `cm_access`
-    string.
-
-    **Position semantics** (CDESK reads `cm_access[1]` as the CMonitor
-    flag — the OpenAPI spec gets this BACKWARDS):
-        position 1 (index 0) = CDESK    (this function's first arg)
-        position 2 (index 1) = CMonitor (this function's second arg)
-
-    Returns None when both inputs are None so the field is omitted from
-    the request body (preserves the current stored value on update; lets
-    CDESK apply its tenant default on create).
-
-    `current`: the current stored cm_access; used on update so a caller
-    setting only one position preserves the other.
-    """
-    if cdesk is None and cmonitor is None:
-        return None
-    safe_current = current if len(current) >= 2 else "YY"
-    pos1 = ("Y" if cdesk else "N") if cdesk is not None else safe_current[0]
-    pos2 = ("Y" if cmonitor else "N") if cmonitor is not None else safe_current[1]
-    return pos1 + pos2
-
-
 async def _fetch_for_update(client: CdeskClient, id: int) -> dict[str, Any]:
     """Fetch a user and unwrap to the record dict; require timestamp_check.
 
@@ -769,8 +651,7 @@ async def _fetch_for_update(client: CdeskClient, id: int) -> dict[str, Any]:
     check, not `updated_at`.
 
     fieldset=all is required: the v3 fieldset default (`extended`) does not
-    include `timestamp_check` — only `all` carries it. It also
-    guarantees `cm_access` is present for the preserve-position logic."""
+    include `timestamp_check` — only `all` carries it."""
     envelope = await client.get(f"v3/user/{id}", params={"fieldset": "all"})
     record = unwrap_record(envelope)
     if not isinstance(record, dict):
@@ -927,19 +808,14 @@ _CREATE_USER_DESC = inspect.cleandoc(
       their own password (the "Vytvoriť heslo prostredníctvom emailu" option
       of the CDESK form). Safer; no plaintext in your AI client's log.
 
-    Access flags:
-    - cdesk_access / cmonitor_access (both default unset → CDESK uses
-      its tenant default). Pass True/False to set them explicitly. The
-      two flags compose CDESK's cm_access 2-char string in the order
-      (CDESK, CMonitor) — position 1 = CDESK, position 2 = CMonitor.
-      (The OpenAPI spec documents this backwards; the actual CDESK
-      source has CMonitor at position 2.)
-    - is_help_account / is_email_account / is_guest_account /
-      is_test_account: special-purpose account markers (mapped to
-      CDESK's 'Y' string when True, omitted otherwise).
+    is_help_account: True marks a help account (non-licensed; CDESK's 'Y').
+
+    Not settable through the API: the user type and role (both follow from
+    group membership), the CDESK / CMonitor access flags, the test, e-mail
+    and guest account flags, language, timezone and the AD user name — a new
+    user takes them from the tenant administrator.
 
     Grouping:
-    - company_id: the customer/company this user belongs to.
     - group_ids: the user's group membership (`group_id` in CDESK terms).
       CDESK has no primary group. A group id outside the caller's scope is
       rejected with a 400. A user with no group has no derived user type
@@ -950,21 +826,13 @@ _CREATE_USER_DESC = inspect.cleandoc(
     - position: the job title by NAME instead of id, matched
       case-insensitively; an unknown name is rejected with a 400. Ignored
       when job_title_id is also sent.
-    - is_test_account: checked against the stored row when the response
-      echoes it; CDESK never returns the flag on read, so otherwise it cannot
-      be confirmed (it has been observed not to store) and a warning says so.
-    - user_type: tenant-specific user type code; for the standard
-      taxonomy see list_users' description.
-
-    Locale: language (sk, en, cz, de, ru, hu, pl, lt, fr) and timezone
-    (IANA name, e.g. 'Europe/Bratislava').
 
     custom_fields: flat dict of `cfield_<propertyId>_<basepropertyId>`
     keys → values (discover keys via get_user_custom_fields;
     select/relation fields take the option id). Unknown keys → 400.
 
-    Returns: {data: <new id> or {...stored user row...}, msg} — both shapes
-    occur.
+    Returns: {data: <new id>, savedData: {...the stored user...}}; check the
+    optional `warnings` list for fields CDESK ignored.
     """
 )
 
@@ -983,10 +851,6 @@ _UPDATE_USER_DESC = inspect.cleandoc(
     create_user, a plain-text password here is visible in the AI client's
     tool-call transcript.
 
-    cm_access: position 1 = CDESK, position 2 = CMonitor (OpenAPI doc
-    is backwards). Setting only `cdesk_access` or only `cmonitor_access`
-    preserves the other position from the current stored value.
-
     custom_fields: flat dict of `cfield_<propertyId>_<basepropertyId>`
     keys → values (discover keys via get_user_custom_fields; read
     stored values via get_user(id, fieldset="all")).
@@ -994,14 +858,14 @@ _UPDATE_USER_DESC = inspect.cleandoc(
     group_ids REPLACES the whole group membership: groups not listed are
     left, and an empty list removes the user from every group; omit it to
     keep the membership. job_title_id / position set the job title as on
-    create. `is_test_account` is checked against the stored row the update
-    echoes; a drop is named in `warnings`.
+    create. The fields create_user cannot set cannot be changed here either.
 
     The display name follows first_name + last_name on update: a `name` sent
     on its own is not stored, and CDESK says so in `warnings`. Send
     first_name / last_name to rename a user.
 
-    Returns: {data: {...stored user row...}, msg}.
+    Returns: {data: <id>, savedData: {...the stored user...}}; check the
+    optional `warnings` list for fields CDESK ignored.
     """
 )
 
@@ -1033,14 +897,17 @@ _LIST_USER_GROUPS_DESC = inspect.cleandoc(
     List CDESK user groups — the groups users belong to, which are ALSO the
     solver groups (`solver_group_id` on requests, work orders and catalog
     prefills) and approver groups. Returns id, name, description, enabled,
-    main_group, parent_id and assigned_company_count per group (fields: pick
-    other top-level fields instead), plus meta.total.
+    root_group, main_group, toplevel_group, parent_id and
+    assigned_company_count per group (fields: pick other top-level fields
+    instead), plus meta.total.
 
-    main_group=true marks a ROOT group (Administrators, Operators, Customer
-    accounts, …): CDESK does not accept a root group as a request's solver
-    group. Whether a group fits a particular request (its customer, service
-    area, catalog) is decided by CDESK when the request is written — the v3
-    API has no list of the groups valid for one request.
+    root_group=true marks one of the tenant's built-in ROOT groups
+    (Administrators, Operators, Customer accounts, …): CDESK does not accept a
+    root group as a request's solver group. main_group=true marks a direct
+    child of a root group; toplevel_group=true a group with no parent group.
+    parent_id is one direct parent group (get_user_group lists all of them).
+    The groups the request form offers for one request (its customer, service
+    area, catalog) are listed by list_request_solver_groups.
 
     text_search matches the group name. get_user_group gives one group's
     member user ids.
@@ -1050,8 +917,9 @@ _LIST_USER_GROUPS_DESC = inspect.cleandoc(
 _GET_USER_GROUP_DESC = inspect.cleandoc(
     """
     One CDESK user group (also a solver / approver group): id, name, nick,
-    description, enabled, main_group (true = a root group), the parent group
-    ids (parent_group_ids), the member user ids (member_ids — names via
+    description, enabled, root_group (true = a built-in root group), main_group
+    (true = a direct child of a root group), the parent group ids
+    (parent_group_ids), the member user ids (member_ids — names via
     get_user / list_users) and the ids of its child groups.
     """
 )

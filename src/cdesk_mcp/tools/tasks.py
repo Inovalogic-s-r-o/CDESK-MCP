@@ -24,8 +24,10 @@ from cdesk_mcp.field_policy import (
     TASK_FIELDS,
     describe,
     refuse_if_violated,
+    requires_task_type,
     task_settings,
     violations,
+    without_required_task_type,
 )
 from cdesk_mcp.filters import build_task_filter, encode_sb, reject_sb_raw_with_typed
 from cdesk_mcp.sort_columns import resolve_sort, sort_note
@@ -89,6 +91,21 @@ async def _label_write_result(cache: EnumCache, result: dict[str, Any]) -> dict[
         cache, [result.get("savedData"), result.get("data")], _TASK_ENUM_LABELS
     )
     return result
+
+
+async def _task_form(client: CdeskClient, cache: EnumCache) -> dict[str, Any] | None:
+    """The task form settings TASK_FIELDS reads. A tenant can require a task
+    type while it has none to choose; CDESK then stores the task without one,
+    so the type is treated as optional there."""
+    settings = task_settings(await base_config.load(client))
+    if settings is None or not requires_task_type(settings):
+        return settings
+    try:
+        await cache.load()
+        no_types = cache.bucket_is_absent("type")
+    except Exception:  # noqa: BLE001 — unreadable enums leave the form rule as it is
+        no_types = False
+    return without_required_task_type(settings) if no_types else settings
 
 
 def register_task_tools(
@@ -245,7 +262,7 @@ def register_task_tools(
         result["status"] = with_status_groups(result.get("status"), task_status_group)
         result["fields"] = {
             "by_tenant_setting": describe(
-                TASK_FIELDS, task_settings(await base_config.load(client))
+                TASK_FIELDS, await _task_form(client, cache)
             ),
             "note": (
                 "State of each configurable create_task/update_task parameter on "
@@ -316,7 +333,7 @@ def register_task_tools(
             # task settings are not in v3 and v1 task/settings is admin-only):
             # an off field is refused, a required one must be given.
             refuse_if_violated(violations(
-                TASK_FIELDS, task_settings(await base_config.load(client)),
+                TASK_FIELDS, await _task_form(client, cache),
                 {"type_name": type_name, "type_2nd_name": type_2nd_name,
                  "watcher_ids": watcher_ids},
             ))
@@ -428,7 +445,7 @@ def register_task_tools(
             # task settings are not in v3 and v1 task/settings is admin-only):
             # an off field is refused, a required one must be given / not cleared.
             refuse_if_violated(violations(
-                TASK_FIELDS, task_settings(await base_config.load(client)),
+                TASK_FIELDS, await _task_form(client, cache),
                 {"type_name": type_name, "type_2nd_name": type_2nd_name,
                  "watcher_ids": watcher_ids},
                 update=True,
@@ -553,7 +570,7 @@ def register_task_tools(
             # tenant has them switched off. (Removing stays allowed — it only
             # clears what is already there.)
             refuse_if_violated(violations(
-                TASK_FIELDS, task_settings(await base_config.load(client)),
+                TASK_FIELDS, await _task_form(client, cache),
                 {"watcher_ids": watcher_ids}, update=True,
             ))
             current = await _fetch_for_update(client, id)

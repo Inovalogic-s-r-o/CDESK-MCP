@@ -1,13 +1,13 @@
 """Which columns each CDESK v3 list can sort by.
 
 CDESK sorts only by the columns its model allow-lists (the same on every
-tenant); for any other column it keeps the default order and says so in a
-`warnings` entry that lists the sortable columns. These lists match those
-warnings. The direction is a `.desc` suffix (CDESK splits the value on '.'), so
-a table-qualified name such as `solver.name` cannot be sent and is left out.
-Some columns CDESK lists as sortable answer HTTP 500 in either direction
-(joined names such as a request's `rc_title` or a task's `customerName`);
-those are left out too.
+tenant); for any other column it keeps the default order and says so in an
+`unsupported_sort` warning. These lists follow the sortable columns the v3 spec
+documents per list, plus a few more CDESK sorts by without a warning. The
+direction is a `.desc` suffix (CDESK splits the value on '.'), so a
+table-qualified name such as `solver.name` cannot be sent and is left out. A
+documented column that answers HTTP 500 in either direction (a fill's
+`approved`) is left out too.
 """
 
 from __future__ import annotations
@@ -21,17 +21,16 @@ SORT_COLUMNS: dict[str, frozenset[str]] = {
     }),
     "configuration_items": frozenset({
         "admin_solver_name", "asset_management_physical_status",
-        "asset_management_status", "assetmanagement_assigned_user_name",
-        "assetmanagement_responsible_user_name", "assignment_date", "branch_name",
+        "asset_management_status", "assignment_date", "branch_name",
         "ci_type_name", "company_name", "cost", "costcenter_name",
         "costcenter_responsible_person_name", "created_at", "description",
-        "disposal_date", "id", "inv_code", "inventory_number", "invoice_id",
+        "disposal_date", "id", "inventory_number", "invoice_id",
         "item_approver_name", "item_manager_name", "liquidation_date",
         "maingroup_name", "name", "owner_name", "place_name", "propertyarea_name",
         "propertyarea_responsible_person_name", "purchase_date",
         "service_it_manager_name", "service_owner_name", "sla", "slo", "status_id",
         "supplier", "supplier_id", "technical_owner_name", "technical_solver_name",
-        "type_mark", "updated_at",
+        "updated_at",
     }),
     "customers": frozenset({
         "accounting_language", "alias", "city", "company_ext_curr", "company_note",

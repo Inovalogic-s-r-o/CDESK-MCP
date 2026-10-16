@@ -657,27 +657,83 @@ def redact_secrets(value: _Redactable) -> _Redactable:
     return value
 
 
+@dataclass(frozen=True)
+class CdeskWarning:
+    """One entry of a CDESK `warnings` array. CDESK sends either a plain string
+    or an object `{code, field, message}`; `field` names the field the warning
+    is about (a field dropped from a write, an unknown sort or return field)."""
+
+    message: str
+    field: str | None = None
+    code: Any = None
+
+    def text(self) -> str:
+        return f"{self.field}: {self.message}" if self.field else self.message
+
+
+def cdesk_warnings(raw: Any) -> list[CdeskWarning]:
+    """CDESK's `warnings` value (a list, a single entry or nothing) as
+    CdeskWarning entries; an entry without a `message` keeps its whole content
+    as the text."""
+    entries = raw if isinstance(raw, list) else [raw]
+    out: list[CdeskWarning] = []
+    for entry in entries:
+        if entry is None or entry == "" or entry == {}:
+            continue
+        if not isinstance(entry, dict):
+            out.append(CdeskWarning(str(entry)))
+            continue
+        field = entry.get("field")
+        message = entry.get("message")
+        if message is None or message == "":
+            message = str({k: v for k, v in entry.items() if k != "field"})
+        out.append(CdeskWarning(
+            str(message), str(field) if field not in (None, "") else None, entry.get("code"),
+        ))
+    return out
+
+
+def warning_texts(raw: Any) -> list[str]:
+    """CDESK's `warnings` value as the plain strings the LLM receives, one per
+    entry ("<field>: <message>" when the entry names a field). Strings pass
+    through unchanged, so applying it twice changes nothing."""
+    return [w.text() for w in cdesk_warnings(raw)]
+
+
+def warned_fields(response: Any) -> frozenset[str]:
+    """The fields CDESK's own `warnings` in a response name."""
+    if not isinstance(response, dict):
+        return frozenset()
+    return frozenset(w.field for w in cdesk_warnings(response.get("warnings")) if w.field)
+
+
+def with_warning_texts(result: dict[str, Any], extra: Iterable[str] = ()) -> dict[str, Any]:
+    """`result` with its `warnings` as plain strings, followed by `extra`; a
+    result without warnings and without `extra` is returned as is."""
+    texts = [*warning_texts(result.get("warnings")), *extra]
+    if not texts:
+        return result
+    return {**result, "warnings": texts}
+
+
 def collect_cdesk_messages(response: Any) -> list[str]:
     """Every non-success message CDESK put in a 2xx body.
 
-    A 200 does NOT mean the write landed as asked. Besides the top-level
-    `warnings` array (which CDESK fills only for `code` on the request
-    module), CDESK carries a `msg` object
+    A 200 does NOT mean the write landed as asked. CDESK names each field it
+    did not store (no write right, switched off by a setting, not writable) in
+    the top-level `warnings` array, and carries a `msg` object
     keyed by severity: `{success: [...], warning: [...], error: [...]}`. Hard
     errors under `msg.error` are already raised by the client's
     `_raise_if_body_signals_error`; anything else there is advisory text that
     explains why part of a write did not stick.
 
-    Returns the messages verbatim, `success` excluded (that bucket carries "record
-    saved" and email-notification noise).
+    Returns the `warnings` entries first (see warning_texts), then the `msg`
+    messages verbatim, `success` excluded (that bucket carries "record saved"
+    and email-notification noise).
     """
     if not isinstance(response, dict):
         return []
-    found: list[str] = []
-
-    top = response.get("warnings")
-    if top:
-        found.extend([str(w) for w in top] if isinstance(top, list) else [str(top)])
+    found: list[str] = warning_texts(response.get("warnings"))
 
     msg = response.get("msg")
     if isinstance(msg, dict):
@@ -709,9 +765,10 @@ def annotate_write_warnings(
        if `savedData` echoes a different/empty value, synthesize a
        'silently dropped' warning. `field_notes` supplies the per-field reason,
        which is where the value is: CDESK strips a column when the tenant
-       setting behind it is off or the account lacks the write right, and it
-       emits no message of its own except for `code`. Naming the setting turns
-       "your value vanished" into something the user can act on.
+       setting behind it is off or the account lacks the write right. Naming
+       the setting turns "your value vanished" into something the user can
+       act on. When CDESK's own `warnings` already name the field, no second
+       warning is added; the field's note is appended to CDESK's entry instead.
     3. For each `customFields` entry the caller SENT a truthy value for,
        if it isn't echoed by `savedData` (nested customFields dict or
        top-level cfield_* key), synthesize a warning — customFields writes
@@ -735,8 +792,13 @@ def annotate_write_warnings(
     if not isinstance(response, dict):
         return response
     notes = field_notes or {}
-    # Everything CDESK itself said about this 2xx, `success` excluded.
+    # Everything CDESK itself said about this 2xx, `success` excluded. The
+    # `warnings` entries come first, so entry i of `own` is line i here.
     warnings: list[str] = collect_cdesk_messages(response)
+    warned_at: dict[str, int] = {}
+    for i, w in enumerate(cdesk_warnings(response.get("warnings"))):
+        if w.field:
+            warned_at.setdefault(w.field, i)
     saved = response.get("savedData")
     if not isinstance(saved, dict):
         # Modules that return the record under `data` instead of `savedData`.
@@ -750,6 +812,10 @@ def annotate_write_warnings(
             # in UTC (09:30+01:00 → 08:30+00:00), a bool as "1.00", an id as a
             # string — the same value, not a dropped one.
             if sent and not write_values_match(sent, saved.get(field)):
+                if field in warned_at:
+                    if notes.get(field):
+                        warnings[warned_at[field]] += f" — {notes[field]}"
+                    continue
                 reason = notes.get(field) or (
                     f"most likely because this account lacks the {field}-field "
                     f"write right"
@@ -801,10 +867,15 @@ def without_notify_flags(body: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in body.items() if k not in _NOTIFY_FLAGS}
 
 
+# CDESK's request status groups, as a status row's `group` names them.
+_REQUEST_GROUP_NAMES = {100: "open", 250: "completed", 200: "closed"}
+
+
 def request_status_group(action_code: Any) -> str | None:
     """CDESK's group of a request status action code (its solved and closed
     status groups; open = below 80) — fixed system codes, the same on every
-    tenant. None for a code in no group."""
+    tenant. None for a code in no group. Used where a status row carries no
+    `group` of its own (see with_status_groups)."""
     if isinstance(action_code, bool) or not isinstance(action_code, int):
         return None
     if action_code < 80:
@@ -826,13 +897,19 @@ def task_status_group(action_code: Any) -> str | None:
 
 def with_status_groups(rows: Any, group_of: Callable[[Any], str | None]) -> Any:
     """Copies of the status enum rows with `status_group` beside the action
-    code (the cached rows are not touched)."""
+    code (the cached rows are not touched). The group CDESK names on the row
+    (`group`: 100 / 250 / 200 for requests, "open" / "closed" for tasks) wins;
+    `group_of(action_code)` covers a row without one."""
     if not isinstance(rows, list):
         return rows
     out: list[Any] = []
     for row in rows:
         if isinstance(row, dict):
-            row = {**row, "status_group": group_of(row.get("action_code"))}
+            raw = row.get("group")
+            named = _REQUEST_GROUP_NAMES.get(raw) if isinstance(raw, int) else (
+                raw if raw in ("open", "closed") else None
+            )
+            row = {**row, "status_group": named or group_of(row.get("action_code"))}
         out.append(row)
     return out
 
@@ -867,16 +944,33 @@ def unwrap_list(envelope: Any) -> tuple[list[Any], dict[str, Any]]:
 
     Defensive against shape variations — the enums endpoint can answer
     `data: false`, so `data` is not assumed to always be the payload."""
+    records, meta = _unwrap_list(envelope)
+    if "warnings" in meta:
+        meta["warnings"] = warning_texts(meta["warnings"])
+    return records, meta
+
+
+def _unwrap_list(envelope: Any) -> tuple[list[Any], dict[str, Any]]:
     inner = envelope
+    outer_warnings = None
     if isinstance(inner, dict) and isinstance(inner.get("data"), dict):
+        # CDESK's `warnings` (e.g. an unknown sort column) sit beside the
+        # outer `data`, so they are kept when descending into it.
+        outer_warnings = inner.get("warnings")
         inner = inner["data"]
     if isinstance(inner, dict):
-        records = inner.get("data")
-        if isinstance(records, list):
+        data = inner.get("data")
+        records: list[Any] = []
+        meta: dict[str, Any] | None = None
+        if isinstance(data, list):
+            records = data
             meta = {k: v for k, v in inner.items() if k != "data"}
+        elif isinstance(data, dict):  # nested envelope
+            records, meta = _unwrap_list(data)
+        if meta is not None:
+            if outer_warnings and "warnings" not in meta:
+                meta["warnings"] = outer_warnings
             return records, meta
-        if isinstance(records, dict):  # nested envelope
-            return unwrap_list(records)
     if isinstance(inner, list):
         return inner, {}
     return [], {}
@@ -1014,7 +1108,7 @@ def forbid_unknown_arguments(mcp: FastMCP, tool_names: tuple[str, ...]) -> None:
 
 FIELDS_NOT_RETURNED_NOTE = (
     "CDESK returned none of these requested fields on any record here — CDESK "
-    "drops a field name it does not know without a word (a field it knows comes "
+    "leaves out a field name it does not know (a field it knows comes "
     "back even when empty). Usually a misspelled or wrong name: fieldset='all' "
     "on one record shows the real names."
 )
@@ -1036,6 +1130,17 @@ def fields_not_returned(fields: Any, records: Any) -> list[str]:
     return [f for f in fields if isinstance(f, str) and f not in seen]
 
 
+def _warns_about_unreturned(w: CdeskWarning, missing: list[str]) -> bool:
+    """Whether a CDESK warning reports one of the `missing` return fields. CDESK
+    files an unknown `returnFields[]` name under the field `returnFields` and
+    names it in backticks in the message; by the time a list result is checked
+    the entry may already be text ("returnFields: …")."""
+    if w.field in missing or any(w.message.startswith(f"{f}: ") for f in missing):
+        return True
+    about_return_fields = w.field == "returnFields" or w.message.startswith("returnFields: ")
+    return about_return_fields and any(f"`{f}`" in w.message for f in missing)
+
+
 def _with_fields_check(result: Any, fields: Any) -> Any:
     if not isinstance(result, dict):
         return result
@@ -1044,6 +1149,18 @@ def _with_fields_check(result: Any, fields: Any) -> Any:
     missing = fields_not_returned(fields, records)
     if missing:
         result["fields_not_returned"] = {"fields": missing, "note": FIELDS_NOT_RETURNED_NOTE}
+        # CDESK names the same unknown fields in its list `warnings`;
+        # fields_not_returned already reports them.
+        meta = result.get("meta")
+        if isinstance(meta, dict) and "warnings" in meta:
+            kept = [
+                w.text() for w in cdesk_warnings(meta["warnings"])
+                if not _warns_about_unreturned(w, missing)
+            ]
+            if kept:
+                meta["warnings"] = kept
+            else:
+                del meta["warnings"]
     return result
 
 
@@ -1126,6 +1243,9 @@ def _wrap_result(mcp: FastMCP, select: Callable[[Any], bool], transform: Callabl
 def _compact_list_result(result: Any) -> Any:
     if isinstance(result, dict) and isinstance(result.get("items"), list):
         result["items"] = [drop_empty_fields(i) for i in result["items"]]
+    meta = result.get("meta") if isinstance(result, dict) else None
+    if isinstance(meta, dict) and "warnings" in meta:
+        meta["warnings"] = warning_texts(meta["warnings"])
     return result
 
 
@@ -1134,6 +1254,10 @@ def _compact_write_result(result: Any) -> Any:
     # the write.
     if isinstance(result, dict) and isinstance(result.get("savedData"), dict):
         result["savedData"] = drop_empty_fields(result["savedData"])
+    # Every write passes CDESK's `warnings` on as plain strings, including
+    # the ones that return CDESK's answer as it came.
+    if isinstance(result, dict) and "warnings" in result:
+        result["warnings"] = warning_texts(result["warnings"])
     return result
 
 

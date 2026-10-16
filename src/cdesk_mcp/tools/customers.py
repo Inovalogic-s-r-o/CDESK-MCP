@@ -48,12 +48,13 @@ from cdesk_mcp.tools._helpers import (
     validate_custom_fields,
     validate_fields,
     validate_fieldset,
-    yn as _yn,
 )
 from cdesk_mcp.tools._local_filter import (
     NOT_EQUAL_CMP,
+    NULL_CMPS,
     RANGE_CMPS,
     ColumnRule,
+    LocalCondition,
     filtered_page,
     numeric_picker,
     split_conditions,
@@ -254,7 +255,6 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
         name: str,
         *,
         alias: str | None = None,
-        code: str | None = None,
         ico: str | None = None,
         dic: str | None = None,
         icdph: str | None = None,
@@ -273,7 +273,6 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
         sla_id: int | None = None,
         expiration: str | None = None,
         tag_ids: list[int] | None = None,
-        cdesk_allowed: bool | None = None,
         custom_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
@@ -297,7 +296,6 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
                 {
                     "name": name,
                     "alias": alias,
-                    "code": code,
                     "ico": ico,
                     "dic": dic,
                     "icdph": icdph,
@@ -316,7 +314,6 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
                     "sla_id": sla_id,
                     "expiration": expiration,
                     "tag_ids": tag_ids,
-                    "cdesk_allowed": _yn(cdesk_allowed),
                 }
             )
             # customFields keys are already wire-format (cfield_*) — set after
@@ -342,7 +339,6 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
         *,
         name: str | None = None,
         alias: str | None = None,
-        code: str | None = None,
         ico: str | None = None,
         dic: str | None = None,
         icdph: str | None = None,
@@ -361,7 +357,6 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
         sla_id: int | None = None,
         expiration: str | None = None,
         tag_ids: list[int] | None = None,
-        cdesk_allowed: bool | None = None,
         custom_fields: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         try:
@@ -389,7 +384,6 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
                 {
                     "name": name,
                     "alias": alias,
-                    "code": code,
                     "ico": ico,
                     "dic": dic,
                     "icdph": icdph,
@@ -408,7 +402,6 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
                     "sla_id": sla_id,
                     "expiration": expiration,
                     "tag_ids": tag_ids,
-                    "cdesk_allowed": _yn(cdesk_allowed),
                 }
             )
             # customFields keys are already wire-format (cfield_*) — set after
@@ -526,10 +519,27 @@ async def _fetch_for_update(client: CdeskClient, id: int) -> dict[str, Any]:
 # (tools/_local_filter.py): a range on `hour_rate` answers HTTP 500 (BETWEEN
 # matches nothing), and a range or `!=` on `id` is read as equality.
 _LOCAL_FILTER_CAP = 2000
-_customer_condition = numeric_picker({
+_numeric_customer_condition = numeric_picker({
     "hour_rate": ColumnRule(RANGE_CMPS),
     "id": ColumnRule(RANGE_CMPS | {NOT_EQUAL_CMP}),
 })
+
+
+def _customer_condition(leaf: dict[str, Any]) -> LocalCondition | None:
+    """Also ISNULL / ISNOTNULL on `updated_at`: CDESK sends the creation date
+    there for a customer never updated, so it is never empty. A new customer
+    is stored with no `updatedby`, and every save sets it, so an empty
+    `updatedby` is what "never updated" means."""
+    comparator = str(leaf.get("c", "")).upper()
+    if leaf.get("col") == "updated_at" and comparator in NULL_CMPS:
+        never_updated = comparator == "ISNULL"
+
+        def test(raw: Any) -> bool:
+            return (raw in (None, "", 0, "0")) is never_updated
+
+        label = "never updated" if never_updated else "updated since it was created"
+        return LocalCondition("updatedby", f"updated_at {comparator} ({label})", test)
+    return _numeric_customer_condition(leaf)
 
 
 
@@ -562,8 +572,9 @@ _LIST_CUSTOMERS_DESC = inspect.cleandoc(
       condition must be joined to the rest by AND. `name` '=' with an
       integer filters the customer id. Date presets (TODAY, THIS_WEEK, …)
       on created_at / updated_at are sent as the BETWEEN window they name,
-      in tenant time; updated_at falls back to the creation date for a
-      customer never updated, so it is never empty. A list of values in
+      in tenant time; updated_at holds the creation date for a customer never
+      updated, so ISNULL / ISNOTNULL on it are applied by this tool as
+      "never updated" / "updated since it was created". A list of values in
       '=' or '!=' matches any / none of them. '!=' leaves out customers
       with an empty value in that column.
 
@@ -639,8 +650,9 @@ _FIND_CUSTOMER_BY_NAME_DESC = inspect.cleandoc(
     admin scope. A zero count is NOT evidence the customer doesn't exist. The most
     likely explanations: casing/spelling difference (try a shorter query
     or just the distinctive part of the name), the customer is outside
-    your admin scope, or you typed the name in a language CDESK doesn't
-    store it under. A broader query (e.g. just the first 3–4 distinctive
+    your admin scope, the customer does not allow AI processing (CDESK hides
+    such customers from this connector entirely), or you typed the name in a
+    language CDESK doesn't store it under. A broader query (e.g. just the first 3–4 distinctive
     letters) distinguishes those cases from genuine absence.
 
     Params: name (required), max_results (default 10, max 100).
@@ -651,7 +663,10 @@ _FIND_CUSTOMER_BY_NAME_DESC = inspect.cleandoc(
 _CREATE_CUSTOMER_DESC = inspect.cleandoc(
     """
     Create a new customer (company / partner). Only `name` is required;
-    everything else is optional but commonly used.
+    everything else is optional but commonly used. CDESK generates the
+    customer code itself; it cannot be set. A customer that does not allow AI
+    processing is hidden from this connector, so a customer find_customer_by_name
+    does not find can still exist in CDESK under the same name.
 
     Address: street, city, postal_code, country (ISO code preferred).
 
@@ -675,9 +690,6 @@ _CREATE_CUSTOMER_DESC = inspect.cleandoc(
     aktívneho zákazníka". Some tenants also require price-list templates
     on a new company, which this tool cannot send.
 
-    cdesk_allowed: pass True to enable CDESK-portal access for this
-    customer (sends 'Y'). Omit to leave it at the tenant default.
-
     custom_fields: flat dict of `cfield_<propertyId>_<basepropertyId>`
     keys → values (discover keys via get_customer_custom_fields;
     select/relation fields take the option id). Unrecognized keys are
@@ -686,14 +698,13 @@ _CREATE_CUSTOMER_DESC = inspect.cleandoc(
     records — if values don't stick on create, re-send them via
     update_customer.
 
-    Returns: {data: <new id>, savedData: {...full record...}}; check the
-    optional `warnings` list for silently-dropped/ignored fields
-    (e.g. `code` without the company code-field write right).
+    Returns: {data: <new id>, savedData: {...the stored record...}}; check
+    the optional `warnings` list for fields CDESK ignored.
 
     Side effects (by CDESK): on a tenant with CDESK's mail-server integration
     (the customer's auto_mail_server on the default POP3 server), creating a
-    customer also creates a POP3 mailbox for it on that mail server — it stays
-    when the customer is deleted.
+    customer also creates a POP3 mailbox for it on that mail server; deleting
+    the customer removes it.
     """
 )
 
@@ -712,12 +723,8 @@ _UPDATE_CUSTOMER_DESC = inspect.cleandoc(
     On 409 conflict (record changed elsewhere since fetch), you'll get
     an Optimistic-lock error — re-fetch with get_customer and retry.
 
-    Returns: {data: <id>, savedData: {...full record...}}; check the
-    optional `warnings` list for silently-dropped/ignored fields.
-
-    Side effects (by CDESK): an update can re-run the customer's mailbox setup and
-    answer "Mailbox creating error 2 (user already exists!)" — the mailbox exists
-    already; the update itself is stored.
+    Returns: {data: <id>, savedData: {...the stored record...}}; check the
+    optional `warnings` list for fields CDESK ignored.
     """
 )
 

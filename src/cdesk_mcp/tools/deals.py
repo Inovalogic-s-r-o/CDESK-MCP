@@ -64,6 +64,7 @@ from cdesk_mcp.tools._helpers import (
     unwrap_record,
     validate_fields,
     validate_fieldset,
+    warned_fields,
     write_values_match,
 )
 from cdesk_mcp.tools._local_filter import (
@@ -360,7 +361,8 @@ def register_deal_tools(
             check_fields=("rc_code",),
         )
         return await _verify_write(
-            client, annotated.get("data"), body, annotated, operation="create_deal"
+            client, annotated.get("data"), body, annotated, operation="create_deal",
+            reported=warned_fields(response),
         )
 
     @mcp.tool(
@@ -448,7 +450,8 @@ def register_deal_tools(
         # `timestamp_check` is a lock token we echoed, not a user value.
         verifiable = {k: v for k, v in body.items() if k != "timestamp_check"}
         return await _verify_write(
-            client, id, verifiable, annotated, operation="update_deal"
+            client, id, verifiable, annotated, operation="update_deal",
+            reported=warned_fields(response),
         )
 
     @mcp.tool(
@@ -495,11 +498,13 @@ async def _verify_write(
     response: dict[str, Any],
     *,
     operation: str,
+    reported: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """Re-read the record and warn about anything sent but not stored.
 
     The write response is not a reliable record of what was stored, so the
-    check reads the deal back; it costs one extra GET per write.
+    check reads the deal back; it costs one extra GET per write. Fields in
+    `reported` are already named in CDESK's own warnings and are not repeated.
     """
     if not isinstance(deal_id, int):
         return response
@@ -521,7 +526,7 @@ async def _verify_write(
         return response
     dropped: list[str] = []
     for column in _READ_BACK_FIELDS:
-        if column not in sent_body:
+        if column not in sent_body or column in reported:
             continue
         sent = sent_body[column]
         if sent is None or sent == [] or sent == "":
@@ -545,15 +550,15 @@ async def _verify_write(
 
 # Conditions CDESK cannot apply correctly on the deal list, applied by the
 # connector (tools/_local_filter.py): a range on the deal number `rc_num`
-# answers HTTP 500 (BETWEEN matches nothing), a range or `!=` on `id` or
-# `id_customer` is read as equality, and the due-date upper bound also matches
+# answers HTTP 500 (BETWEEN matches nothing), a range on `id` or `id_customer`
+# and a `!=` on `id` are read as equality, and the due-date upper bound also matches
 # deals that have no due date. On a deal row the id is `id_rc` and the
 # customer `id_company`.
 _LOCAL_FILTER_CAP = 2000
 _deal_condition = numeric_picker({
     "rc_num": ColumnRule(RANGE_CMPS),
     "id": ColumnRule(RANGE_CMPS | {NOT_EQUAL_CMP}, "id_rc"),
-    "id_customer": ColumnRule(RANGE_CMPS | {NOT_EQUAL_CMP}, "id_company"),
+    "id_customer": ColumnRule(RANGE_CMPS, "id_company"),
 })
 
 
@@ -795,8 +800,8 @@ _LIST_DEALS_DESC = inspect.cleandoc(
     last_invoice_issue_date, updated_by (user id, `=` only — a name does not
     match), plus the no-col text leaf. Clauses on
     other columns are stripped and reported in `unsupported_filters`.
-    A range on rc_num (>, >=, <, <=, BETWEEN), and a range or a single-value
-    '!=' on id or id_customer, are applied by this tool, because CDESK cannot
+    A range on rc_num (>, >=, <, <=, BETWEEN), a range on id or id_customer,
+    and a single-value '!=' on id are applied by this tool, because CDESK cannot
     compare them that way: it fetches every
     deal matching the rest of the filter (up to 2000) and keeps the matching
     ones, reported in `filtered_by_connector`; such a condition must be

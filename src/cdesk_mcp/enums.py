@@ -69,6 +69,9 @@ class EnumEntry:
     # CDESK form no longer offers it, but old records may still carry it.
     # None when the bucket does not report it.
     in_use: bool | None = None
+    # CDESK's status group of a status row (`group`: 100 / 250 / 200 on
+    # requests, "open" / "closed" on tasks); None where the row has none.
+    group: int | str | None = None
 
     def all_names(self) -> tuple[str, ...]:
         # Deduplicate while preserving order.
@@ -405,6 +408,8 @@ class EnumCache:
                     record["lang_names"] = list(entry.lang_names)
                 if entry.in_use is not None:
                     record["in_use"] = entry.in_use
+                if entry.group is not None:
+                    record["group"] = entry.group
                 out[bucket].append(record)
         # Surface key/value buckets (e.g. request `type`) that the int-id model
         # can't hold — the LLM needs these codes (e.g. the create_request type
@@ -628,7 +633,19 @@ def _parse_entry(record: dict[str, Any]) -> EnumEntry:
         action_code=action_code_int,
         lang_names=tuple(lang_names),
         in_use=in_use,
+        group=_group(record.get("group")),
     )
+
+
+def _group(raw: Any) -> int | str | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        text = raw.strip()
+        return int(text) if text.isdigit() else text
+    return None
 
 
 def _canon(text: str) -> str:

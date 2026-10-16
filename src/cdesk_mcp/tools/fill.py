@@ -153,7 +153,7 @@ def register_fill_tools(
             raise to_llm_error(e, operation="list_fills") from e
 
         records, meta = unwrap_list(response)
-        warning = await _add_list_minutes(client, records, params)
+        warning = _add_list_minutes(records)
         add_names(records, "fill", detail=False, fieldset=fieldset, fields=fields)
         if added_times:
             records = [
@@ -524,35 +524,26 @@ _FILL_CREATE_FIELDS: dict[str, str] = {
 
 
 # --- worked time -------------------------------------------------------------
-# CDESK sends a fill's time in two shapes under one name:
-#   - the detail / write response `duration`: the STORED worked time in seconds —
-#     valid_to − valid_from plus `other_time` (the correction, seconds), set on
-#     every save; what CDESK bills and sums in reports;
-#   - the list `duration`: TEXT of the from→to span only ("1h"), without the
-#     correction; the stored seconds are `durationSeconds`, sent with
-#     fieldset=all or when named in `returnFields[]`. `other_time` is text
-#     there too ("30min").
-# Every fill result therefore gets `duration_minutes` / `other_time_minutes`
-# (int), the stored worked time and its correction, computed the same way.
+# CDESK sends a fill's STORED worked time — valid_to − valid_from plus
+# `other_time` (the correction), set on every save, what CDESK bills and sums in
+# reports — as `duration_seconds`, and the correction as `other_time_seconds`,
+# on the list and the detail alike. `duration` / `other_time` differ between
+# them: seconds on a detail or write response, text on a list row ("1h 30min",
+# the from→to span only). Every fill result therefore gets `duration_minutes` /
+# `other_time_minutes` (int), computed from the seconds fields.
 
-_LIST_TIME_FIELDS = ["id", "durationSeconds", "other_time_h"]
-_LIST_TIME_COLUMNS = ("durationSeconds", "other_time_h")
+_TIME_COLUMNS = ("duration_seconds", "other_time_seconds")
 
 
 def _ask_for_list_times(params: dict[str, Any], fields: list[str] | None) -> list[str]:
-    """Add the time columns to the list request: on fills a fieldset and
-    `returnFields[]` combine, so the page itself carries them and no second
-    read is needed. Returns the columns the caller did not ask for, to be
-    removed from the rows again."""
-    if fields:
-        added = [c for c in _LIST_TIME_COLUMNS if c not in fields]
-        params["returnFields[]"] = [*fields, *added]
-        return added
-    if params.get("fieldset") == "all":
+    """Add the time columns to a list request that names its `fields` (every
+    fieldset carries them already). Returns the columns the caller did not ask
+    for, to be removed from the rows again."""
+    if not fields:
         return []
-    params.setdefault("fieldset", "extended")
-    params["returnFields[]"] = list(_LIST_TIME_COLUMNS)
-    return list(_LIST_TIME_COLUMNS)
+    added = [c for c in _TIME_COLUMNS if c not in fields]
+    params["returnFields[]"] = [*fields, *added]
+    return added
 
 
 
@@ -564,68 +555,32 @@ def _minutes(seconds: Any) -> int | None:
     return None
 
 
-def _hours_to_minutes(hours: Any) -> int | None:
-    if hours is None or isinstance(hours, bool):
-        return None
-    try:
-        return round(float(str(hours).replace(",", ".")) * 60)
-    except ValueError:
-        return None
+def _add_minutes(record: Any) -> bool:
+    """Add `duration_minutes` / `other_time_minutes` to a fill record from its
+    seconds fields; False when the record carries no worked time."""
+    if not isinstance(record, dict):
+        return False
+    duration = _minutes(record.get("duration_seconds"))
+    if duration is not None:
+        record["duration_minutes"] = duration
+    other = _minutes(record.get("other_time_seconds"))
+    if other is not None:
+        record["other_time_minutes"] = other
+    return duration is not None
 
 
 def _add_detail_minutes(record: Any) -> None:
-    """A detail or write record: `duration` / `other_time` are seconds."""
-    if not isinstance(record, dict):
-        return
-    duration = _minutes(record.get("duration"))
-    if duration is not None:
-        record["duration_minutes"] = duration
-    other = _minutes(record.get("other_time"))
-    if other is not None:
-        record["other_time_minutes"] = other
+    _add_minutes(record)
 
 
-def _add_row_minutes(row: dict[str, Any], seconds: Any, other_hours: Any) -> None:
-    duration = _minutes(seconds)
-    if duration is not None:
-        row["duration_minutes"] = duration
-    other = _hours_to_minutes(other_hours)
-    if other is not None:
-        row["other_time_minutes"] = other
-
-
-async def _add_list_minutes(
-    client: CdeskClient, rows: list[Any], params: dict[str, Any],
-) -> str | None:
-    """Give every list row its minutes. A page read with fieldset=all already
-    carries the seconds; otherwise one extra read of the same page returns only
-    id + seconds (a few KB, instead of the ~5x larger fieldset=all page) and is
-    merged by id. Returns a warning when the minutes could not be added."""
-    records = [r for r in rows if isinstance(r, dict)]
-    missing = [r for r in records if "durationSeconds" not in r]
-    for r in records:
-        if "durationSeconds" in r:
-            _add_row_minutes(r, r.get("durationSeconds"), r.get("other_time_h"))
-    if not missing:
-        return None
-    side = {k: v for k, v in params.items() if k not in ("fieldset", "returnFields[]")}
-    side["returnFields[]"] = _LIST_TIME_FIELDS
-    try:
-        times, _ = unwrap_list(await client.get("v3/fill", params=side))
-    except Exception:  # noqa: BLE001 — the page itself is fine; say what is missing
-        times = []
-    by_id = {t.get("id"): t for t in times if isinstance(t, dict)}
-    unmatched = 0
-    for r in missing:
-        t = by_id.get(r.get("id"))
-        if t is None:
-            unmatched += 1
-            continue
-        _add_row_minutes(r, t.get("durationSeconds"), t.get("other_time_h"))
+def _add_list_minutes(rows: list[Any]) -> str | None:
+    """Give every list row its minutes. Returns a warning when a row carries
+    no worked time."""
+    unmatched = sum(1 for r in rows if isinstance(r, dict) and not _add_minutes(r))
     if unmatched:
         return (
             f"duration_minutes could not be read for {unmatched} fill(s) on this "
-            f"page; get_fill gives a fill's worked time (duration, in seconds)."
+            f"page; get_fill gives a fill's worked time (duration_seconds)."
         )
     return None
 
@@ -678,9 +633,10 @@ _LIST_FILLS_DESC = inspect.cleandoc(
     Worked time: every item carries `duration_minutes` (int) — the fill's
     stored worked time, i.e. valid_to − valid_from plus `other_time`, the value
     CDESK bills and sums in its reports — and `other_time_minutes`, the
-    correction part. CDESK's own `duration` field in this list is TEXT of the
-    from→to span only ("1h 24min", without the correction), and `other_time`
-    is text too ("30min"); get_fill returns both in seconds.
+    correction part (CDESK's `duration_seconds` / `other_time_seconds` in
+    minutes). CDESK's own `duration` field in this list is TEXT of the from→to
+    span only ("1h 24min", without the correction), and `other_time` is text
+    too ("30min").
 
     Date window: pass worked_from / worked_to (ISO-8601) to scope the search to
     a work-date range. There is NO implicit month bound: a windowless call
@@ -725,8 +681,8 @@ _GET_FILL_DESC = inspect.cleandoc(
     a whitelist of field names (returnFields; union with fieldset);
     `customer_name` / `solver_name` are added to it.
 
-    `duration` here is the stored worked time in SECONDS (valid_to − valid_from
-    plus `other_time`, the correction, also seconds); `duration_minutes` /
+    `duration_seconds` is the stored worked time (valid_to − valid_from plus
+    `other_time_seconds`, the correction); `duration_minutes` /
     `other_time_minutes` give the same in minutes, as list_fills does.
     """
 )

@@ -1638,7 +1638,9 @@ _VERDICT_MEANINGS = inspect.cleandoc(
         invalid_evidence gives the per-quote reason; "out_of_scope" means the
         words are in the record but the record is about a different subject.
       - confirmed_absence — the absence search ran and matched zero records:
-        there is no record showing the thing.
+        there is no record showing the thing among the customers this
+        connector can see (CDESK hides customers that do not allow AI
+        processing, with all their records).
       - refuted — the absence search DID match records, listed in matched_ids,
         so the asserted absence is false.
 

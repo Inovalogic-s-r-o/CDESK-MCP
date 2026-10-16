@@ -31,7 +31,7 @@ and day-to-day usage are all documented there — not in this repository.
 
 ## Technical summary
 
-A thin translation layer between an AI client and the CDESK v3 API — **76 tools
+A thin translation layer between an AI client and the CDESK v3 API — **77 tools
 across 11 modules**, no datastore of its own:
 
 ```

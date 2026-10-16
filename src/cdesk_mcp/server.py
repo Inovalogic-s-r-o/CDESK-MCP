@@ -116,7 +116,8 @@ _SERVER_INSTRUCTIONS = inspect.cleandoc(
       4. State only what came back confirmed, citing the record id. Never assert
          a fact you did not verify, and never bend a quote's meaning.
 
-    "I found nothing about that" is a correct, expected answer — give it plainly
+    "I found nothing about that" is a correct, expected answer — within the
+    customers this connector can see (see below) — give it plainly
     rather than inventing a plausible reply. You are an AI and can hallucinate;
     before inferring beyond the verified facts, ask the user whether they want
     facts-only or also inference, and label any inference as such next to the
@@ -153,6 +154,16 @@ _SERVER_INSTRUCTIONS = inspect.cleandoc(
     write tools' descriptions list them under "Side effects"; the user hears
     about such a change together with the write itself.
 
+    CUSTOMERS THAT DO NOT ALLOW AI PROCESSING. A CDESK customer can be set to
+    not allow AI processing. CDESK then hides that customer and everything that
+    belongs to it — its requests, tasks, fills, configuration items, projects
+    and contacts — from this connector: a get answers "not found", lists and
+    searches leave the records out, totals do not count them, and a write that
+    refers to the customer is refused. Every search, count and "nothing found"
+    therefore covers only the customers that allow AI processing; a record
+    that cannot be found here may still exist in CDESK under such a customer,
+    visible in the CDESK web interface.
+
     THE CALLER. whoami returns the CDESK user this connector acts as; its `id`
     is the user / solver id that questions about "my tasks", "my requests" or
     "what I logged" refer to.
@@ -169,8 +180,8 @@ _SERVER_INSTRUCTIONS = inspect.cleandoc(
         fieldset="custom" is a different thing: it returns the record's
         custom-field (cfield_*) values, not a user-picked selection.
     If the user doesn't care, or it's an internal lookup, omit both parameters
-    (the extended default applies). CDESK drops a field name it does not know
-    without a word; a result then carries `fields_not_returned` naming the
+    (the extended default applies). CDESK leaves out a field name it does not know;
+    a result then carries `fields_not_returned` naming the
     requested fields that came back on no record. Items of the list_* tools
     leave out empty fields (null, "", [], {}): a field missing from an item is
     empty there.
