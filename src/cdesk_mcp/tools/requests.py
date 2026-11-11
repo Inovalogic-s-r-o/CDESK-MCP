@@ -643,7 +643,9 @@ def register_request_tools(
 
     @mcp.tool(
         description=_CREATE_REQUEST_DESC,
-        annotations=ToolAnnotations(title="Create request", destructiveHint=True),
+        annotations=ToolAnnotations(
+            title="Create request", readOnlyHint=False, destructiveHint=False
+        ),
     )
     async def create_request(
         company: int,

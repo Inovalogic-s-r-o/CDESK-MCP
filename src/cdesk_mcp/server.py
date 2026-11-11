@@ -128,8 +128,8 @@ _SERVER_INSTRUCTIONS = inspect.cleandoc(
     a user's factual question from them without running the verify step above.
 
     PARAMETER-COLLECTION PROTOCOL — applies to every create_*, update_*,
-    delete_*, set_* and other write tool (the ones whose annotations carry
-    destructiveHint). They write to the real tenant, so before calling one, walk
+    delete_*, set_* and other write tool (every tool not annotated
+    readOnlyHint). They write to the real tenant, so before calling one, walk
     the user through EVERY parameter — required and optional — and collect values:
       - Required: if the user skips one or answers unclearly, ask again. Do NOT
         invent, infer, or default the value.

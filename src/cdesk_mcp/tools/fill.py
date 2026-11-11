@@ -224,7 +224,9 @@ def register_fill_tools(
 
     @mcp.tool(
         description=_CREATE_FILL_DESC,
-        annotations=ToolAnnotations(title="Create fill", destructiveHint=True),
+        annotations=ToolAnnotations(
+            title="Create fill", readOnlyHint=False, destructiveHint=False
+        ),
     )
     async def create_fill(
         assign_id: int,

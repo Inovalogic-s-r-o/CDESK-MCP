@@ -275,7 +275,9 @@ def register_task_tools(
 
     @mcp.tool(
         description=_CREATE_TASK_DESC,
-        annotations=ToolAnnotations(title="Create task", destructiveHint=True),
+        annotations=ToolAnnotations(
+            title="Create task", readOnlyHint=False, destructiveHint=False
+        ),
     )
     async def create_task(
         name: str,
