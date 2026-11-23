@@ -55,6 +55,7 @@ from cdesk_mcp.tools._helpers import (
     unwrap_list,
     unwrap_record,
 )
+from cdesk_mcp.tools._request_links import add_links, read_request_links
 from cdesk_mcp.tools._text import (
     MIN_QUOTE_CHARS,
     normalize_for_display,
@@ -129,6 +130,18 @@ class GroundingDomain:
     # The module whose customer / solver names are read with the record
     # (see ask_for_names); None for domains without them.
     names_module: str | None = None
+    # Fields read with every record on top of the default fieldset — the
+    # number people know the record by when that fieldset leaves it out.
+    extra_return_fields: tuple[str, ...] = ()
+    # Fields only the list endpoint knows (a request's request_url), read
+    # with collect_records' list pages.
+    list_return_fields: tuple[str, ...] = ()
+    # Reads those list-only fields for one record fetched by id, for
+    # verify_claims; None when the domain has none.
+    read_links: Callable[[CdeskClient, int], Awaitable[dict[str, Any]]] | None = None
+    # The record field holding the link that opens the record in CDESK,
+    # shown as `url` in collect_records items.
+    url_field: str | None = None
 
 
 # --- per-domain filter resolvers ----------------------------------------
@@ -356,9 +369,10 @@ def build_domains(
             list_endpoint="v3/request",
             detail_template="v3/request/{id}",
             id_fields=("id_req", "id"),
-            # The v3 request record's human number is `number`; `req_num` is
-            # absent on this API (kept as a defensive fallback).
-            num_fields=("number", "req_num", "num"),
+            # `system_number` ("CDR-1234") is the number CDESK shows its users;
+            # `number` is the bare sequence number, the fallback when the
+            # system number is missing.
+            num_fields=("system_number", "number", "req_num", "num"),
             title_fields=("req_title", "title", "name"),
             body_fields=(
                 "req_text", "description", "solution", "solver_note",
@@ -389,12 +403,18 @@ def build_domains(
                 ("solver_group_id", "solver_group_id"),
             ),
             context_fields=(
+                ("system_number", "system_number"),
+                ("request_url", "request_url"),
                 ("company_id", "id_company"),
                 ("solver_id", "id_solver"),
                 ("solver_group_id", "solver_group_id"),
             ),
             company_field="id_company",
             names_module="request",
+            extra_return_fields=("system_number",),
+            list_return_fields=("request_url",),
+            read_links=read_request_links,
+            url_field="request_url",
         ),
         "tasks": GroundingDomain(
             name="tasks",
@@ -640,6 +660,7 @@ def register_grounding_tools(
                     params["sb"] = sb_encoded
                 if dom.names_module is not None:
                     ask_for_names(params, dom.names_module, detail=False)
+                _ask_for_extra_fields(params, dom, listing=True)
                 response, paging = await client.get_page(dom.list_endpoint, params=params)
                 records, meta = unwrap_list(response)
                 if total_reported is None:
@@ -922,6 +943,8 @@ def _collect_entry(
         "status": status,
         "created": _first_field(rec, domain.created_fields),
     }
+    if domain.url_field is not None and rec.get(domain.url_field):
+        entry["url"] = rec[domain.url_field]
     if domain.names_module is not None:
         add_names([rec], domain.names_module, detail=False, fieldset=None, fields=None)
         for key in NAME_TARGETS:
@@ -1408,6 +1431,21 @@ async def _verify_absence(
     }
 
 
+def _ask_for_extra_fields(
+    params: dict[str, Any], domain: GroundingDomain, *, listing: bool = False,
+) -> None:
+    """Add the domain's extra_return_fields (and on a list read its
+    list_return_fields) to a read. returnFields[] alone narrows the response
+    to itself, so the default fieldset is pinned for the fields to be read on
+    top of it."""
+    extra = (*domain.extra_return_fields, *(domain.list_return_fields if listing else ()))
+    if not extra:
+        return
+    params.setdefault("fieldset", "extended")
+    asked = list(params.get("returnFields[]") or [])
+    params["returnFields[]"] = [*asked, *(f for f in extra if f not in asked)]
+
+
 async def _fetch_record(
     client: CdeskClient,
     domain: GroundingDomain,
@@ -1436,6 +1474,7 @@ async def _do_fetch_record(
     params: dict[str, Any] = {}
     if domain.names_module is not None:
         ask_for_names(params, domain.names_module, detail=True)
+    _ask_for_extra_fields(params, domain)
     try:
         envelope = await client.get(
             domain.detail_template.format(id=record_id), params=params or None
@@ -1449,6 +1488,8 @@ async def _do_fetch_record(
         return None
     if domain.names_module is not None:
         add_names([record], domain.names_module, detail=True, fieldset=None, fields=None)
+    if domain.read_links is not None:
+        add_links(record, await domain.read_links(client, record_id))
     return record
 
 
@@ -1536,7 +1577,11 @@ _COLLECT_RECORDS_DESC = inspect.cleandoc(
       - items: [{id, num, title, text, status, created}] (text = cleaned
         title+body, capped at text_chars_per_record; pass 0 for a cheap
         ids/titles-only sweep with no body text). Requests, tasks and
-        fills add customer_name and solver_name.
+        fills add customer_name and solver_name. `id` is the internal key
+        verify_claims takes as record_id; `num` is the number CDESK shows
+        its users where the module has one (a request's system_number,
+        e.g. "CDR-1234"). Requests add `url`, the link that opens the request
+        in CDESK.
       - coverage: {scanned, total_reported, complete, truncated, cap,
         text_truncated_count, include_discussion[, discussion_unsupported]}.
         total_reported is CDESK's own count of the records matching the filter;

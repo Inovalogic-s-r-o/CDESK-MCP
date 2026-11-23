@@ -11,8 +11,12 @@ for what you need instead of clicking through screens and filters.
   *"How many hours did we log last month?"*, *"Find the user with this e-mail."*
   Answers come from your live CDESK, not from anything the AI remembers.
 - **Get work done.** Open a ticket, log a task and assign a solver, add a
-  customer, note a fulfillment, change a status, or post into a ticket's
-  discussion — visible to the customer or internal to your technicians.
+  customer, note a fulfillment with its billing item, change a status, or post
+  into a ticket's discussion — visible to the customer or internal to your
+  technicians.
+- **Tickets by the number you know.** Ask for a ticket by its CDESK number
+  (e.g. *CDR-1234*); every ticket the assistant shows carries that number and a
+  link that opens it in CDESK, ready to paste into a reply or an e-mail.
 - **In your own words.** Statuses, types and categories can be named the way
   your team names them, in Slovak, Czech or English, with or without diacritics.
 - **Answers you can check.** For factual questions the assistant must quote real

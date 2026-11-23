@@ -393,16 +393,22 @@ class CdeskClient:
 
     async def logout(self) -> None:
         """Best-effort: tell CDESK to invalidate the current apitoken
-        (``POST /api/logout``). Bypasses ``_request`` so it does NOT renew on a
-        401 (an already-invalid token is fine — we're logging out). No-op if no
-        token is held; never raises (the caller treats this as best-effort)."""
+        (``POST /api/logout``) and revoke the refresh token issued with it — a
+        refresh token left out of the call stays valid until it expires (30
+        days), so renewtokens would still mint new apitokens from it. Bypasses
+        ``_request`` so it does NOT renew on a 401 (an already-invalid token is
+        fine — we're logging out). No-op if no token is held; never raises (the
+        caller treats this as best-effort)."""
         token = self._token
         if not token:
             return
+        body: dict[str, str] = {"token": token}
+        if self._refresh_token:
+            body["refreshToken"] = self._refresh_token
         try:
             await self._http.post(
                 _LOGOUT_PATH,
-                json={"token": token},
+                json=body,
                 headers={"Authorization": f"apitoken {token}"},
             )
         except Exception as e:  # network / HTTP error — logout is best-effort

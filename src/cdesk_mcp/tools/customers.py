@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 
 import inspect
+import re
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -302,7 +303,8 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
                     "street": street,
                     "city": city,
                     "postal_code": postal_code,
-                    "country": country,
+                    "country": _country_code(country),
+                    "country_iso": _country_code(country),
                     "web_page": web_page,
                     "email_general": email_general,
                     "phone_general": phone_general,
@@ -390,7 +392,8 @@ def register_customer_tools(mcp: FastMCP, client: CdeskClient) -> None:
                     "street": street,
                     "city": city,
                     "postal_code": postal_code,
-                    "country": country,
+                    "country": _country_code(country),
+                    "country_iso": _country_code(country),
                     "web_page": web_page,
                     "email_general": email_general,
                     "phone_general": phone_general,
@@ -475,6 +478,27 @@ async def _linked_records(client: CdeskClient, customer_id: int) -> list[str]:
 
     found = await asyncio.gather(*(has_any(path, col) for path, col, _ in _LINKED_LISTS))
     return [name for (_, _, name), hit in zip(_LINKED_LISTS, found) if hit]
+
+
+_COUNTRY_CODE = re.compile(r"^[A-Za-z]{2}$")
+
+
+def _country_code(value: str | None) -> str | None:
+    """The country as an upper-case ISO 3166-1 alpha-2 code. It goes out as
+    `country_iso`, which CDESK validates ("Neplatná krajina" for an unknown
+    code) and from which it derives the country name, and as `country` for
+    servers that read only that field. The `country` field alone stores an
+    unknown value as plain text without an error, so a name or other text is
+    refused here."""
+    if value is None:
+        return None
+    code = value.strip()
+    if not _COUNTRY_CODE.match(code):
+        raise ValueError(
+            f"country must be an ISO 3166-1 alpha-2 code such as SK, CZ or AT "
+            f"(got {value!r}); CDESK stores the country name from the code"
+        )
+    return code.upper()
 
 
 def _build_customer_body(raw: dict[str, Any]) -> dict[str, Any]:
@@ -668,7 +692,9 @@ _CREATE_CUSTOMER_DESC = inspect.cleandoc(
     processing is hidden from this connector, so a customer find_customer_by_name
     does not find can still exist in CDESK under the same name.
 
-    Address: street, city, postal_code, country (ISO code preferred).
+    Address: street, city, postal_code, country — an ISO 3166-1 alpha-2 code
+    (e.g. SK, CZ); CDESK stores the country name derived from it and refuses
+    an unknown code. A country name is refused.
 
     Slovak tax IDs (ico, dic, icdph) are validated server-side against
     Finstat when the tenant configures that — invalid values surface as

@@ -39,6 +39,13 @@ from cdesk_mcp.field_policy import (
     violations,
 )
 from cdesk_mcp.filters import build_request_filter, encode_sb
+from cdesk_mcp.tools._request_links import (
+    LINK_FIELDS,
+    REQUEST_URL,
+    SYSTEM_NUMBER,
+    add_links,
+    read_request_links,
+)
 from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
     without_notify_flags as _without_notify_flags,
@@ -163,12 +170,27 @@ _MAX_PER_PAGE = 100
 # periodical request carries the parent id here; ad-hoc requests have null.
 _PERIODIC_SRC = "periodical_request_id"
 
+# The request number people see in CDESK, its notifications and e-mails
+# ("CDR-1234": the tenant's prefix + the sequence number). Neither the `base`
+# nor the default `extended` fieldset carries it; `id` is an internal key that
+# appears nowhere a CDESK user looks.
+_SYSTEM_NUMBER = SYSTEM_NUMBER
 
-def _ensure_periodic_field(
-    fieldset: str | None, fields: list[str] | None
+# Fields every request read asks for, whatever fieldset / fields the caller set.
+# Only the list knows `request_url`; the detail GET reads it separately
+# (read_request_links).
+_ALWAYS_FIELDS = (_PERIODIC_SRC, _SYSTEM_NUMBER)
+_ALWAYS_LIST_FIELDS = (*_ALWAYS_FIELDS, REQUEST_URL)
+
+
+def _ensure_always_fields(
+    fieldset: str | None,
+    fields: list[str] | None,
+    always: tuple[str, ...] = _ALWAYS_FIELDS,
 ) -> tuple[str | None, list[str] | None]:
-    """Guarantee periodical_request_id is in the projection so `is_periodic` is
-    always derivable. The default (extended) fieldset omits it.
+    """Put `always` into the projection, so `is_periodic` is always
+    derivable and every record carries its system_number (and, on the list,
+    its request_url). The default (extended) fieldset omits them.
     returnFields[] ALONE is restrictive (the response is narrowed to just those
     keys), so when no `fields` whitelist is given we also pin an explicit
     fieldset for returnFields to compose as a UNION rather than a restriction.
@@ -176,13 +198,14 @@ def _ensure_periodic_field(
     When the caller DID pass a `fields` whitelist, we must NOT pin a fieldset:
     doing so would turn their narrow selection into the full extended set
     (UNION), silently defeating the field-narrowing they asked for. We only
-    append periodical_request_id to their whitelist, keeping returnFields[]
+    append the always-fields to their whitelist, keeping returnFields[]
     restrictive.
     """
     had_fields = bool(fields)
     fields = list(fields) if fields else []
-    if _PERIODIC_SRC not in fields:
-        fields.append(_PERIODIC_SRC)
+    for name in always:
+        if name not in fields:
+            fields.append(name)
     if fieldset is None and not had_fields:
         fieldset = "extended"  # match CDESK's implicit default so the union holds
     return fieldset, fields
@@ -351,9 +374,13 @@ def _with_direct_close_warning(result: dict[str, Any], current: Any, new: Any) -
     ])
 
 
-async def _label_write_result(cache: EnumCache, result: dict[str, Any]) -> dict[str, Any]:
+async def _label_write_result(
+    cache: EnumCache, result: dict[str, Any], links: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Enum labels on a write response: the record is in `savedData` (or in
-    `data` on endpoints that return the record there)."""
+    `data` on endpoints that return the record there). CDESK's savedData has
+    no system_number / request_url; the caller passes them in as `links`."""
+    add_links(result.get("savedData"), links or {})
     _add_time_fields(result.get("savedData"))
     _add_time_fields(result.get("data"))
     await add_enum_names(
@@ -387,6 +414,7 @@ def register_request_tools(
     )
     async def list_requests(
         text_search: str | None = None,
+        request_number: str | None = None,
         status_name: str | None = None,
         status_group: Literal[
             "open", "completed", "closed", "closed_and_completed", "waiting_for_response",
@@ -444,6 +472,7 @@ def register_request_tools(
             dropped_clauses: list[dict[str, Any]] = []
             sb = build_request_filter(
                 text_search=text_search,
+                request_number=request_number,
                 status_id=status_id,
                 status_group=status_group,
                 priority_id=priority_id,
@@ -467,7 +496,7 @@ def register_request_tools(
                 dropped_cols_out=dropped_clauses,
             )
             params: dict[str, Any] = {"pg": page, "pp": per_page}
-            fieldset, fields = _ensure_periodic_field(fieldset, fields)
+            fieldset, fields = _ensure_always_fields(fieldset, fields, _ALWAYS_LIST_FIELDS)
             apply_field_scope(params, fieldset, fields)
             only = ask_for_names(params, "request", detail=False)
             if sort:
@@ -505,7 +534,8 @@ def register_request_tools(
         annotations=ToolAnnotations(title="Get request", readOnlyHint=True),
     )
     async def get_request(
-        id: int,
+        id: int | None = None,
+        request_number: str | None = None,
         fieldset: str | None = None,
         fields: list[str] | None = None,
         include_deleted: bool = False,
@@ -514,7 +544,17 @@ def register_request_tools(
         try:
             validate_fieldset(fieldset)
             validate_fields(fields)
-            fieldset, fields = _ensure_periodic_field(fieldset, fields)
+            if (id is None) == (request_number is None):
+                raise ValueError(
+                    "pass exactly one of id (the internal request id) or "
+                    "request_number (the number CDESK shows, e.g. \"CDR-1234\")"
+                )
+            links: dict[str, Any] | None = None
+            if id is None:
+                id, links = await _id_for_request_number(
+                    client, str(request_number), include_deleted=include_deleted,
+                )
+            fieldset, fields = _ensure_always_fields(fieldset, fields)
             params: dict[str, Any] = {}
             if fieldset:
                 params["fieldset"] = fieldset
@@ -533,6 +573,9 @@ def register_request_tools(
         record = _add_time_fields(_add_is_periodic(unwrap_record(response)))
         add_names([record], "request", detail=True, fieldset=fieldset, fields=fields)
         await add_enum_names(cache, [record], _REQUEST_ENUM_LABELS)
+        if links is None:
+            links = await read_request_links(client, id, include_deleted=include_deleted)
+        add_links(record, links)
         if include_allowed_statuses and isinstance(record, dict):
             try:
                 rows = unwrap_record(await client.get(f"v3/request/{id}/statuses"))
@@ -818,6 +861,10 @@ def register_request_tools(
                 cache, "cat_area_2nd", cat_area_2nd_name, kind="cat_area_2nd",
                 parent_id=cat_area_id,
             )
+            await _check_request_areas(
+                client, company=company, cat_type_id=cat_type_id, catalog_id=catalog_id,
+                cat_area_id=cat_area_id, cat_area_2nd_id=cat_area_2nd_id, creating=True,
+            )
             close_reason_id = await resolve_enum_or_raise(
                 cache, "close_reasons", close_reason_name, kind="close_reason"
             )
@@ -913,12 +960,19 @@ def register_request_tools(
         # PUT carrying solver_note is then a complete no-op — 200, not stored,
         # udatetime not even bumped), so diff them against savedData.
         # Labels go on AFTER the diff, so it compares only CDESK's own keys.
-        return await _label_write_result(cache, annotate_write_warnings(
+        result = annotate_write_warnings(
             response if isinstance(response, dict) else {"data": response},
             sent_body=body,
             check_fields=tuple(_REQUEST_GATED_FIELDS),
             field_notes=_REQUEST_GATED_FIELDS,
-        ))
+        )
+        new_id = result.get("data")
+        saved = result.get("savedData")
+        if isinstance(saved, dict) and new_id is None:
+            new_id = saved.get("id")
+        return await _label_write_result(
+            cache, result, links=await read_request_links(client, new_id),
+        )
 
     @mcp.tool(
         description=_UPDATE_REQUEST_DESC,
@@ -1073,6 +1127,14 @@ def register_request_tools(
 
             current = await _fetch_for_update_request(client, id)
             await _check_status_allowed(client, id, current, status_id)
+            if cat_area_id is not None or cat_area_2nd_id is not None:
+                await _check_request_areas(
+                    client,
+                    company=company if company is not None else current.get("id_company"),
+                    cat_type_id=cat_type_id if cat_type_id is not None else current.get("cat_type_id"),
+                    catalog_id=catalog_id if catalog_id is not None else current.get("catalog_id"),
+                    cat_area_id=cat_area_id, cat_area_2nd_id=cat_area_2nd_id, creating=False,
+                )
 
             body = _build_request_body(
                 {
@@ -1155,7 +1217,9 @@ def register_request_tools(
             field_notes=_REQUEST_GATED_FIELDS,
         )
         result = _with_direct_close_warning(result, current.get("status"), body.get("status"))
-        return await _label_write_result(cache, result)
+        return await _label_write_result(
+            cache, result, links=await read_request_links(client, id),
+        )
 
     @mcp.tool(
         description=_DELETE_REQUEST_DESC,
@@ -1207,7 +1271,9 @@ def register_request_tools(
             response if isinstance(response, dict) else {"data": response},
             current.get("status"), status_id,
         )
-        return await _label_write_result(cache, result)
+        return await _label_write_result(
+            cache, result, links=await read_request_links(client, id),
+        )
 
     @mcp.tool(
         description=_LIST_REQUEST_DISCUSSION_DESC,
@@ -1348,6 +1414,118 @@ def register_request_tools(
 
 
 # --- internals ----------------------------------------------------------
+
+def _area_names(rows: list[Any]) -> str:
+    return ", ".join(
+        f"{r.get('name')} ({r.get('id')})" for r in rows if isinstance(r, dict)
+    ) or "none"
+
+
+async def _check_request_areas(
+    client: CdeskClient,
+    *,
+    company: Any,
+    cat_type_id: Any,
+    catalog_id: Any,
+    cat_area_id: int | None,
+    cat_area_2nd_id: int | None,
+    creating: bool,
+) -> None:
+    """Refuse service areas this request may not take. A request accepts only
+    the areas GET /v3/request/areas returns for its customer (the customer's own
+    area list when it has one, else the tenant's), narrowed to the request type
+    and the catalog item, and that endpoint also says whether each level is
+    required, optional or off for that customer; the enum lists every tenant
+    area without those limits. Without a readable answer (no customer known, an
+    older backend) the decision is left to CDESK."""
+    if not isinstance(company, int) or isinstance(company, bool):
+        return
+    params: dict[str, Any] = {"company_id": company}
+    if cat_type_id:
+        params["cat_type_id"] = cat_type_id
+    if catalog_id:
+        params["catalog_id"] = catalog_id
+    try:
+        data = unwrap_record(await client.get("v3/request/areas", params=params))
+    except Exception:  # noqa: BLE001
+        return
+    if not isinstance(data, dict):
+        return
+    first_status = data.get("cat_area_status")
+    second_status = data.get("cat_area_2nd_status")
+    areas = [a for a in data.get("areas") or [] if isinstance(a, dict)]
+    where = f"requests of customer {company}" + (
+        f" with request type {cat_type_id}" if cat_type_id else ""
+    ) + (f" from catalog item {catalog_id}" if catalog_id else "")
+    if cat_area_id is None:
+        if creating and first_status == "required":
+            raise ValueError(
+                f"cat_area_name is required for {where}; accepted areas: "
+                f"{_area_names(areas)}"
+            )
+        return
+    if first_status == "off":
+        raise ValueError(f"cat_area_name: service areas are switched off for {where}")
+    area = next((a for a in areas if a.get("id") == cat_area_id), None)
+    if area is None:
+        raise ValueError(
+            f"cat_area_name: area {cat_area_id} is not accepted for {where}; "
+            f"accepted areas: {_area_names(areas)}"
+        )
+    children = [c for c in area.get("children") or [] if isinstance(c, dict)]
+    if cat_area_2nd_id is None:
+        if creating and second_status == "required" and children:
+            raise ValueError(
+                f"cat_area_2nd_name is required for area {area.get('name')!r} on "
+                f"{where}; accepted: {_area_names(children)}"
+            )
+        return
+    if second_status == "off":
+        raise ValueError(
+            f"cat_area_2nd_name: second-level service areas are switched off for {where}"
+        )
+    if not any(c.get("id") == cat_area_2nd_id for c in children):
+        raise ValueError(
+            f"cat_area_2nd_name: area {cat_area_2nd_id} is not accepted under "
+            f"{area.get('name')!r} for {where}; accepted: {_area_names(children)}"
+        )
+
+
+async def _id_for_request_number(
+    client: CdeskClient, number: str, *, include_deleted: bool = False,
+) -> tuple[int, dict[str, Any]]:
+    """The internal id of the request CDESK shows as `number` ("CDR-1234", or
+    the bare "1234"), found through the list endpoint's request-number filter,
+    with its link fields (system_number, request_url) read on the way.
+    Raises ValueError when no request or more than one carries that number."""
+    sb = build_request_filter(request_number=number)
+    params: dict[str, Any] = {
+        "pg": 1, "pp": 2, "fieldset": "base", "returnFields[]": list(LINK_FIELDS),
+    }
+    if sb is not None:
+        params["sb"] = encode_sb(sb)
+    if include_deleted:
+        params["includeDeleted"] = 1
+    response, _ = await client.get_page("v3/request", params=params)
+    records, _ = unwrap_list(response)
+    rows = [r for r in records if isinstance(r, dict)]
+    if not rows:
+        raise ValueError(
+            f"no request with the number {number.strip()!r} is visible to this account"
+        )
+    if len(rows) > 1:
+        found = ", ".join(
+            f"{r.get(_SYSTEM_NUMBER) or r.get('number')} (id {r.get('id')})" for r in rows
+        )
+        raise ValueError(
+            f"the number {number.strip()!r} matches more than one request: {found}; "
+            f"pass the full number with its prefix, or the id"
+        )
+    found_id = rows[0].get("id")
+    if not isinstance(found_id, int) or isinstance(found_id, bool):
+        raise ValueError(f"the request numbered {number.strip()!r} came back without an id")
+    return found_id, {key: rows[0][key] for key in LINK_FIELDS if rows[0].get(key)}
+
 
 async def _fetch_for_update_request(client: CdeskClient, id: int) -> dict[str, Any]:
     """Fetch a request and unwrap to the record dict, ready to feed the
@@ -1607,7 +1785,20 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
     tasks. Returns a paginated `items` array; `meta.total` is the number of records matching the filter across all pages (CDESK's own count) and `meta.last_page` tells whether this is the last page. A count question
     ("how many …") is one call with per_page=1, read meta.total.
 
+    Identifiers: every record carries three. `system_number` (e.g.
+    "CDR-1234") is the request number CDESK shows its users, in the web
+    interface, notifications and e-mails. `id` is the internal key the
+    request tools take as their `id` parameter; it appears nowhere a CDESK
+    user sees. `number` is the bare sequence number (1234) without the
+    tenant's prefix. `code` is a separate free-text field, empty unless set.
+    `request_url` is the link that opens the request in the CDESK web
+    interface; whoever opens it signs in to CDESK and needs the right to see
+    the request.
+
     Common filters:
+      - request_number: exact match on the number CDESK shows — the
+        system_number ("CDR-1234", case-insensitive) or the bare number
+        ("1234").
       - text_search: free-text across the request's default columns.
       - status_name / priority_name: resolved via get_request_enums to
         tenant-specific ids (diacritic-insensitive, Slovak/Czech/English).
@@ -1624,7 +1815,8 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
 
     Every returned item carries a derived `is_periodic` boolean (True when
     the request was generated from a periodical request) alongside the raw
-    `periodical_request_id` it is derived from.
+    `periodical_request_id` it is derived from, and its `system_number` and
+    `request_url`, whatever fieldset/fields asks for.
 
     Each record carries `customer_name` / `solver_name` next to the
     customer and solver ids.
@@ -1637,7 +1829,7 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
     label (empty, or a category switched off on the tenant) has no
     `*_name` key.
 
-    Working filters: text_search, status_name, priority_name, cat_type_name,
+    Working filters: request_number, text_search, status_name, priority_name, cat_type_name,
     base_type, company, solver_id, solver_group_id, catalog_id, deal_id,
     project_contract_id, branch_id, place_name, superior_request_id, periodic,
     due_after/due_before, created_after/created_before, include_deleted.
@@ -1714,9 +1906,21 @@ def _allowed_statuses(rows: Any) -> list[dict[str, Any]]:
 
 _GET_REQUEST_DESC = inspect.cleandoc(
     """
-    Fetch a single request by id. Returns the request record including
-    SLA metadata. (The optimistic-lock token for updates is fetched
-    internally by update_request — you never need it.)
+    Fetch a single request, by its internal `id` or by `request_number`,
+    the number CDESK shows its users ("CDR-1234", case-insensitive, or the
+    bare "1234"). Exactly one of the two is accepted. Returns the request
+    record including SLA metadata. (The optimistic-lock token for updates is
+    fetched internally by update_request — you never need it.)
+
+    Identifiers: every record carries three. `system_number` (e.g.
+    "CDR-1234") is the request number CDESK shows its users, in the web
+    interface, notifications and e-mails. `id` is the internal key the
+    request tools take as their `id` parameter; it appears nowhere a CDESK
+    user sees. `number` is the bare sequence number (1234) without the
+    tenant's prefix. `code` is a separate free-text field, empty unless set.
+    `request_url` is the link that opens the request in the CDESK web
+    interface; whoever opens it signs in to CDESK and needs the right to see
+    the request.
 
     Time fields: `age_hours_calendar` is the calendar time from creation to
     close (to now while the request is open), in hours. CDESK's own
@@ -1750,7 +1954,7 @@ _GET_REQUEST_DESC = inspect.cleandoc(
     The response carries a derived `is_periodic` boolean (True when the
     request was generated from a periodical request) plus the raw
     `periodical_request_id` it rests on — both are included regardless of
-    fieldset/fields.
+    fieldset/fields, as are `system_number` and `request_url`.
 
     Each record carries `customer_name` / `solver_name` next to the
     customer and solver ids.
@@ -1919,6 +2123,12 @@ _CREATE_REQUEST_DESC = inspect.cleandoc(
 
     Categories (each resolved via get_request_enums):
       - cat_type_name / cat_area_name / cat_area_2nd_name.
+      Service areas: a request accepts only the areas offered for its
+      customer (the customer's own area list when it has one, else the
+      tenant's), narrowed to its request type and catalog item, and each
+      level may be required, optional or off for that customer — a narrower
+      set than get_request_enums lists. An area outside it is refused before
+      anything is written, naming the accepted areas.
 
     Resolution / closure (typically used on update, not create):
       - close_reason_name / solver_method_name / root_cause_name.
@@ -1941,7 +2151,10 @@ _CREATE_REQUEST_DESC = inspect.cleandoc(
     fields, approval rules, etc.) — CDESK's 400/422 response surfaces
     those clearly via translate_error.
 
-    Returns: {data: <new id>, savedData: {...full record...}}; check the
+    Returns: {data: <new id>, savedData: {...full record...}} — the record
+    includes the new request's `system_number` ("CDR-1234"), the number
+    CDESK shows its users, and its `request_url`, the link that opens it in
+    CDESK; `data` is the internal id. Check the
     optional `warnings` list for silently-dropped/ignored fields.
 
     Side effects (by CDESK): with the deal module and the tenant's automatic deal
@@ -1962,6 +2175,15 @@ _UPDATE_REQUEST_DESC = inspect.cleandoc(
     close_reason_name / solver_method_name / root_cause_name. Several of these
     enums are gated per tenant and are simply absent on some servers; the error
     says which, and names the setting behind it.
+    cat_area_name / cat_area_2nd_name are checked against the areas offered for
+    the request's customer, request type and catalog item (see create_request).
+
+    Priority and the SLA: when priority, the request type or a service area
+    changes, the resulting priority must be one the request's SLA offers for
+    that type and area; CDESK refuses anything else (HTTP 400, its message
+    passed on). Request types whose priority comes from the urgency × impact
+    matrix are not checked. No API lists the priorities an SLA offers, so this
+    is not checked before the call.
 
     due_date sets the deadline (CDESK computes it from the SLA otherwise), and
     due_date_fixed=true keeps it from being recomputed — the latter only with
@@ -1989,7 +2211,9 @@ _UPDATE_REQUEST_DESC = inspect.cleandoc(
     is completed or has bound devices/approvals — CDESK's error message
     will explain.
 
-    Returns: {data: <id>, savedData: {...full record...}}; check the
+    Returns: {data: <id>, savedData: {...full record...}} — the record
+    includes the request's `system_number`, the number CDESK shows its
+    users, and its `request_url`, the link that opens it in CDESK. Check the
     optional `warnings` list for silently-dropped/ignored fields.
         notify_block=1 sends no notification for this change; notify_customer_block
     / notify_sms_block suppress only the customer e-mails / the SMS.
@@ -2024,7 +2248,9 @@ _SET_REQUEST_STATUS_DESC = inspect.cleandoc(
     notify_block=1 sends no notification for this change (notify_customer_block
     / notify_sms_block: none to the customer / no SMS).
 
-    Returns the updated request record. Closing a request makes CDESK compute
+    Returns the updated request record, with its `system_number` (the
+    number CDESK shows its users) and `request_url` (the link that opens it
+    in CDESK). Closing a request makes CDESK compute
     `duration_open` (SLA working seconds, see get_request); the result carries
     it as `sla_open_hours` beside `age_hours_calendar`.
 

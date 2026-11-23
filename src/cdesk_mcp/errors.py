@@ -383,6 +383,33 @@ def _extract_cdesk_messages(body: Any) -> tuple[list[int], list[str]]:
     return codes, messages
 
 
+class ConnectorNotReady(RuntimeError):
+    """Raised by every call when the server has no working CDESK connection:
+    credentials missing, or the startup check failed. Its text says why."""
+
+
+# How a startup failure caused by the API-v3 gate starts, so the probe message
+# can tell it apart from an unreachable server or wrong credentials.
+API_V3_ACCESS_REFUSED = (
+    "CDESK refused this account's access to API v3, which the connector uses "
+    "(HTTP 403)"
+)
+
+
+def api_v3_gate_refusal(exc: BaseException) -> str | None:
+    """CDESK's reason when `exc` is the API-v3 gate's refusal — HTTP 403 with
+    the gate's top-level `error` object — or None for any other error. The
+    gate answers it when the account signs in but may not use API v3 (the
+    "API v3" permission, or the licence tier). Module and record rights answer
+    403 in the `msg.error` shape instead and are not matched."""
+    if not isinstance(exc, httpx.HTTPStatusError) or exc.response.status_code != 403:
+        return None
+    body = _safe_body(exc.response)
+    if not isinstance(body, dict) or not isinstance(body.get("error"), dict):
+        return None
+    return _format_cdesk_reason(body) or "CDESK gave no reason"
+
+
 def _format_cdesk_reason(body: Any) -> str:
     """Render the CDESK-side reason as a single string fragment, or empty when
     the body had no extractable detail. Designed to be concatenated onto the

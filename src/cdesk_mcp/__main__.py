@@ -22,6 +22,7 @@ from cdesk_mcp import base_config
 from cdesk_mcp.cdesk_client import CdeskClient
 from cdesk_mcp.config import Config
 from cdesk_mcp.enums import EnumCache
+from cdesk_mcp.errors import API_V3_ACCESS_REFUSED, api_v3_gate_refusal
 from cdesk_mcp.logging_setup import setup_logging
 from cdesk_mcp.oauth import CdeskOAuthProvider
 from cdesk_mcp.oauth.crypto import TokenCipher
@@ -265,9 +266,15 @@ async def _startup_probe(
     # failure so the LLM sees one clear error rather than four.
     if len(cache_warnings) == len(labels):
         # The errors usually have the same root cause; surface the
-        # first one with its label for context.
+        # first one with its label for context. When every read was refused
+        # by the API-v3 gate, the account signed in but may not use API v3,
+        # and CDESK's own reason says so.
+        gate = [api_v3_gate_refusal(r) for r in results if isinstance(r, BaseException)]
         first_label, first_err = next(iter(cache_warnings.items()))
-        error_str = f"{first_label} enums: {first_err}"
+        if gate and all(gate):
+            error_str = f"{API_V3_ACCESS_REFUSED}. {gate[0]}."
+        else:
+            error_str = f"{first_label} enums: {first_err}"
         log.warning(
             "CDESK startup probe failed (all caches errored — likely auth or "
             "connectivity): %s",

@@ -32,6 +32,7 @@ from cdesk_mcp import __version__
 from cdesk_mcp.cdesk_client import CdeskClient
 from cdesk_mcp.config import DEFAULT_EVIDENCE_THRESHOLD
 from cdesk_mcp.enums import EnumCache
+from cdesk_mcp.errors import API_V3_ACCESS_REFUSED, ConnectorNotReady
 from cdesk_mcp.oauth import (
     CdeskOAuthProvider,
     RequestScopedClient,
@@ -139,6 +140,16 @@ _SERVER_INSTRUCTIONS = inspect.cleandoc(
     Call only once you hold an explicit value or an explicit skip for every
     parameter.
 
+    REQUEST NUMBERS. CDESK users know a request by its `system_number`
+    (e.g. "CDR-1234"), the number CDESK shows in its web interface,
+    notifications and e-mails; every request result carries it. The internal
+    `id` the request tools take appears nowhere a CDESK user sees, and
+    get_request / list_requests also find a request by its `request_number`.
+    Every request result also carries `request_url`, the link that opens the
+    request in the CDESK web interface — usable in a reply or in a message
+    to a person, who signs in to CDESK to open it and needs the right to see
+    the request.
+
     TENANT FORM RULES. Requests, deals, tasks, fills, customers and request
     catalogs follow the tenant's CDESK form, read live: a field the tenant has
     switched off is refused when given, a required one is refused when missing
@@ -218,6 +229,13 @@ def _probe_failed_msg(probe_error: str) -> str:
     being filled in. Includes the actual exception (type + message) so
     the LLM can relay the real cause rather than echoing the generic
     'credentials not configured' line."""
+    if probe_error.startswith(API_V3_ACCESS_REFUSED):
+        return (
+            f"{probe_error} The account signs in, but it may not use API v3, "
+            f"so no tool can read or write. A CDESK administrator grants the "
+            f"permission \"API v3\" (read and write) in the user's permissions, "
+            f"or the licence CDESK names above; restart the server afterwards."
+        )
     return (
         f"cdesk-mcp's startup probe to CDESK failed: {probe_error}. "
         f"The .env credentials are set, but the server couldn't reach "
@@ -244,19 +262,19 @@ class _UnconfiguredCdeskClient:
         self._message = message
 
     async def get(self, *_args: Any, **_kwargs: Any) -> Any:
-        raise RuntimeError(self._message)
+        raise ConnectorNotReady(self._message)
 
     async def get_page(self, *_args: Any, **_kwargs: Any) -> Any:
-        raise RuntimeError(self._message)
+        raise ConnectorNotReady(self._message)
 
     async def post(self, *_args: Any, **_kwargs: Any) -> Any:
-        raise RuntimeError(self._message)
+        raise ConnectorNotReady(self._message)
 
     async def put(self, *_args: Any, **_kwargs: Any) -> Any:
-        raise RuntimeError(self._message)
+        raise ConnectorNotReady(self._message)
 
     async def delete(self, *_args: Any, **_kwargs: Any) -> Any:
-        raise RuntimeError(self._message)
+        raise ConnectorNotReady(self._message)
 
     async def close(self) -> None:
         pass

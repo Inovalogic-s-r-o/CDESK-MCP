@@ -125,6 +125,9 @@ def user_type_label(value: str) -> str:
 # Surface high-value filters only; the OpenAPI lists ~30 columns but most
 # would just bloat the tool signature without value to the LLM.
 _REQUEST_COLS = {
+    # The number CDESK shows people: `=` matches the prefixed system number
+    # ("CDR-1234", case-insensitive) and the bare sequence number ("1234").
+    "request_number": "req_num",
     "customer_id": "id_company",        # FK to cdesk_companies.id
     "solver_id": "id_solver",
     "solver_group_id": "solver_group_id",
@@ -740,6 +743,7 @@ def _status_group_value(kind: str, group: str, groups: Any) -> Any:
 def build_request_filter(
     *,
     text_search: str | None = None,
+    request_number: str | None = None,
     status_id: int | None = None,
     status_group: str | None = None,
     priority_id: int | None = None,
@@ -767,6 +771,10 @@ def build_request_filter(
     LLM-friendly arg names; the builder maps to CDESK internal columns
     (see _REQUEST_COLS). Name→id resolution (status_name → status_id) is
     the caller's responsibility — pass already-resolved ints here.
+
+    request_number is an exact match on the number CDESK shows for the
+    request: the prefixed system number ("CDR-1234", case-insensitive) or the
+    bare sequence number ("1234").
 
     periodic narrows by request periodicity via ISNULL/ISNOTNULL on
     periodical_request_id: True → periodic (generated) requests only,
@@ -810,6 +818,11 @@ def build_request_filter(
     clauses: list[dict[str, Any]] = []
     if text_search:
         clauses.append(_text_leaf(text_search))
+    if request_number is not None:
+        number = request_number.strip()
+        if not number:
+            raise ValueError("request_number must not be empty")
+        clauses.append(_eq_leaf(_REQUEST_COLS["request_number"], number))
     if status_id is not None:
         clauses.append(_eq_leaf(_REQUEST_COLS["status_id"], status_id))
     if status_group is not None:
@@ -2261,12 +2274,15 @@ def _validate_sb_shape(sb: dict[str, Any]) -> None:
                 )
         if "o" not in sb:
             raise ValueError("sb_raw with 'group: true' must include 'o' ('AND' or 'OR')")
+        _validate_sb_nodes(query, "query")
     elif has_query or has_text:
         # primary form: top-level may carry 'q' and optionally a nested 'query'.
         if has_query and not isinstance(sb["query"], list):
             raise ValueError(
                 f"sb_raw 'query' must be a list, got {type(sb['query']).__name__}"
             )
+        if has_query:
+            _validate_sb_nodes(sb["query"], "query")
     else:
         # None of the supported forms — warn via error so the caller knows
         # CDESK is unlikely to interpret this.
@@ -2274,6 +2290,74 @@ def _validate_sb_shape(sb: dict[str, Any]) -> None:
             "sb_raw must be a group form ({'group': true, 'o': 'AND'|'OR', "
             "'query': [...]}) or a primary-search form ({'q': '...', ...})"
         )
+
+
+# The keys an sb node may carry. CDESK reads a leaf only through these and
+# drops one it cannot read — a misnamed key ('op', 'val', 'value') or a missing
+# value — without an error, so the list comes back unfiltered as if filtered.
+_SB_LEAF_KEYS = frozenset({"col", "c", "q", "q2", "o"})
+_SB_GROUP_KEYS = frozenset({"group", "o", "query"})
+# Comparators that take no value; every other one needs `q`.
+_SB_VALUELESS = frozenset({"ISNULL", "ISNOTNULL", "TRUE", "FALSE"}) | _DATE_PRESETS
+# Comparators whose range needs a second value in `q2`.
+_SB_TWO_VALUES = frozenset({"BETWEEN", "FOR_THE_LAST", "FOR_THE_NEXT"})
+_SB_LEAF_FORM = "{'col': <column>, 'c': <comparator>, 'q': <value>, 'o': 'AND'|'OR'}"
+
+
+def _validate_sb_nodes(nodes: Any, path: str) -> None:
+    """Check every node of an sb `query` list, nested groups included: a group
+    carries only group/o/query; a leaf only col/c/q/q2/o, a comparator in `c`
+    when it names a column, and the values its comparator needs. A leaf
+    without `col` is the module's text search and needs only `q`."""
+    if not isinstance(nodes, list):
+        raise ValueError(f"sb_raw {path} must be a list, got {type(nodes).__name__}")
+    for i, node in enumerate(nodes):
+        where = f"{path}[{i}]"
+        if not isinstance(node, dict):
+            raise ValueError(f"sb_raw {where} must be a dict, got {type(node).__name__}")
+        if node.get("group") is True or "query" in node:
+            unknown = sorted(str(k) for k in node if k not in _SB_GROUP_KEYS)
+            if unknown:
+                raise ValueError(
+                    f"sb_raw {where} is a group and carries {unknown}; a group "
+                    f"takes only 'group', 'o' and 'query'"
+                )
+            _validate_sb_nodes(node.get("query"), f"{where}.query")
+            continue
+        unknown = sorted(str(k) for k in node if k not in _SB_LEAF_KEYS)
+        if unknown:
+            raise ValueError(
+                f"sb_raw {where} carries {unknown}, which CDESK does not read "
+                f"(the clause would be dropped and the list returned unfiltered); "
+                f"a leaf takes only 'col', 'c', 'q', 'q2' and 'o': {_SB_LEAF_FORM}"
+            )
+        comparator = node.get("c")
+        if "col" not in node:
+            if comparator is None and node.get("q") in (None, ""):
+                raise ValueError(
+                    f"sb_raw {where} has neither 'col' nor a 'q' value; a leaf "
+                    f"without 'col' is a text search and needs 'q'"
+                )
+            if comparator is None:
+                continue
+        elif comparator is None:
+            raise ValueError(
+                f"sb_raw {where} names column {node['col']!r} without a comparator "
+                f"'c' (CDESK drops such a clause on some columns): {_SB_LEAF_FORM}"
+            )
+        c = str(comparator).upper()
+        if c in _SB_VALUELESS:
+            continue
+        if node.get("q") is None:
+            raise ValueError(
+                f"sb_raw {where} uses comparator {comparator!r} without a value "
+                f"'q' (CDESK would drop the clause): {_SB_LEAF_FORM}"
+            )
+        if c in _SB_TWO_VALUES and node.get("q2") is None:
+            raise ValueError(
+                f"sb_raw {where} uses {comparator!r}, which needs a second value "
+                f"in 'q2' (q = from, q2 = to)"
+            )
 
 
 def reject_sb_raw_with_typed(

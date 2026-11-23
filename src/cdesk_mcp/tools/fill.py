@@ -11,8 +11,9 @@ enum groups directly.
 
 Optimistic locking is hidden exactly as in the Task module: update_fill does
 GET (fieldset=all) → mutate → PUT, echoing the `timestamp_check` token; the LLM
-never sees it. The backend hard-blocks writes to already-invoiced fills (HTTP
-409) — that surfaces through the normal error translator.
+never sees it. The backend blocks writes to already-invoiced fills (HTTP 403
+without the invoiced-write right; a delete answers 424) and to fills on a closed
+request (424) — that surfaces through the normal error translator.
 
 The date window filters via a `start_date` BETWEEN leaf (built by
 build_fill_filter). A windowless list has no implicit month bound.
@@ -44,12 +45,15 @@ from cdesk_mcp.tools._helpers import (
     add_names,
     apply_field_scope,
     ask_for_names,
+    canon_name,
+    closest_row_names,
     to_llm_error,
     unsupported_filter_directive,
     unwrap_list,
     unwrap_record,
     validate_fields,
     validate_fieldset,
+    with_warning_texts,
 )
 from cdesk_mcp.tz import localize_naive_datetime, tenant_timezone
 
@@ -249,6 +253,7 @@ def register_fill_tools(
         place_custom: str | None = None,
         place_travel_id: int | None = None,
         billing_item_id: int | None = None,
+        billing_item_name: str | None = None,
         billing_travel_id: int | None = None,
         billing_kopfis_id: int | None = None,
         travel: bool | None = None,
@@ -274,10 +279,12 @@ def register_fill_tools(
                 raise ValueError("solver_id (the worker) is required")
             # The tenant's fill FORM rules, read live from core/base-config (fill
             # settings are not in v3; v1 fill/settings is admin-only).
+            _one_billing_item_param(billing_item_id, billing_item_name)
             refuse_if_violated(violations(
                 FILL_FIELDS, fill_settings(await base_config.load(client)),
                 {"description": description, "place_id": place_id,
-                 "place_custom": place_custom, "billing_item_id": billing_item_id},
+                 "place_custom": place_custom,
+                 "billing_item_id": billing_item_id if billing_item_name is None else billing_item_name},
             ))
             parents = {
                 "company_id": company_id,
@@ -288,6 +295,11 @@ def register_fill_tools(
                 "project_contract_id": project_contract_id,
             }
             _validate_assign(assign_id, parents)
+            if billing_item_name is not None:
+                scope_company, scope_deal = await _fill_scope(client, assign_id, parents)
+                billing_item_id = await _billing_item_by_name(
+                    client, billing_item_name, company_id=scope_company, deal_id=scope_deal,
+                )
 
             body = _build_fill_body(
                 {
@@ -323,7 +335,7 @@ def register_fill_tools(
             raise RuntimeError(f"create_fill input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="create_fill") from e
-        return _with_write_minutes(response)
+        return await _with_billing_check(client, _with_write_minutes(response))
 
     @mcp.tool(
         description=_UPDATE_FILL_DESC,
@@ -351,6 +363,7 @@ def register_fill_tools(
         place_custom: str | None = None,
         place_travel_id: int | None = None,
         billing_item_id: int | None = None,
+        billing_item_name: str | None = None,
         billing_travel_id: int | None = None,
         billing_kopfis_id: int | None = None,
         travel: bool | None = None,
@@ -363,10 +376,12 @@ def register_fill_tools(
         try:
             # Same fill form rules: an off field may not be set, a required one
             # not cleared (left out = unchanged).
+            _one_billing_item_param(billing_item_id, billing_item_name)
             refuse_if_violated(violations(
                 FILL_FIELDS, fill_settings(await base_config.load(client)),
                 {"description": description, "place_id": place_id,
-                 "place_custom": place_custom, "billing_item_id": billing_item_id},
+                 "place_custom": place_custom,
+                 "billing_item_id": billing_item_id if billing_item_name is None else billing_item_name},
                 update=True,
             ))
             valid_from = localize_naive_datetime("valid_from", valid_from)
@@ -399,6 +414,14 @@ def register_fill_tools(
                 current_from = current.get("valid_from")
                 if isinstance(current_from, str):
                     _ensure_chronological(current_from, valid_to)
+            if billing_item_name is not None:
+                scope_company, scope_deal = await _fill_scope(
+                    client, assign_id if assign_id is not None else stored_assign,
+                    parents, current,
+                )
+                billing_item_id = await _billing_item_by_name(
+                    client, billing_item_name, company_id=scope_company, deal_id=scope_deal,
+                )
 
             body = _build_fill_body(
                 {
@@ -440,7 +463,7 @@ def register_fill_tools(
             raise RuntimeError(f"update_fill input error: {e}") from e
         except Exception as e:
             raise to_llm_error(e, operation="update_fill", record_id=id) from e
-        return _with_write_minutes(response)
+        return await _with_billing_check(client, _with_write_minutes(response))
 
     @mcp.tool(
         description=_DELETE_FILL_DESC,
@@ -486,6 +509,233 @@ def _refuse_foreign_parents(assign_id: int, parents: dict[str, Any]) -> None:
             f"that record, use assign_id={_PARENT_ASSIGN[field]} "
             f"({_ASSIGN_NAMES[_PARENT_ASSIGN[field]]}); otherwise leave {field} out."
         )
+
+
+def _one_billing_item_param(item_id: int | None, item_name: str | None) -> None:
+    if item_id is not None and item_name is not None:
+        raise ValueError("pass billing_item_id or billing_item_name, not both")
+
+
+async def _with_billing_check(client: CdeskClient, result: dict[str, Any]) -> dict[str, Any]:
+    """Add a warning when the written fill's billing item belongs to another
+    customer's or another deal (see _billing_item_mismatch)."""
+    warning = await _billing_item_mismatch(client, result)
+    return with_warning_texts(result, [warning]) if warning else result
+
+
+def _first_id(record: Any, fields: tuple[str, ...]) -> int | None:
+    if not isinstance(record, dict):
+        return None
+    for field in fields:
+        value = record.get(field)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        if isinstance(value, str) and value.strip().isdigit() and int(value) > 0:
+            return int(value)
+    return None
+
+
+# --- billing items -----------------------------------------------------------
+# A billing item ("účtovná položka", cd_billing_item) is defined on a deal, in
+# the deal's billing tab. A fill takes the items of the deal it is filed under
+# (its own deal, or its request's / task's / work order's deal) plus the items
+# flagged global on the customer's other deals; "global" never reaches past the
+# customer. CDESK's web form offers only those, but the API stores any item
+# without checking. CDESK offers no list of them: the
+# only place an item's id and name appear is a fill that already uses it (the
+# list's billing_item_id / billing_item_title; a fill read with returnFields
+# `billing_item` carries the whole item, including its deal in contract_id).
+# So a name is looked up among the fills of the fill's customer, newest first.
+
+# How many of the customer's newest fills a name lookup reads.
+_ITEM_SCAN_PAGE = 100
+_ITEM_SCAN_PAGES = 20
+_ITEM_ID_HINT = (
+    "Its id is shown in CDESK under Zákazky → Účtovné položky (column Id), or on "
+    "the deal's Účtovanie tab; pass it as billing_item_id."
+)
+
+
+async def _fill_scope(
+    client: CdeskClient,
+    assign_id: Any,
+    parents: dict[str, Any],
+    current: dict[str, Any] | None = None,
+) -> tuple[int | None, int | None]:
+    """(customer id, deal id) the fill is filed under: the ones given, else the
+    stored fill's, else a request parent's customer and deal."""
+    company = parents.get("company_id")
+    deal = parents.get("deal_id")
+    request_id = parents.get("request_id")
+    if current is not None:
+        company = company or _first_id(current, ("company_id",))
+        deal = deal or _first_id(current, ("contract_id",))
+        request_id = request_id or _first_id(current, ("request_id",))
+    if (company is None or deal is None) and request_id is not None and assign_id in (3, None):
+        request = unwrap_record(await client.get(
+            f"v3/request/{request_id}", params={"fieldset": "base"},
+        ))
+        company = company or _first_id(request, ("id_company",))
+        deal = deal or _first_id(request, ("id_rc",))
+    return company, deal
+
+
+async def _billing_item_of_fill(client: CdeskClient, fill_id: Any) -> dict[str, Any] | None:
+    """The billing item object of a fill (id, title, contract_id, global, …),
+    or None when it has none or the read fails."""
+    if not isinstance(fill_id, int) or isinstance(fill_id, bool):
+        return None
+    try:
+        record = unwrap_record(await client.get(
+            f"v3/fill/{fill_id}",
+            params={"returnFields[]": ["billing_item", "company_id", "contract_id"]},
+        ))
+    except Exception:  # noqa: BLE001
+        return None
+    item = record.get("billing_item") if isinstance(record, dict) else None
+    return item if isinstance(item, dict) else None
+
+
+async def _billing_item_by_name(
+    client: CdeskClient, name: str, *, company_id: int | None, deal_id: int | None,
+) -> int:
+    """The id of the billing item called `name` (case- and
+    diacritic-insensitive) among those used on the customer's newest fills;
+    with several items of that name, the one on the fill's deal (or a global
+    one). Raises ValueError naming the candidates or the place to find the id."""
+    wanted = canon_name(name)
+    if not wanted:
+        raise ValueError("billing_item_name must not be empty")
+    if company_id is None:
+        raise ValueError(
+            "billing_item_name is looked up among the fills of the fill's customer, "
+            "and this fill's customer is not known here; pass company_id, or "
+            "billing_item_id. " + _ITEM_ID_HINT
+        )
+    sb = build_fill_filter(company_id=company_id)
+    titles: dict[int, str] = {}
+    used_on: dict[int, int] = {}  # item id → a fill that uses it
+    scanned = 0
+    complete = False
+    for page in range(1, _ITEM_SCAN_PAGES + 1):
+        params: dict[str, Any] = {
+            "pg": page, "pp": _ITEM_SCAN_PAGE, "fieldset": "base",
+            "returnFields[]": ["billing_item_id", "billing_item_title"],
+            "sort": resolve_sort("fills", "valid_from.desc"),
+        }
+        if sb is not None:
+            params["sb"] = encode_sb(sb)
+        response, _ = await client.get_page("v3/fill", params=params)
+        rows, _ = unwrap_list(response)
+        scanned += len(rows)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            item_id = _first_id(row, ("billing_item_id",))
+            title = row.get("billing_item_title")
+            if item_id is None or not isinstance(title, str):
+                continue
+            titles.setdefault(item_id, title)
+            fill_id = _first_id(row, ("id",))
+            if fill_id is not None:
+                used_on.setdefault(item_id, fill_id)
+        if len(rows) < _ITEM_SCAN_PAGE:
+            complete = True
+            break
+    matches = [i for i, t in titles.items() if canon_name(t) == wanted]
+    searched = (
+        f"all {scanned} fills of customer {company_id}" if complete
+        else f"the {scanned} newest fills of customer {company_id}"
+    )
+    # A fill history can hold an item of another customer's deal (CDESK accepts
+    # one), so each match is checked against the customer before it is used.
+    items: dict[int, dict[str, Any]] = {}
+    deal_owner: dict[int, int | None] = {}
+    foreign: list[str] = []
+    for item_id in list(matches):
+        item = await _billing_item_of_fill(client, used_on.get(item_id)) or {}
+        items[item_id] = item
+        item_deal = _first_id(item, ("contract_id",))
+        if item_deal is None:
+            continue
+        if item_deal not in deal_owner:
+            deal_owner[item_deal] = await _deal_customer(client, item_deal)
+        owner = deal_owner[item_deal]
+        if owner is not None and owner != company_id:
+            matches.remove(item_id)
+            foreign.append(f"{item_id} (deal {item_deal} of customer {owner})")
+    if len(matches) > 1 and deal_id is not None:
+        on_deal = [
+            i for i in matches
+            if items[i].get("contract_id") == deal_id or items[i].get("global")
+        ]
+        if on_deal:
+            matches = on_deal
+    if len(matches) == 1:
+        return matches[0]
+    if not matches and foreign:
+        raise ValueError(
+            f"billing_item_name {name!r} on {searched} is only item "
+            f"{', '.join(foreign)}, which belongs to another customer; it was used "
+            f"there by mistake, so it is not used again. " + _ITEM_ID_HINT
+        )
+    if matches:
+        listed = ", ".join(f"{i} ({titles[i]!r})" for i in sorted(matches))
+        raise ValueError(
+            f"billing_item_name {name!r} matches more than one billing item used on "
+            f"{searched}: {listed}; pass the right one as billing_item_id."
+        )
+    near = closest_row_names([{"name": t} for t in titles.values()], name)
+    hint = f" Similar names used there: {', '.join(near)}." if near else ""
+    raise ValueError(
+        f"no billing item named {name!r} is used on {searched}. CDESK offers no list "
+        f"of billing items, so only items already used on the customer's fills can "
+        f"be found by name.{hint} " + _ITEM_ID_HINT
+    )
+
+
+async def _deal_customer(client: CdeskClient, deal_id: int) -> int | None:
+    """The customer id of a deal, or None when it cannot be read."""
+    try:
+        deal = unwrap_record(await client.get(
+            f"v3/contract/{deal_id}", params={"fieldset": "base"},
+        ))
+    except Exception:  # noqa: BLE001
+        return None
+    return _first_id(deal, ("id_company",))
+
+
+async def _billing_item_mismatch(client: CdeskClient, result: dict[str, Any]) -> str | None:
+    """A warning when the fill's billing item belongs to another customer's deal,
+    or — unless the item is global — to another deal than the fill's own; CDESK
+    stores such a fill without an error. None when the item has no deal or
+    cannot be read."""
+    saved = result.get("savedData")
+    if not isinstance(saved, dict) or not saved.get("billing_item_id"):
+        return None
+    item = await _billing_item_of_fill(client, _first_id(saved, ("id",)) or result.get("data"))
+    if item is None:
+        return None
+    item_deal = _first_id(item, ("contract_id",))
+    if item_deal is None:
+        return None
+    fill_deal = _first_id(saved, ("contract_id",))
+    fill_company = _first_id(saved, ("company_id",))
+    label = f"billing item {item.get('id')} ({item.get('title')!r})"
+    deal_company = await _deal_customer(client, item_deal)
+    if deal_company is not None and fill_company is not None and deal_company != fill_company:
+        return (
+            f"The fill's {label} belongs to deal {item_deal} of customer "
+            f"{deal_company}, while the fill is filed under customer {fill_company}; "
+            f"CDESK stored it anyway, so the work is billed on the other customer's "
+            f"deal."
+        )
+    if fill_deal is not None and fill_deal != item_deal and not item.get("global"):
+        return (
+            f"The fill's {label} belongs to deal {item_deal}, while the fill is linked "
+            f"to deal {fill_deal}; CDESK stored it anyway."
+        )
+    return None
 
 
 async def _fetch_for_update(client: CdeskClient, id: int) -> dict[str, Any]:
@@ -694,6 +944,8 @@ _GET_FILL_ENUMS_DESC = inspect.cleandoc(
     Return the Fill module enum/metadata groups (maingroups, form fields,
     invoicing statuses/dates, deal & request category types, request
     status). Use these ids when building create/update payloads and sb filters.
+    Billing items are not among them: CDESK offers no list of billing items
+    (see create_fill).
     """
 )
 
@@ -713,9 +965,28 @@ _CREATE_FILL_DESC = inspect.cleandoc(
     every save: valid_to − valid_from plus `other_time` (seconds, may be
     negative), the way to correct it — there is no duration to set directly.
     The result carries `duration_minutes` / `other_time_minutes`.
-    `solver_id` (the worker) is always required. An already-invoiced parent or tenant billing settings may
-    require billing_item_id and will reject the write (HTTP 409). Fetch
-    tenant-specific ids via get_fill_enums and the related module list tools.
+    `solver_id` (the worker) is always required. Tenant billing settings may
+    require a billing item; CDESK then refuses a fill without one (HTTP 400). Ids of
+    places and other parents come from get_fill_enums and the related module
+    list tools.
+
+    Billing item ("účtovná položka"): billing_item_id, or billing_item_name.
+    A billing item is defined on a deal (its Účtovanie tab). A fill may use
+    the items of the deal it is filed under (its own deal, or its request's,
+    task's or work order's deal) and the items flagged global on the same
+    customer's other deals; a global item is never meant for another
+    customer. CDESK offers no list of billing items — neither get_fill_enums
+    nor any other tool lists them. An item's id and name appear only on fills
+    that already use it: list_fills items carry billing_item_id and
+    billing_item_title. billing_item_name looks the name up (case- and
+    diacritic-insensitive) among the items used on the fill's customer's
+    newest fills (up to 2000), preferring the fill's deal when several items
+    share the name and leaving out an item of another customer's deal; an
+    item never used on that customer's fills is not found by name, and the
+    error then names where CDESK shows its id. A nonexistent
+    billing_item_id is refused by CDESK. CDESK does accept an item that
+    belongs to another customer's deal, or a non-global item of another deal;
+    the result then carries a warning naming the item's deal and customer.
 
     `description`, the place (`place_id` / `place_custom`) and
     `billing_item_id` follow the tenant's CDESK fill form, read live on
@@ -737,15 +1008,36 @@ _UPDATE_FILL_DESC = inspect.cleandoc(
     `assign_id` requires sending the new matching parent id; a parent id that
     does not match the fill's assign_id (the new one, else the stored one) is
     refused, because CDESK does not store it. An already-invoiced
-    fill is write-blocked (HTTP 409) unless you hold the invoiced-write right.
+    fill is write-blocked (HTTP 403) unless you hold the invoiced-write right,
+    and a fill on a closed request is refused (HTTP 424).
     The worked time follows valid_from / valid_to plus `other_time` (seconds),
     recomputed by CDESK on every save; the result carries `duration_minutes`.
+
+    Billing item ("účtovná položka"): billing_item_id, or billing_item_name.
+    A billing item is defined on a deal (its Účtovanie tab). A fill may use
+    the items of the deal it is filed under (its own deal, or its request's,
+    task's or work order's deal) and the items flagged global on the same
+    customer's other deals; a global item is never meant for another
+    customer. CDESK offers no list of billing items — neither get_fill_enums
+    nor any other tool lists them. An item's id and name appear only on fills
+    that already use it: list_fills items carry billing_item_id and
+    billing_item_title. billing_item_name looks the name up (case- and
+    diacritic-insensitive) among the items used on the fill's customer's
+    newest fills (up to 2000), preferring the fill's deal when several items
+    share the name and leaving out an item of another customer's deal; an
+    item never used on that customer's fills is not found by name, and the
+    error then names where CDESK shows its id. A nonexistent
+    billing_item_id is refused by CDESK. CDESK does accept an item that
+    belongs to another customer's deal, or a non-global item of another deal;
+    the result then carries a warning naming the item's deal and customer.
     """
 )
 
 _DELETE_FILL_DESC = inspect.cleandoc(
     """
-    Delete (soft-delete) a fill by id. An already-invoiced fill cannot be
-    deleted (HTTP 409). Returns {"deleted": <id>} on success.
+    Delete (soft-delete) a fill by id. A fill on a CDESK invoice, an
+    otherwise invoiced fill (without the invoiced-write right) and a fill on a
+    closed request cannot be deleted (HTTP 424). Returns {"deleted": <id>} on
+    success.
     """
 )

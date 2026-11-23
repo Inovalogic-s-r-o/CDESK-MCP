@@ -38,6 +38,7 @@ from mcp.types import ToolAnnotations
 
 from cdesk_mcp import base_config
 from cdesk_mcp.cdesk_client import CdeskApiError, CdeskAuthError, CdeskClient
+from cdesk_mcp.errors import ConnectorNotReady
 from cdesk_mcp.filters import build_user_filter, encode_sb, user_type_label
 from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
@@ -203,15 +204,20 @@ def register_user_tools(mcp: FastMCP, client: CdeskClient) -> None:
         annotations=ToolAnnotations(title="Who am I", readOnlyHint=True),
     )
     async def whoami() -> dict[str, Any]:
+        own_error: Exception | None = None
         try:
             own = unwrap_record(
                 await client.get("v3/user/me", params={"returnFields[]": list(_ME_FIELDS)})
             )
-        except Exception:  # noqa: BLE001 — core/base-config still names the caller
-            own = None
+        except Exception as e:  # noqa: BLE001 — core/base-config still names the caller
+            own, own_error = None, e
         data = await base_config.load(client)
         me = whoami_record(data, own)
         if me is None:
+            # A server without a working CDESK connection answers every read
+            # with the reason; it says more than this fallback.
+            if isinstance(own_error, ConnectorNotReady):
+                raise own_error
             raise RuntimeError(
                 "whoami: CDESK did not return the calling user's record "
                 "(neither /v3/user/me nor core/base-config was readable); try "
