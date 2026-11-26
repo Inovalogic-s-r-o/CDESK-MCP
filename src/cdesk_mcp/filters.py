@@ -168,7 +168,7 @@ _REQUEST_COLS = {
     # Of the documented RequestSbFilterFields, these are IGNORED by the
     # endpoint (the clause returns the full set): req_title, req_status,
     # req_priority (use the action_code keys `status`/`priority` instead),
-    # sla_id, cat_type_id, cat_area_2nd_id, percent_done_manual, deleted_at,
+    # cat_type_id, cat_area_2nd_id, percent_done_manual, deleted_at,
     # req_due_date, req_close_date, idatetime. The columns that do filter are
     # listed in _REQUEST_SB_COLS below.
 }
@@ -226,6 +226,8 @@ _REQUEST_SB_COLS = frozenset({
     # periodical_request_id: ISNULL = ad-hoc only, ISNOTNULL = periodic only,
     # `=`/array = a specific periodical-request parent (per RequestSbFilterFields).
     "periodical_request_id",
+    # the SLA id; `!=` also matches requests without an SLA.
+    "sla_id",
     # date columns below: strict W3C datetime values only.
     # reaction_due_date is also honored by CDESK but deliberately left out:
     # its matching behaviour is unconfirmed.
@@ -254,8 +256,7 @@ _FILL_COLS = {
 # its ISNULL matches the request-linked fills too (match-all), so it's excluded
 # as a trap (link/ISNULL filtering works via the `task`/`contract`/`work_order`
 # keys). `start_date` works ONLY via BETWEEN with strict W3C bounds (`=`
-# matches nothing); the list defaults to the current calendar month when no
-# window is sent.
+# matches nothing); without a window the list returns every fill.
 _FILL_SB_COLS = frozenset({
     "fill_id", "assign_id", "company_id", "solver_id", "request_id",
     "contract_id", "project_contract_id", "place_id", "description",
@@ -263,6 +264,8 @@ _FILL_SB_COLS = frozenset({
     "invoiced_status", "rma", "is_signed", "start_date",
     # end_date filters on both an exact value and a range.
     "end_date",
+    # the fill number as the list shows it.
+    "num",
 })
 
 # The fill DATE TRAPS, deliberately absent from the set above (each is ignored —
@@ -282,6 +285,8 @@ _CUSTOMER_SB_COLS = frozenset({
     "ico", "dic", "icdph", "email", "phone",
     "company.city", "company.street", "company.zip", "company.country",
     "created_at", "updated_at",
+    # the user who last saved the customer (a user id).
+    "updated_by",
 })
 
 # User: 10 of the 20 documented columns + the label-form `type` filter
@@ -763,6 +768,8 @@ def build_request_filter(
     due_before: str | None = None,
     created_after: str | None = None,
     created_before: str | None = None,
+    sla_id: int | None = None,
+    deadline: str | None = None,
     sb_raw: str | dict[str, Any] | None = None,
     dropped_cols_out: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
@@ -797,8 +804,13 @@ def build_request_filter(
     requests with no due date pass it — so due_before alone is not "has a due
     date before X"; combine it with due_after to exclude undated requests.
 
-    A deleted toggle and sla_id are deliberately not offered — the v3 request
-    list silently ignores those sb columns (see _REQUEST_COLS).
+    sla_id filters by the request's SLA. deadline is "has" (a resolution
+    deadline is set), "none" (none is set) or "overdue" (the deadline is
+    past and the request has no close date). CDESK's `lateDeadline` flag
+    also matches open requests WITHOUT a deadline, so "overdue" is sent as
+    `lateDeadline` AND `hasDeadline`.
+
+    A deleted toggle is deliberately not offered (see _REQUEST_COLS).
     """
     if sb_raw is not None:
         _reject_typed_with_sb_raw(
@@ -856,6 +868,14 @@ def build_request_filter(
         clauses.append(_eq_leaf(_REQUEST_COLS["superior_request_id"], superior_request_id))
     if periodic is not None:
         clauses.append(_null_leaf(_REQUEST_COLS["periodic"], is_null=not periodic))
+    if sla_id is not None:
+        clauses.append(_eq_leaf("sla_id", sla_id))
+    if deadline is not None:
+        if deadline not in _DEADLINE_FLAGS:
+            raise ValueError(
+                f"deadline must be one of {', '.join(_DEADLINE_FLAGS)} (got {deadline!r})"
+            )
+        clauses.extend(_eq_leaf(flag, True) for flag in _DEADLINE_FLAGS[deadline])
     if due_after:
         clauses.append(_eq_leaf(_REQUEST_COLS["due_after"], due_after))
     if due_before:
@@ -868,9 +888,20 @@ def build_request_filter(
     return _wrap(clauses)
 
 
-# The list defaults to the current calendar month unless a date window is sent;
-# these bounds let a one-sided worked_from/worked_to still ride the
-# start_date BETWEEN path (the only comparator the column honors).
+# deadline → the request flags sent, each as `= true` (CDESK ignores
+# `= false`). `lateDeadline` alone also matches open requests without a
+# deadline, hence the `hasDeadline` pair.
+_DEADLINE_FLAGS: dict[str, tuple[str, ...]] = {
+    "has": ("hasDeadline",),
+    "none": ("noDeadline",),
+    "overdue": ("lateDeadline", "hasDeadline"),
+}
+
+
+# These bounds let a one-sided worked_from/worked_to still ride the
+# start_date BETWEEN path (the only comparator the column honors), and give a
+# scan that must cover the whole history an explicit window
+# (ensure_fill_start_date_window).
 _FILL_FAR_PAST = "2000-01-01T00:00:00"
 _FILL_FAR_FUTURE = "2099-12-31T23:59:59"
 
@@ -903,8 +934,9 @@ def build_fill_filter(
     Each accepts ISO-8601 and is normalized to the
     strict W3C datetime BETWEEN bounds the backend requires (worked_from
     start-of-day, worked_to end-of-day); a one-sided window fills the other
-    bound with a far past/future sentinel. IMPORTANT: with NO window the v1 list
-    returns only the CURRENT CALENDAR MONTH — always pass a window to widen.
+    bound with a far past/future sentinel. With NO window CDESK returns every
+    fill; a scan that must cover the whole history passes the wide window
+    explicitly (ensure_fill_start_date_window).
 
     invoiced/signed/rma are booleans surfaced as the integer flag columns
     invoiced_status/is_signed/rma (True→1, False→0).
@@ -955,17 +987,15 @@ def build_fill_filter(
 def ensure_fill_start_date_window(
     sb_raw: str | dict[str, Any],
 ) -> str | dict[str, Any]:
-    """Guarantee a raw fill filter bounds `start_date` so a grounded collect
-    scans full history instead of the v3 list's silent current-calendar-month
-    default.
+    """Guarantee a raw fill filter bounds `start_date` with a window covering
+    the whole history.
 
-    The fill list returns ONLY the current month when no start_date window is
-    sent, so an sb_raw that filters by some other
-    column (duration, used_material, a link col) would scan just this month and
-    could turn a real older fill into a false confirmed_absence — the exact
-    failure mode the typed-path window injection prevents. If the parsed tree
-    already targets start_date we trust the caller's bound; otherwise we AND-in a
-    wide one by wrapping. Wrapping (rather than appending into the existing
+    CDESK returns every fill when no start_date window is sent. The explicit
+    wide window keeps a scan complete regardless of a version's default: a
+    grounded collect or an existence check that silently covered only part of
+    the history could turn a real older fill into a false confirmed_absence.
+    If the parsed tree already targets start_date we trust the caller's bound;
+    otherwise we AND-in a wide one by wrapping. Wrapping (rather than appending into the existing
     query) is structure-agnostic: it preserves the caller's boolean expression
     even when its top-level connector is OR. A value we can't parse is returned
     unchanged for build_fill_filter to reject with its normal error."""

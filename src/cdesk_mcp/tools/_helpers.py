@@ -165,6 +165,38 @@ def validate_fieldset(fieldset: str | None) -> None:
         )
 
 
+_FILE_HASH = re.compile(r"[0-9a-f]{40}")
+
+
+def validate_attachments(attachments: Any) -> None:
+    """`attachment` / `attachment_internal` items: a file hash from
+    `POST /v3/file` (40 lowercase hex characters), or `{"hash": <hash>,
+    "delete": true}` to remove a file already on the record. CDESK accepts
+    only the caller's own not-yet-attached uploads or files the record
+    already has; that part is its check, this one only checks the shape."""
+    if attachments is None:
+        return
+    if not isinstance(attachments, list):
+        raise ValueError(
+            f"attachment must be a list of file hashes, got {type(attachments).__name__}"
+        )
+    for item in attachments:
+        if isinstance(item, str) and _FILE_HASH.fullmatch(item):
+            continue
+        if (
+            isinstance(item, dict)
+            and set(item) == {"hash", "delete"}
+            and isinstance(item["hash"], str)
+            and _FILE_HASH.fullmatch(item["hash"])
+            and item["delete"] is True
+        ):
+            continue
+        raise ValueError(
+            "attachment items must be a file hash (40 lowercase hex characters) "
+            f'or {{"hash": <hash>, "delete": true}}; got {item!r}'
+        )
+
+
 def validate_custom_fields(custom_fields: Any) -> None:
     """custom_fields must be a flat dict of `cfield_<propertyId>_<basepropertyId>`
     keys (from the module's get_*_custom_fields tool) → scalar/array values.

@@ -470,7 +470,8 @@ async def _linked_records(client: CdeskClient, customer_id: int) -> list[str]:
             {"col": col, "c": "=", "q": customer_id, "o": "AND"},
         ]}
         if path == "v3/fill":
-            # Without a date window the fill list covers the current month only.
+            # A window over the whole history, so the check cannot miss an
+            # older fill whatever the version's default.
             widened = ensure_fill_start_date_window(sb)
             sb = widened if isinstance(widened, dict) else sb
         rows, _ = unwrap_list(await client.get(path, params={"pg": 1, "pp": 1, "sb": encode_sb(sb)}))

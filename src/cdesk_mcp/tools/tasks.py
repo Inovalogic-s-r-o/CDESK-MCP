@@ -33,6 +33,7 @@ from cdesk_mcp.filters import build_task_filter, encode_sb, reject_sb_raw_with_t
 from cdesk_mcp.sort_columns import resolve_sort, sort_note
 from cdesk_mcp.tools._helpers import (
     notify_block_value,
+    validate_attachments,
     task_status_group,
     with_status_groups,
     list_meta,
@@ -303,10 +304,11 @@ def register_task_tools(
         tag_ids: list[int] | None = None,
         offer_item_id: int | None = None,
         notify: dict[str, Any] | None = None,
-        attachment: list[dict[str, Any]] | None = None,
+        attachment: list[str | dict[str, Any]] | None = None,
         notify_block: int | None = None,
     ) -> dict[str, Any]:
         try:
+            validate_attachments(attachment)
             # Naive datetimes are interpreted as TENANT-LOCAL wall-clock time
             # and sent with an explicit offset: CDESK reads a naive value as
             # UTC (a naive 8:00 displays as 10:00 in a CEST tenant's UI), while
@@ -425,12 +427,13 @@ def register_task_tools(
         tag_ids: list[int] | None = None,
         offer_item_id: int | None = None,
         notify: dict[str, Any] | None = None,
-        attachment: list[dict[str, Any]] | None = None,
+        attachment: list[str | dict[str, Any]] | None = None,
         subordinate_task_id: int | None = None,
         duration_gap: int | None = None,
         notify_block: int | None = None,
     ) -> dict[str, Any]:
         try:
+            validate_attachments(attachment)
             if name is not None and not name.strip():
                 raise ValueError("name must be a non-empty string")
             # Naive datetimes = tenant-local wall-clock time; CDESK reads a
@@ -850,8 +853,11 @@ _CREATE_TASK_DESC = inspect.cleandoc(
         reassigned once set).
       - notify: notification-override object passed verbatim; non-null
         forces notifications even when nothing else changed.
-      - attachment: file-upload payload array passed verbatim (CDESK's
-        processAttachment shape — requires pre-uploaded file hashes).
+      - attachment: files for the task, as a list of file hashes
+        (40 lowercase hex characters, from an upload to CDESK). An item
+        {"hash": <hash>, "delete": true} removes a file the task already
+        has. CDESK accepts only the caller's own uploads not yet attached
+        elsewhere, or files the task already has.
 
     Returns the created task's id + full record (CDESK's savedData).
     

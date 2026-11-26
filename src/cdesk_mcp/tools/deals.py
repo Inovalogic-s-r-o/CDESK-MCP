@@ -864,6 +864,10 @@ _CREATE_DEAL_DESC = inspect.cleandoc(
     naive datetime is read as tenant-local time; due dates must not precede
     their opening dates. tag_ids attaches existing tags (see
     get_deal_enums `tags`).
+
+    Side effects (by CDESK): a new deal can get billing items and travel
+    rates copied from the customer's price list; CDESK then names them in
+    `warnings`.
     """
 )
 

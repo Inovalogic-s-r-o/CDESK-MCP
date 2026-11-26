@@ -436,6 +436,8 @@ def register_request_tools(
         due_before: str | None = None,
         created_after: str | None = None,
         created_before: str | None = None,
+        sla_id: int | None = None,
+        deadline: Literal["has", "none", "overdue"] | None = None,
         include_deleted: bool = False,
         sb_raw: str | dict[str, Any] | None = None,
         page: int = 1,
@@ -492,6 +494,8 @@ def register_request_tools(
                 due_before=due_before,
                 created_after=created_after,
                 created_before=created_before,
+                sla_id=sla_id,
+                deadline=deadline,
                 sb_raw=sb_raw,
                 dropped_cols_out=dropped_clauses,
             )
@@ -1281,14 +1285,11 @@ def register_request_tools(
     )
     async def list_request_discussion(
         request_id: int,
-        include_deleted: bool = False,
         fields: list[str] | None = None,
     ) -> dict[str, Any]:
         try:
             validate_fields(fields)
             params: dict[str, Any] = {}
-            if include_deleted:
-                params["includeDeleted"] = "true"
             if fields:
                 params["returnFields[]"] = fields
             response = await client.get(
@@ -1302,9 +1303,9 @@ def register_request_tools(
                 e, operation="list_request_discussion", record_id=request_id,
             ) from e
         # Normalize to the same shape as the other list tools. Discussion isn't
-        # paginated, so there's no page/per_page — but unwrap_list still lifts
-        # the messages out of `data` and keeps discussionAcl/config/signature
-        # metadata in `meta`.
+        # paginated, so there's no page/per_page — unwrap_list lifts the
+        # messages out of `data`. The discussion ACL, config and signature come
+        # only with include_metadata, which is not sent.
         records, meta = unwrap_list(response)
         # With a `fields` whitelist, CDESK answers an empty LIST for any message
         # that carries none of the requested columns — so `items` could come back
@@ -1810,6 +1811,10 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
         was created from (0 / null = ad-hoc).
       - solver_group_id / branch_id / place_name /
         superior_request_id: further scoping.
+      - sla_id: the request's SLA.
+      - deadline: "has" (a resolution deadline is set), "none" (no
+        deadline), "overdue" (the deadline is past and the request has no
+        close date).
       - periodic: True → only periodic requests (those generated from a
         periodical request), False → only ad-hoc requests, omitted → both.
 
@@ -1832,7 +1837,8 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
     Working filters: request_number, text_search, status_name, priority_name, cat_type_name,
     base_type, company, solver_id, solver_group_id, catalog_id, deal_id,
     project_contract_id, branch_id, place_name, superior_request_id, periodic,
-    due_after/due_before, created_after/created_before, include_deleted.
+    due_after/due_before, created_after/created_before, sla_id, deadline,
+    include_deleted.
       - due_after / due_before: deadline (req_due_date) window, ISO-8601.
         CAVEAT: due_before alone also returns every request that has NO due
         date — the server's upper bound lets undated records through. To mean
@@ -1845,7 +1851,7 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
         the other filters). Requests are the ONLY module where deleted
         records are reachable; deleted tasks/catalogs are gone for good.
     NOT offered (the CDESK v3 request list silently ignores or
-    mis-evaluates them): request type ("druh"), sla_id.
+    mis-evaluates it): request type ("druh").
     Use client-side filtering for those.
 
     For advanced filters not exposed here, pass sb_raw as a CDESK sb object
@@ -1853,8 +1859,9 @@ _LIST_REQUESTS_DESC = inspect.cleandoc(
     working columns are applied server-side (id_req, req_num,
     code, urgency_id, impact_id, id_company, catalog_id, id_solver,
     solver_group_id, id_rc, project_contract_id, cat_area_id, branch_id,
-    place_id, change_manager_id, superior_request_id, periodical_request_id,
-    request_weight, percent_done, status, priority, type (INTEGER cat-type id),
+    place_id, change_manager_id, superior_request_id (a '!=' also matches
+    requests without a parent), periodical_request_id, sla_id (a '!=' also
+    matches requests without an SLA), request_weight, percent_done, status, priority, type (INTEGER cat-type id),
     baseType (base-type letter), dateFrom/dateTo (raw due-date bounds; dateTo
     also passes undated requests), created_at, assign_date, udatetime,
     due_date, close_date (W3C datetime values), plus the no-col text leaf).
@@ -2096,9 +2103,15 @@ _CREATE_REQUEST_DESC = inspect.cleandoc(
         (list_request_solver_groups lists the ones the request form offers;
         a root group, root_group=true in list_user_groups, is not accepted);
         whether the group is required follows use_solver_group
-        (get_request_enums → fields).
+        (get_request_enums → fields). With both given, the solver must be a
+        member of the group, directly or through a subgroup — a virtual
+        project-team group accepts any solver. CDESK refuses a group not
+        offered, or a solver outside the group, naming the allowed values; a
+        solver CDESK stored instead of the one sent is named in `warnings`.
       - catalog_id: instantiate from a request-catalog template.
-      - deal_id (id_rc) / project_contract_id: deal linkage.
+      - deal_id (id_rc): the deal the request belongs to.
+      - project_contract_id: the project contract (a work package inside a
+        project, not a deal) the request belongs to.
       - desired_date, calendar_date_start, invoice_date, first_conclusion
         (ISO-8601 datetimes; a datetime without an offset is interpreted as
         TENANT-LOCAL time — CDESK_TIMEZONE, default Europe/Bratislava — and
@@ -2182,8 +2195,8 @@ _UPDATE_REQUEST_DESC = inspect.cleandoc(
     changes, the resulting priority must be one the request's SLA offers for
     that type and area; CDESK refuses anything else (HTTP 400, its message
     passed on). Request types whose priority comes from the urgency × impact
-    matrix are not checked. No API lists the priorities an SLA offers, so this
-    is not checked before the call.
+    matrix are not checked. This tool does not check the priority before the
+    call.
 
     due_date sets the deadline (CDESK computes it from the SLA otherwise), and
     due_date_fixed=true keeps it from being recomputed — the latter only with
@@ -2210,6 +2223,13 @@ _UPDATE_REQUEST_DESC = inspect.cleandoc(
     Reparenting (changing company) may be rejected once the request
     is completed or has bound devices/approvals — CDESK's error message
     will explain.
+
+    Solver group and solver: the rules of create_request apply to the values
+    sent together with the stored ones. Changing the customer, a service area
+    or the project contract re-checks the stored solver group and solver, so
+    such a change is refused when they no longer fit (CDESK names the
+    allowed values) unless solver_group_id / solver_id are changed with it. A
+    solver CDESK stored instead of the one sent is named in `warnings`.
 
     Returns: {data: <id>, savedData: {...full record...}} — the record
     includes the request's `system_number`, the number CDESK shows its
@@ -2267,9 +2287,8 @@ _LIST_REQUEST_DISCUSSION_DESC = inspect.cleandoc(
     """
     List the discussion messages on a request, newest first. Each
     message includes the channel (customer-visible or internal),
-    author, timestamp, body, and per-message ACL metadata.
+    author, timestamp and body. Deleted messages are never returned.
 
-    include_deleted=True surfaces soft-deleted messages as well.
     fields: an exact whitelist of field names to keep per message
     (returnFields; unknown names silently ignored).
     """
@@ -2310,12 +2329,14 @@ _POST_REQUEST_DISCUSSION_DESC = inspect.cleandoc(
         anything is posted.
       - custom_notify — what the receivers above do to CDESK's default
         notifications. False (default): they are notified in addition
-        to the receivers CDESK picks by its own rules. True: only they
-        are notified, and CDESK's default receivers are not. Requires at
-        least one receiver.
+        to the receivers CDESK picks by its own rules. True: they replace
+        CDESK's default receivers; on tenants with notification rules the
+        rules' recipients are still notified. Requires at least one
+        receiver.
       - notify_block — 1 = nobody is notified about this post: neither
-        its receivers nor the notification a status change can trigger
-        (with work_order_id, the work order's receivers still are).
+        its receivers, nor the work order's receivers, nor those of the
+        tenant's notification rules, nor the notification a status change
+        can trigger.
         Cannot be combined with notify_user_ids / discussion_receivers.
       - notify_customer_block / notify_sms_block — 0 or 1 flags that
         suppress the customer / SMS notification of a status change the

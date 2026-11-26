@@ -793,8 +793,9 @@ _CREATE_KB_ARTICLE_DESC = inspect.cleandoc(
     an INTERNAL article. Ask the user which they want rather than relying on
     the default. category_id is optional (0 = no category; see
     list_kb_categories for the space's categories). tag_names attaches keyword
-    tags by name; each name is stored as a tag (a name not yet in
-    availableTags creates a new tag). The article number is
+    tags by name; a name matching an existing tag in availableTags (ignoring
+    case and surrounding spaces) attaches that tag, any other name creates a
+    new tag. The article number is
     auto-assigned; the creator auto-follows the article and notifications fire
     server-side.
 
@@ -813,7 +814,8 @@ _UPDATE_KB_ARTICLE_DESC = inspect.cleandoc(
     with the version token), so an edit made by someone else in between
     conflicts with HTTP 409 instead of being overwritten. Passing space_id
     MOVES the article to another space (requires
-    record rights there). tag_names REPLACES the tag set (unknown names are
+    record rights there). tag_names REPLACES the tag set (names match
+    existing tags ignoring case and surrounding spaces; unknown names are
     created; tags no longer used are removed). Leaving tag_names out keeps
     the article's current tags.
 

@@ -270,14 +270,15 @@ async def _resolve_user_filter(
 async def _resolve_fill_filter(
     cache: EnumCache | None, f: dict[str, Any]
 ) -> dict[str, Any] | None:
-    # No enum cache — fills resolve no enum names. CRITICAL for absence
-    # correctness: the v3 fill list defaults to the CURRENT CALENDAR MONTH when
-    # no date window is sent, so an unbounded collect would silently miss older
-    # fills and could turn a real record into a false confirmed_absence.
+    # No enum cache — fills resolve no enum names. For absence correctness a
+    # collect always sends a start_date window covering the whole history:
+    # CDESK returns every fill without one, and the explicit window keeps the
+    # scan complete regardless of a version's default — a collect that missed
+    # older fills could turn a real record into a false confirmed_absence.
     #
     # sb_raw bypasses the typed worked_from/worked_to window (the two can't be
     # combined — build_fill_filter rejects it), so a raw filter that doesn't
-    # itself bound start_date would still scan only the current month. AND-in a
+    # itself bound start_date gets the same guard: AND-in a
     # wide start_date window when it doesn't (ensure_fill_start_date_window). The
     # typed path injects the same wide window when the caller gives no bound.
     sb_raw = f.get("sb_raw")
@@ -336,7 +337,7 @@ _REQUEST_FILTER_HELP = (
     "(base-type letter e.g. 'H'), company, solver_id, solver_group_id, "
     "catalog_id, deal_id, project_contract_id, branch_id, "
     "superior_request_id, created_after/before, sb_raw "
-    "(sla/due-date/deleted filters are not honored by the v3 request list)"
+    "(the SLA goes through sb_raw as sla_id; deleted requests are not collected)"
 )
 _TASK_FILTER_HELP = (
     "tasks: text_search, status_name, status_group (open / closed), type_name, "
@@ -348,8 +349,7 @@ _USER_FILTER_HELP = "users: text_search, company_id, user_type, status, sb_raw"
 _FILL_FILTER_HELP = (
     "fills: text_search, solver_id, company_id, request_id, deal_id, "
     "project_contract_id, assign_id, invoiced, worked_from/worked_to, sb_raw "
-    "(without worked_from/worked_to the full history is scanned automatically; "
-    "the live list otherwise defaults to the current calendar month)"
+    "(without worked_from/worked_to the whole history is scanned)"
 )
 
 
@@ -1556,8 +1556,8 @@ _COLLECT_RECORDS_DESC = inspect.cleandoc(
         cat_type_name (category type → cat_type_id), base_type (letter),
         company, solver_id, solver_group_id, catalog_id, deal_id,
         project_contract_id, branch_id, superior_request_id,
-        created_after/before, sb_raw. (sla/due-date/deleted filters are
-        not honored by the v3 request list.)
+        created_after/before, sb_raw (sla_id goes there). Deleted requests are
+        not collected.
       - tasks → text_search, status_name, type_name, solver_id, customer_id,
         valid_from_after/before, deadline_after/before, created_after/before,
         sb_raw. (open/late filters are not honored by the v3 task list.)

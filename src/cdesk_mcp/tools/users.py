@@ -126,16 +126,18 @@ def _drop_oversized_user_keys(record: dict[str, Any]) -> dict[str, Any]:
 # `root_group` (one of the tenant's built-in root groups — Administrators,
 # Operators, Customer accounts, … — which CDESK never offers as a request's
 # solver group), `main_group` (a direct child of a root group) and, on the list,
-# `toplevel_group` (no parent group).
+# `toplevel_group` (no parent group). `virtual` marks a project-team group,
+# which takes any solver on a request.
 _MAX_GROUPS_PER_PAGE = 100
 _GROUP_LIST_FIELDS = (
     "id", "name", "description", "enabled", "root_group", "main_group",
-    "toplevel_group", "parent_id", "assigned_company_count",
+    "toplevel_group", "virtual", "parent_id", "assigned_company_count",
 )
 # `id_parent` on a group detail is NOT its parent group (it holds the tenant's
 # admin account id); the parents are `group_id`.
 _GROUP_DETAIL_FIELDS = (
     "id", "name", "nick", "description", "enabled", "root_group", "main_group",
+    "virtual",
 )
 
 
@@ -903,14 +905,16 @@ _LIST_USER_GROUPS_DESC = inspect.cleandoc(
     List CDESK user groups — the groups users belong to, which are ALSO the
     solver groups (`solver_group_id` on requests, work orders and catalog
     prefills) and approver groups. Returns id, name, description, enabled,
-    root_group, main_group, toplevel_group, parent_id and
+    root_group, main_group, toplevel_group, virtual, parent_id and
     assigned_company_count per group (fields: pick other top-level fields
     instead), plus meta.total.
 
     root_group=true marks one of the tenant's built-in ROOT groups
     (Administrators, Operators, Customer accounts, …): CDESK does not accept a
     root group as a request's solver group. main_group=true marks a direct
-    child of a root group; toplevel_group=true a group with no parent group.
+    child of a root group; toplevel_group=true a group with no parent group;
+    virtual=true a project-team group (the list includes them), which accepts
+    any solver on a request.
     parent_id is one direct parent group (get_user_group lists all of them).
     The groups the request form offers for one request (its customer, service
     area, catalog) are listed by list_request_solver_groups.
@@ -924,7 +928,8 @@ _GET_USER_GROUP_DESC = inspect.cleandoc(
     """
     One CDESK user group (also a solver / approver group): id, name, nick,
     description, enabled, root_group (true = a built-in root group), main_group
-    (true = a direct child of a root group), the parent group ids
+    (true = a direct child of a root group), virtual (true = a project-team
+    group, which accepts any solver on a request), the parent group ids
     (parent_group_ids), the member user ids (member_ids — names via
     get_user / list_users) and the ids of its child groups.
     """
